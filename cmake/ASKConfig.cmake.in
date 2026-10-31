@@ -1,0 +1,12 @@
+@PACKAGE_INIT@
+include(CMakeFindDependencyMacro)
+find_dependency(LLVM 18.1.8 EXACT CONFIG)
+find_dependency(MLIR 18.1.8 EXACT CONFIG)
+include("${CMAKE_CURRENT_LIST_DIR}/ASKCoreTargets.cmake")
+set(ASK_Core_FOUND TRUE)
+foreach(component IN LISTS ASK_FIND_COMPONENTS)
+  if(NOT component STREQUAL "Core")
+    set(ASK_${component}_FOUND FALSE)
+  endif()
+endforeach()
+check_required_components(ASK)

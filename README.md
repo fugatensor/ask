@@ -1,0 +1,51 @@
+# ASK
+
+ASK 用 MLIR 的 `ask` dialect 接收上层框架生成的计算图，以原生 LLVM IR 承接低层产物。这个仓库已开始实现编译器初稿；当前入口是 Python SDK 和原生 `ask-opt`。
+
+目前可以构建、检查和准备单基本块的 i32 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。`prepare` 不编译外部 DSL，也不执行 GPU kernel。完整的图运行时、跨编译器融合和通用优化流水线仍在设计中。
+
+## 构建
+
+需要 C++17、CMake 3.28 或更新版本、Ninja，以及配套的 LLVM/MLIR 开发安装。LLVM/MLIR 的具体版本和修订以仓库锁定记录及 CMake 检查为准；不要把系统上不同版本的两套库混用。Triton 导出与 reader 的兼容性记录见 [dependencies.lock.json](adapters/triton/dependencies.lock.json)。
+
+```bash
+cmake --preset core \
+  -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm \
+  -DMLIR_DIR=/path/to/llvm/lib/cmake/mlir
+cmake --build --preset core
+ctest --preset core
+build/core/bin/ask-opt --capabilities
+```
+
+`core` 使用 `ASK_THIRD_PARTY_COMPILERS=none`，不需要 Triton、NumPy 或 PyTorch。它仍能检查包含 `ask.external` 的图；真正请求编译外部 DSL 时才检查该编译器是否启用。第三方编译器可选择 `none`、`all` 或明确的名称，目标后端另外选择；当前后端选项只实现 `none` 和 `host`。见[构建说明](docs/09-构建与可选编译器.md)。
+
+## 从上层框架提交图
+
+Python SDK 支持 Python 3.10 或更新版本，运行时只依赖标准库。可以安装 `python3 -m pip install -e .`，也可以直接从源码使用：
+
+```bash
+PYTHONPATH=python python3 examples/framework_frontend.py --emit-only
+PYTHONPATH=python python3 examples/framework_frontend.py \
+  --ask-opt build/core/bin/ask-opt
+```
+
+[完整示例](examples/framework_frontend.py) 生成 `P: t=x+1 → F: u=t*2 → Q: y=u+3`。F 的 Triton 源码作为字符串写入实现声明；示例进程不会导入或执行 Triton。第二条命令调用真实 MLIR 编译器，输出准备后的 IR、形状快照、追踪记录和外部编译请求。
+
+也可以直接提交 MLIR 文件：
+
+```bash
+build/core/bin/ask-opt tests/ir/pipeline.mlir \
+  --prepare -o /tmp/ask-prepared.mlir --report-json /tmp/ask-report.json
+```
+
+SDK 用法、当前支持范围和诊断处理见[上层框架接入](docs/10-上层框架接入.md)。架构设计从[核心思想](docs/核心思想.md)开始，分阶段说明见[文档目录](docs/README.md)。设计文档中的完整接口不等于当前版本已经实现的 API。
+
+## 测试
+
+`ctest --preset core` 会运行 Python 客户端测试和真实 `ask-opt` 集成测试。只检查 Python 部分时：
+
+```bash
+python3 -m unittest discover -s tests/python -v
+```
+
+未设置 `ASK_OPT` 时，真实编译器测试会显示 skipped。要单独运行它们，设置 `ASK_OPT` 为编译出的 `ask-opt` 路径；不能把跳过当成 native 验证通过。

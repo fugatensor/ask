@@ -1,0 +1,3 @@
+# Exact compiler version used by the initial worker ABI tests.
+# This is not a hash-locked portable Python environment or a complete wheel lock.
+triton==3.7.1

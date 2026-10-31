@@ -1,0 +1,67 @@
+"""Small type descriptions used to print ASK's real MLIR input format."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+_DTYPES = frozenset({"i32"})
+
+
+def _dtype(value: str) -> str:
+    if not isinstance(value, str) or value not in _DTYPES:
+        raise ValueError(f"the initial ASK frontend supports only i32, got {value!r}")
+    return value
+
+
+@dataclass(frozen=True)
+class ScalarType:
+    dtype: str = "i32"
+
+    def __post_init__(self) -> None:
+        _dtype(self.dtype)
+
+    def __str__(self) -> str:
+        return self.dtype
+
+
+@dataclass(frozen=True)
+class TensorType:
+    shape: tuple[int | None, ...]
+    dtype: str = "i32"
+
+    def __post_init__(self) -> None:
+        _dtype(self.dtype)
+        try:
+            shape = tuple(self.shape)
+        except TypeError as exc:
+            raise TypeError("tensor shape must be an iterable of dimensions") from exc
+        for dim in shape:
+            if dim is not None and (type(dim) is not int or not 0 <= dim < 2**63):
+                raise ValueError(f"invalid tensor dimension: {dim!r}")
+        object.__setattr__(self, "shape", shape)
+
+    def __str__(self) -> str:
+        dims = "".join(("?" if dim is None else str(dim)) + "x" for dim in self.shape)
+        return f"tensor<{dims}{self.dtype}>"
+
+
+Type = ScalarType | TensorType
+
+
+def as_type(value: Type | str) -> Type:
+    if isinstance(value, (ScalarType, TensorType)):
+        return value
+    if isinstance(value, str):
+        return ScalarType(value)
+    raise TypeError(f"expected ScalarType or TensorType, got {type(value).__name__}")
+
+
+def compatible(actual: Type, declared: Type) -> bool:
+    if type(actual) is not type(declared) or actual.dtype != declared.dtype:
+        return False
+    if isinstance(actual, TensorType) and isinstance(declared, TensorType):
+        return len(actual.shape) == len(declared.shape) and all(
+            left is None or right is None or left == right
+            for left, right in zip(actual.shape, declared.shape)
+        )
+    return True

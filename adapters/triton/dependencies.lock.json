@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "adapter_version": "0.1.0",
+  "protocol_version": 1,
+  "compiler": {"name": "triton", "version": "3.7.1"},
+  "observed_python_version": "3.14.7",
+  "tested_target": {"backend": "cuda", "arch": 80, "warp_size": 32},
+  "producer_llvm": {
+    "upstream_tag": "v3.7.1",
+    "upstream_version": "23.0.0git",
+    "revision": "1f126a6dea50d185c0781743a667390037ae88bd",
+    "source": "https://github.com/triton-lang/triton/blob/v3.7.1/cmake/llvm-hash.txt",
+    "installed_wheel_revision_verified": false
+  },
+  "ask_reader": {
+    "version": "18.1.8",
+    "observed_compatibility": "rejected",
+    "first_diagnostic": "expected ')' at captures(none) in the entry parameter attributes"
+  },
+  "validation": {
+    "public_api_export": "passed",
+    "gpu_execution": "not_run",
+    "scope": "two i32 pointers, integer constexprs, num_warps=4, zero shared/scratch"
+  }
+}
