@@ -2,7 +2,7 @@
 
 [返回顶层设计](核心思想.md#10-fugatensor-放在哪里) · [框架接入接口](10-上层框架接入.md) · [编译器适配](17-第三方编译器适配与注册.md) · [文档目录](README.md)
 
-FugaTensor 位于同级 `fugatensor/` 仓库。用户写张量计算，FugaTensor 先记录独立的 Fuga IR，处理框架层控制流和显式请求的基础 VJP，再把可执行静态部分降成高层 ASK IR。ASK 负责检查、目标优化和生成实际执行的代码。Fuga IR 是跨设备的逻辑表示，基本类型与操作不带 CPU/CUDA 放置；对象模型、region 和转换边界见 [Fuga IR 文档](../../fugatensor/docs/ir/README.md)。
+FugaTensor 位于同级 `fugatensor/` 仓库。用户写张量计算，FugaTensor 记录独立的 Fuga IR 和实际执行历史，在 backward 时生成反向计算，再把可执行静态部分降成高层 ASK IR。Python 动态条件由 Fuga 分片调度，ASK 继续接收静态图。ASK 负责检查、目标优化和生成实际代码。Fuga IR 是跨设备的逻辑表示，基本类型与操作不带 CPU/CUDA 放置；对象模型、region 和转换边界见 [Fuga IR 文档](../../fugatensor/docs/ir/README.md)。
 
 ## 日常代码
 
@@ -62,7 +62,9 @@ print(mixed(x).tolist())  # [7.0, 9.0, 11.0]
 
 前后加法先成为 Fuga 操作，`scale` 成为保存用户源码的 `fuga.external`；转换后才对应 ASK 加法与 `ask.external`。具体 GPU 架构在这一边界绑定，不写进通用 Fuga 值的类型。换成用户写的其他合法算法，仍通过同一注册接口接入。FugaTensor 提交 DSL、语义、端口绑定和固定编译选项；ASK 的 Triton 适配器取得 LLVM IR 并证明值边界，通用内联 Pass 插入 ASK helper，然后重新生成 cubin。FugaTensor 复用 ASK 的常驻 Session 提交设备张量，`tolist()` 等待并下载结果。独立 Fuga IR 不改变这条原生 LLVM 链接与融合路径。
 
-目前 external 融合入口仍要求一个输入、一个同形状同存储类型输出和一个 external。这个限制只属于外部融合路径；自有 GPU 图可有多个输入和输出，各端口保留自己的形状与类型。fp16/bf16 存储可以在图中显式转为 f32 计算再转回；实际硬件检查沿用 ASK。
+目前 external 融合入口仍要求一个实际使用的输入、一个同形状同存储类型输出和一个 external。Fuga 可删除无用的物理参数，并保存逻辑输入到实际端口的映射。这个限制只属于外部融合路径；自有 GPU 图可有多个输入和输出，各端口保留自己的形状与类型。fp16/bf16 存储可以在图中显式转为 f32 计算再转回；实际硬件检查沿用 ASK。
+
+external 后的计算目前只使用其结果与常量，不支持绕过 external 再读取原始输入。用户手写 backward 也遵守这一限制；只需要 dy 的反向可以删除未使用的原始 x，正常接收运行时梯度。确实需要多个实际输入的 external 反向仍会拒绝，基础 ASK 多输入反向没有这项限制。
 
 ## 配置、测试和检查产物
 
@@ -70,8 +72,10 @@ FugaTensor 的 `python3 tools/bootstrap.py` 默认以 `all` 构建同级 ASK，�
 
 `function.last_fuga_ir` 显示追踪后的 Fuga 图，`last_ask_ir` 显示提交给 ASK 的图，`last_ir` 保留 ASK 文本的兼容含义。编译目录同时保存 `fuga.ir`、`frontend.mlir` 及逐值映射 `fuga-to-ask.json`。`last_report` 保留编译报告；`last_artifact_dir` 定位目标文件、LLVM 或 cubin。`cache_info()` 统计 FugaTensor 内存特化缓存，ASK 的 IR 与可执行磁盘缓存仍分别记在 GPU 报告里。CPU 当前没有跨进程持久代码缓存。
 
-Fuga 的 region 能表达 if/for/while；当前桥接只处理静态条件与有界 for，动态分支和 while 仍会拒绝。基础 VJP 在 Fuga IR 上生成反向图，然后走同一 ASK 执行路径；尚无完整 `Tensor.backward()` 或动态控制流调度器。这些框架层工作不会要求 ASK A 层接收动态控制流。
+Fuga 的 region 能表达 if/for/while，直接桥接仍只处理静态条件与有界 for。普通 JIT 的 Python 零维 Tensor 条件通过图中断执行前缀、读取条件并选择下一片段；反向连接本次实际执行路径。这些框架层工作不要求 ASK A 层接收动态控制流。
 
-后续 `ft.fun` 类、`ft.grad` 与嵌套 JIT 的关系见 [Fuga 接口提案](../../fugatensor/docs/ir/04-JIT与自定义梯度提案.md)，这些新增 API 尚未实现。提案让 Fuga 选择正向或反向函数体，再提交静态 ASK 图；外部 DSL 继续经适配器进入原生 LLVM 链接与合法内联流程。
+公开自动微分使用 `requires_grad=True`、`output.backward()` 和叶子 `.grad`。create_graph 可保留由已知 Fuga 基础运算组成的梯度图并继续求导；不透明第三方正向或反向的高阶请求会提前拒绝。fun 的 forward/backward 都需 `@ft.jit`；Fuga 先检查全部反向规则，再生成和执行反向图，缺少规则时不会先执行部分反向。外部 DSL 继续进入原生 LLVM 链接与合法内联。接口、保存值和图释放见 [Fuga backward](../../fugatensor/docs/ir/04-JIT与自定义梯度提案.md)。
+
+Fuga 开始把 SSA 依赖、反向路径和活跃性分析放入自己的 nanobind C++ 扩展，Python 暂时保留追踪和求导规则生成。这个拆分不改变 ASK 的职责：ASK 继续接收静态计算图，负责目标编译与设备执行。
 
 默认运行时由 `ft.shutdown()` 关闭；也可用 `with ft.Engine(...)` 明确管理生命周期。关闭会等待设备工作并清除所属的 JIT 特化。追踪期间不能读取真实张量数据来生成 Python 常量，所有计算输入必须作为参数进入图。
