@@ -9,7 +9,7 @@ does not import Triton.
 The first tested configuration is deliberately narrow:
 
 - Triton 3.7.1; observed Python 3.14.7.
-- CUDA `arch=80`, `warp_size=32`, `num_warps=4`.
+- CUDA `arch=80`, `warp_size=32`, requested `num_warps=4` or `8`.
 - One `@triton.jit` entry, two `*i32` data pointers, integer `tl.constexpr` values.
 - One logical input and one logical output, with explicit source parameter bindings.
 - No shared, global scratch, profile scratch, tensor descriptors, or cooperative resources.
@@ -93,14 +93,24 @@ the older reader.
 ## Optional boundary tracing
 
 An additional request field `"fusion": {"enabled": true}` asks the adapter to
-validate the canonical one-load/one-store pointwise i32 subset and insert two
-identity traces through public `tl.inline_asm_elementwise`. It compares the
+validate a one-load/one-store pointwise i32 dataflow and insert two logical
+identity traces through public `tl.inline_asm_elementwise`. Local aliases,
+reassignments, equivalent affine arithmetic and positional/keyword arguments
+are accepted without prescribing a single source template. It compares the
 unmodified and traced kernels' blocked layouts and execution metadata. Ordinary
 export requests keep their existing behavior.
 
+`BLOCK` is a requested power of two from 1 through 1024. The physical thread
+count is `num_warps * 32`; it need not equal BLOCK. Each logical identity may
+lower to multiple LLVM calls, so the contract records actual `marker_count`
+for each boundary. All sites are bound before using the compiler-independent
+[LLVM value inliner](../../include/ask/LLIR/Inline.h).
+
 The response includes `instrumented_source` and a versioned `fusion_contract`
 bound to original source, instrumented source and exact LLVM content hashes.
-The core checks typed boundary addresses/masks and inlines native ASK LLVM
-helpers. Original memory assembly is preserved; it is never decoded to guess
+The producer-specific binder checks addresses with ScalarEvolution and proves
+mask expressions equivalent using LLVM normalization on a disposable clone.
+The shared inliner checks helper types, dominance and effects before rewriting
+a clone transactionally. Original memory assembly is preserved; it is never decoded to guess
 access semantics. Traces are removed before final code generation. Unsupported
 DSL operations or compiler environment overrides fail explicitly.

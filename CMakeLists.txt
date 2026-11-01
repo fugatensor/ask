@@ -63,7 +63,8 @@ configure_file(cmake/BuildConfig.h.in generated/ask/BuildConfig.h @ONLY)
 
 add_library(ask_core STATIC
   lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp
-  lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/Lowering/Host.cpp
+  lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/LLIR/Inline.cpp
+  lib/Adapters/TritonBoundary.cpp lib/Lowering/Host.cpp
   lib/Transforms/Optimize.cpp)
 add_library(ASK::Core ALIAS ask_core)
 target_compile_features(ask_core PUBLIC cxx_std_17)
@@ -102,6 +103,12 @@ install(FILES cmake/llvm.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMP
 
 if(BUILD_TESTING)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_executable(ask-boundary-inline-test tests/test_boundary_inline.cpp)
+  target_link_libraries(ask-boundary-inline-test PRIVATE ASK::Core)
+  add_test(NAME ask-boundary-inline COMMAND ask-boundary-inline-test)
+  add_test(NAME ask-boundary-execution COMMAND "${Python3_EXECUTABLE}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_boundary_execution.py"
+    "$<TARGET_FILE:ask-boundary-inline-test>" "${LLVM_TOOLS_BINARY_DIR}")
   add_test(NAME ask-python COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/tests/python" -v)
   set_tests_properties(ask-python PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python;ASK_OPT=$<TARGET_FILE:ask-opt>")
   add_test(NAME ask-native COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native.py" "$<TARGET_FILE:ask-opt>")

@@ -1,16 +1,14 @@
 #include "ask/LLIR/Fuse.h"
 #include "ask/IR/ASKOps.h"
+#include "ask/Adapters/TritonBoundary.h"
+#include "ask/LLIR/Inline.h"
 #include "ask/LLIR/Import.h"
 #include "ask/LLIR/Optimize.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "llvm/ADT/StringExtras.h"
-#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
 #include "llvm/IR/Verifier.h"
-#include "llvm/Linker/Linker.h"
 #include "llvm/Support/SHA256.h"
-#include "llvm/Transforms/Utils/Cloning.h"
 
 namespace ask::llir {
 namespace {
@@ -94,11 +92,16 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
   if (func.getNumArguments() != 1 || func.getNumResults() != 1 || !func.getBody().hasOneBlock())
     return error("fusion requires one static tensor input and one output in one block");
   auto type = mlir::dyn_cast<mlir::RankedTensorType>(func.getArgument(0).getType());
-  if (!type || type.getRank() != 1 || !type.hasStaticShape() || !type.getElementType().isSignlessInteger(32))
-    return error("fusion requires a static one-dimensional i32 tensor");
-  int64_t n = type.getDimSize(0);
-  if (func.getResultTypes()[0] != type || n < 1 || n > 2147483520)
-    return error("fusion requires matching shapes and indices within signed i32 range");
+  if (!type || !type.hasStaticShape() || !type.getElementType().isSignlessInteger(32))
+    return error("ASK graph lowering currently requires a static i32 tensor");
+  int64_t n = 1;
+  for (int64_t dim : type.getShape()) {
+    if (dim == 0 || dim > INT64_MAX / n)
+      return error("fusion requires a nonempty tensor with a representable element count");
+    n *= dim;
+  }
+  if (func.getResultTypes()[0] != type)
+    return error("fusion requires matching pointwise input/output shapes");
   ExternalOp external;
   for (auto &op : func.front()) {
     if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, ExternalOp, mlir::func::ReturnOp>(op))
@@ -120,12 +123,8 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
   auto entryName = artifact.getString("entry");
   auto *producer = artifact.getObject("producer");
   auto *specializations = artifact.getObject("specializations");
-  if (!contract || !payload || !entryName || !producer || !specializations ||
-      contract->getString("protocol") != "ask.triton.boundary.v1" ||
-      producer->getString("name") != "triton" || producer->getString("version") != "3.7.1" ||
-      contract->getString("llir_sha256") != digest(*payload) ||
-      contract->getString("entry") != entryName || contract->getString("dtype") != "i32")
-    return error("missing or inconsistent Triton boundary contract / LLVM digest");
+  if (!contract || !payload || !entryName || !producer || !specializations)
+    return error("missing external fusion artifact / boundary contract fields");
   auto impl = external.resolveImplementation();
   auto source = impl->getAttrOfType<mlir::StringAttr>("source").getValue();
   if (impl->getAttrOfType<mlir::StringAttr>("compiler").getValue() != "triton" ||
@@ -153,101 +152,18 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
   if (!instrumented || contract->getString("instrumented_source_sha256") != digest(*instrumented))
     return error("instrumented source digest does not match boundary contract");
   auto *shape = contract->getArray("shape");
-  auto *proof = contract->getObject("proof");
-  if (!proof || proof->getInteger("input_loads") != 1 || proof->getInteger("output_stores") != 1)
-    return error("boundary contract lacks complete input/output coverage");
-  for (llvm::StringRef field : {"same_index", "same_mask", "no_pointer_escape",
-                                "only_output_store_has_effect", "requires_disjoint_input_output"})
-    if (proof->getBoolean(field) != true) return error("incomplete boundary proof: " + field);
-  auto *constants = specializations->getObject("constants");
+  if (!shape || shape->size() != 1 || (*shape)[0].getAsInteger() != n)
+    return error("boundary shape/constexpr element count does not match the prepared graph");
   auto *invocation = artifact.getObject("invocation");
-  if (!shape || shape->size() != 1 || (*shape)[0].getAsInteger() != n || !constants ||
-      constants->getInteger("N") != n || constants->getInteger("BLOCK") != 128 || !invocation)
-    return error("boundary shape/constexpr N does not match the prepared graph");
-  llvm::json::Array grid{std::max<int64_t>(1, (n + 127) / 128), 1, 1};
-  if (!invocation->get("grid") || *invocation->get("grid") != llvm::json::Value(std::move(grid)) ||
-      !impl->getAttr("grid") || *invocation->get("grid") != attributeJSON(impl->getAttr("grid")) ||
-      invocation->getInteger("num_warps") != 4 || invocation->getInteger("num_ctas") != 1 ||
-      invocation->getInteger("shared_bytes") != 0 || !invocation->get("block") ||
-      *invocation->get("block") != llvm::json::Value(llvm::json::Array{128, 1, 1}))
-    return error("boundary launch grid does not cover exactly the logical tensor");
-  auto imported = importLLVMIR(*payload, context, "triton.boundary.ll");
+  if (!invocation || !invocation->get("grid") || !impl->getAttr("grid") ||
+      *invocation->get("grid") != attributeJSON(impl->getAttr("grid")))
+    return error("artifact launch grid does not match implementation");
+  auto imported = importLLVMIR(*payload, context, "external.boundary.ll");
   if (!imported) return imported.takeError();
   auto &m = **imported;
-  auto *entry = m.getFunction(*entryName);
-  if (!entry || entry->arg_size() != 4 || entry->size() != 1 ||
-      entry->getCallingConv() != llvm::CallingConv::PTX_Kernel || !entry->getReturnType()->isVoidTy() ||
-      entry->isVarArg() || !entry->hasFnAttribute("nvvm.reqntid") ||
-      entry->getFnAttribute("nvvm.reqntid").getValueAsString() != "128")
-    return error("unsupported external LLVM entry ABI/control flow");
-  for (auto &arg : entry->args())
-    if (!arg.getType()->isPointerTy() || arg.getType()->getPointerAddressSpace() != 1 ||
-        (arg.getArgNo() >= 2 && !arg.use_empty()))
-      return error("unsupported data or scratch pointer ABI");
-  for (auto &f : m)
-    if (&f != entry && !f.isDeclaration()) return error("unexpected auxiliary external function body");
-  if (target->getString("data_layout") != m.getDataLayoutStr())
-    return error("LLVM data layout differs from artifact target");
-  if (!m.getTargetTriple().empty() && m.getTargetTriple().str() != "nvptx64-nvidia-cuda")
-    return error("external LLVM target is not nvptx64-nvidia-cuda");
-  m.setTargetTriple(llvm::Triple("nvptx64-nvidia-cuda"));
-  llvm::CallInst *boundaries[2] = {nullptr, nullptr};
-  const char *asmText[] = {"// ASK_BOUNDARY_INPUT_V1\nmov.b32 $0, $1;",
-                           "// ASK_BOUNDARY_OUTPUT_V1\nmov.b32 $0, $1;"};
-  for (auto &instruction : entry->front()) {
-    auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
-    if (!call || !call->isInlineAsm()) continue;
-    auto *assembly = llvm::cast<llvm::InlineAsm>(call->getCalledOperand());
-    for (unsigned i = 0; i < 2; ++i) {
-      if (assembly->getAsmString() != asmText[i]) continue;
-      if (boundaries[i] || assembly->getConstraintString() != "=r,r,l,r,r" ||
-          !assembly->hasSideEffects() || call->arg_size() != 4 || !call->getType()->isIntegerTy(32) ||
-          !call->getArgOperand(0)->getType()->isIntegerTy(32) ||
-          !call->getArgOperand(1)->getType()->isPointerTy() ||
-          !call->getArgOperand(2)->getType()->isIntegerTy(32) ||
-          !call->getArgOperand(3)->getType()->isIntegerTy(32))
-        return error("malformed or repeated ASK boundary marker");
-      boundaries[i] = call;
-    }
-  }
-  if (!boundaries[0] || !boundaries[1]) return error("producer did not retain both ASK boundary markers");
-  if (boundaries[0]->getArgOperand(2) != boundaries[1]->getArgOperand(2) ||
-      boundaries[0]->getArgOperand(3) != boundaries[1]->getArgOperand(3))
-    return error("input/output boundary index or mask differs");
-  auto *mask = llvm::dyn_cast<llvm::ZExtInst>(boundaries[0]->getArgOperand(3));
-  auto *predicate = mask ? llvm::dyn_cast<llvm::ICmpInst>(mask->getOperand(0)) : nullptr;
-  auto *limit = predicate ? llvm::dyn_cast<llvm::ConstantInt>(predicate->getOperand(1)) : nullptr;
-  if (!predicate || predicate->getPredicate() != llvm::ICmpInst::ICMP_SLT || !limit ||
-      predicate->getOperand(0) != boundaries[0]->getArgOperand(2) || limit->getSExtValue() != n)
-    return error("boundary mask must be the declared signed index < N predicate");
-  auto *ports = artifact.getArray("port_map");
-  if (!ports || ports->size() != 2) return error("missing port map");
-  for (unsigned i = 0; i < 2; ++i) {
-    llvm::StringRef binding = i == 0 ? "input:0" : "output:0";
-    auto *boundary = contract->getObject(i == 0 ? "input" : "output");
-    if (!boundary || boundary->getString("marker_asm") != asmText[i] ||
-        boundary->getString("constraints") != "=r,r,l,r,r" ||
-        boundary->getString("source_binding") != binding)
-      return error("boundary marker definition differs from the supported protocol");
-    llvm::Argument *arg = nullptr;
-    for (auto &port : *ports) {
-      auto *p = port.getAsObject();
-      if (p && p->getString("logical_port") == binding) {
-        auto index = p->getInteger("argument");
-        if (!index || *index < 0 || *index > 1) return error("invalid data argument mapping");
-        arg = entry->getArg(*index);
-      }
-    }
-    if (!arg || llvm::getUnderlyingObject(boundaries[i]->getArgOperand(1)) != arg)
-      return error("boundary address is not rooted at the declared data port");
-    auto *address = llvm::dyn_cast<llvm::GetElementPtrInst>(boundaries[i]->getArgOperand(1));
-    auto *offset = address && address->getNumIndices() == 1
-        ? llvm::dyn_cast<llvm::SExtInst>(address->getOperand(1)) : nullptr;
-    if (!address || !address->getSourceElementType()->isIntegerTy(32) ||
-        address->getPointerOperand() != arg || !offset || !offset->getType()->isIntegerTy(64) ||
-        offset->getOperand(0) != boundaries[i]->getArgOperand(2))
-      return error("boundary address must be data pointer + signed i32 element index");
-  }
+  // Dispatch is producer-specific; native LLVM transformation is independent.
+  auto boundaries = adapters::bindTritonBoundaries(m, artifact);
+  if (!boundaries) return boundaries.takeError();
   auto helpers = std::make_unique<llvm::Module>("ask.scalar.helpers", context);
   helpers->setTargetTriple(m.getTargetTriple());
   helpers->setDataLayout(m.getDataLayout());
@@ -259,33 +175,26 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
   if (llvm::verifyModule(*helpers, &llvm::errs())) return error("invalid ASK helper LLVM IR");
   llvm::raw_string_ostream helperStream(helperIR);
   helpers->print(helperStream, nullptr);
-  if (m.getFunction("__ask_pre") || m.getFunction("__ask_post")) return error("reserved helper symbol collision");
-  if (llvm::Linker::linkModules(m, std::move(helpers))) return error("LLVM helper link failed");
-  for (unsigned i = 0; i < 2; ++i) {
-    auto *marker = boundaries[i];
+  llvm::SmallVector<BoundaryInlineSite> sites;
+  for (auto *marker : boundaries->inputs) {
     llvm::IRBuilder<> b(marker);
-    auto *f = m.getFunction(i == 0 ? "__ask_pre" : "__ask_post");
-    auto *call = b.CreateCall(f, {marker->getArgOperand(0)});
-    llvm::Value *value = call;
-    if (i == 0) {
-      auto *valid = b.CreateICmpNE(marker->getArgOperand(3), b.getInt32(0));
-      value = b.CreateSelect(valid, call, marker->getArgOperand(0));
-    }
-    marker->replaceAllUsesWith(value);
-    marker->eraseFromParent();
-    llvm::InlineFunctionInfo info;
-    if (!llvm::InlineFunction(*call, info).isSuccess()) return error("ASK helper inlining failed");
-    if (!f->use_empty()) return error("ASK helper unexpectedly retained users");
-    f->eraseFromParent();
+    auto *valid = b.CreateICmpNE(marker->getArgOperand(3), b.getInt32(0));
+    sites.push_back({marker, *pre, {marker->getArgOperand(0)}, valid, marker->getArgOperand(0)});
   }
-  if (auto e = optimizeLLVMIR(m, report)) return std::move(e);
-  if (llvm::verifyModule(m, &llvm::errs())) return error("fused LLVM IR failed verification");
+  for (auto *marker : boundaries->outputs)
+    sites.push_back({marker, *post, {marker->getArgOperand(0)}, nullptr, nullptr});
+  auto fused = inlineValueBoundaries(m, *helpers, sites, report);
+  if (!fused) return fused.takeError();
+  if (auto e = optimizeLLVMIR(**fused, report)) return std::move(e);
+  if (llvm::verifyModule(**fused, &llvm::errs())) return error("fused LLVM IR failed verification");
   report["fusion"] = llvm::json::Object{{"protocol", "ask.triton.boundary.v1"},
-      {"external_op", external->getAttrOfType<mlir::StringAttr>("ask.id").getValue()},
-      {"entry", *entryName}, {"inlined_helpers", 2}, {"removed_boundary_markers", 2},
+      {"external_op", external->getAttrOfType<mlir::StringAttr>("ask.id").getValue().str()},
+      {"entry", entryName->str()}, {"inlined_helpers", static_cast<int64_t>(sites.size())},
+      {"removed_boundary_markers", static_cast<int64_t>(sites.size())},
+      {"helper_functions", 2}, {"boundary_inliner", "ask.llvm.value-boundary.v1"},
       {"original_llir_sha256", digest(*payload)}, {"ask_helpers_sha256", digest(helperIR)},
       {"launch_policy", "preserved"}, {"input_mask_other", "preserved"},
       {"llvm_verified", true}, {"device_execution_performed", false}};
-  return std::move(*imported);
+  return std::move(*fused);
 }
 } // namespace ask::llir

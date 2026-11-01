@@ -23,7 +23,7 @@ import sys
 import tempfile
 
 PROTOCOL_VERSION = 1
-ADAPTER_VERSION = "0.2.0"
+ADAPTER_VERSION = "0.3.0"
 SUPPORTED_TRITON_VERSION = "3.7.1"
 SUPPORTED_TARGET = {"backend": "cuda", "arch": 80, "warp_size": 32}
 
@@ -98,9 +98,10 @@ def validate_request(request):
             "constexpr values must be named signed 64-bit integers")
     require(not set(constants).intersection(signature),
             "data parameters cannot also be constexprs")
-    require(request["fixed_options"] == {"num_warps": 4} and
-            type(request["fixed_options"].get("num_warps")) is int,
-            "initial adapter requires fixed_options={num_warps: 4}", "UnsupportedOptions")
+    require(set(request["fixed_options"]) == {"num_warps"} and
+            type(request["fixed_options"].get("num_warps")) is int and
+            request["fixed_options"]["num_warps"] in (4, 8),
+            "adapter requires fixed_options={num_warps: 4|8}", "UnsupportedOptions")
     require(request["target"] == SUPPORTED_TARGET and
             type(request["target"].get("arch")) is int and
             type(request["target"].get("warp_size")) is int,
@@ -356,8 +357,8 @@ def build_artifact(request, compiled, triton_version, source_order):
             "target": {**request["target"], "data_layout": layout[0]},
             "port_map": port_map,
             "invocation": {"kind": "cuda-kernel", "version": 1,
-                           "grid": request["grid"], "block": [128, 1, 1],
-                           "num_warps": 4, "num_ctas": 1, "shared_bytes": 0,
+                           "grid": request["grid"], "block": [metadata["num_warps"] * metadata["warp_size"], 1, 1],
+                           "num_warps": metadata["num_warps"], "num_ctas": 1, "shared_bytes": 0,
                            "arguments": arguments, "resources": resources,
                            "completion": "device-event", "compiler_metadata": metadata},
             "dependencies": dependencies,

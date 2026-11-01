@@ -2,6 +2,8 @@
 
 [返回顶层设计](核心思想.md#ask-c) · [B 层导入](03-B层多源降级与低层归一化.md) · [运行时设计](05-代码生成与运行时.md) · [框架 API](10-上层框架接入.md)
 
+LLVM 链接和内联已抽成[与编译器无关的值边界接口](13-通用LLVM值边界内联.md)。本章说明其中一条具体的 Triton 导出和 GPU 执行路径；这些适配器限制不属于通用内联核心。
+
 本章描述已经实现的窄路径。输入仍是框架生成的 ASK IR，外部节点仍携带 Triton DSL。例子是 `P: t=x+1 → F: u=t*2 → Q: y=u+3`，三个计算最终在一个 GPU kernel 中执行。
 
 ## 1. 一次编译到底做了什么
@@ -17,7 +19,7 @@
 
 ## 2. 怎样找到边界，为什么允许内联 PTX
 
-首版适配器接受以下形式，变量名可以变化；`mask` 和 `other` 使用关键字参数：
+适配器接受以下逻辑访问关系。局部别名、等价交换运算和重赋值由数据流分析处理；`mask` 可以使用位置或关键字参数：
 
 ```python
 i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -26,13 +28,13 @@ x = tl.load(input_ptr + i, mask=i < N, other=0)
 tl.store(output_ptr + i, x * 2, mask=i < N)
 ```
 
-AST 检查要求只有一次输入读、一次输出写，二者索引和掩码相同。禁止重赋值、指针逃逸、额外调用、原子操作、分支、循环和归约。无法说明整个函数体，就返回 `UnsupportedFusion`。
+AST 检查要求只有一次逻辑输入读、一次逻辑输出写，二者索引和掩码相同。禁止指针逃逸、未知调用、原子操作、分支、循环和归约。无法说明整个函数体，就返回 `UnsupportedFusion`。一个线程处理多个元素时，编译器可以把逻辑边界展开成多个 LLVM 站点；导出器记录数量，融合器逐个处理。
 
 适配器用公开 `tl.inline_asm_elementwise` 在读取结果、写入值上各插入一个已知 identity：`mov.b32 $0, $1`。它显式携带值、地址、索引和掩码。编译时暂用 `is_pure=False` 保留这两个位置；这只是低层追踪手段，不是给高层 `ask.mark` 增加副作用。标记既不读写内存，也不做同步，融合结束后必须全部删除。
 
-融合器识别的是 ASK 自己定义的精确标记协议，并检查 LLVM 调用类型、端口地址、两端索引和掩码，以及绑定该模块的摘要。它不根据未知 PTX 字符串猜测 load/store 的语义。普通外部 LLVM 导入也不要求有这些标记；只有这个可选融合 Pass 要求边界证明。
+Triton 绑定层识别 ASK 自己定义的标记协议，核对 LLVM 调用类型、端口地址和绑定模块的摘要。地址通过 ScalarEvolution 比较表达式；掩码在临时克隆中与预期条件比较，经过 LLVM 归一化后必须得到恒真。等价的位运算形式因此不必被误拒绝。证明不了仍拒绝，原模块不受这次分析改写。它不根据未知 PTX 字符串猜测 load/store 的语义。普通外部 LLVM 导入也不要求有这些标记。
 
-输入侧实际替换为 `select(mask, P(loaded), loaded)`。无效 lane 继续使用 F 原来的 `other=0`。输出侧把值替换为 `Q(value)`，保留 F 原来的 store 和 mask。x、y 使用独立分配，t、u 不再物化。
+输入侧的值语义是 `select(mask, P(loaded), loaded)`；通用内联器用条件分支保护标量 helper，后续 LLVM 可再简化。无效 lane 继续使用 F 原来的 `other=0`。输出侧把值替换为 `Q(value)`，保留 F 原来的 store 和 mask。x、y 使用独立分配，t、u 不再物化。
 
 `fusion_contract` 记录 DSL 检查结论、原源码摘要、插入标记后的源码摘要和导出 LLVM 摘要。它来自受信任的适配器，并不是对任意外部程序的形式化证明。模块被改写后，这份契约移到 `source_fusion_contract`，只表示来源；不能再用它定位新 IR 的指令。高层 ShapeSnapshot 则写入融合产物及 `!ask.shape_snapshot`，不会从 LLVM 指针反推形状。
 
@@ -40,11 +42,11 @@ AST 检查要求只有一次输入读、一次输出写，二者索引和掩码�
 
 | 项目 | 当前要求 |
 |---|---|
-| ASK 图 | 一个函数、一个一维静态 i32 输入、一个同形状输出、一个 external |
+| ASK 图 | 一个函数、一个任意 rank 静态 i32 输入、一个同形状输出、一个 external |
 | P / Q | `constant/splat/add/mul`；P 只依赖图输入，Q 只依赖 F 输出及常量 |
-| F | 上述 AST 子集，Triton 3.7.1；边界 identity 可保留为一对标量 LLVM 调用 |
-| 形状 | `1 <= N <= 2147483520`，N 必须与 ASK 类型一致 |
-| 固定策略 | `BLOCK=128`、4 warps、`grid=[ceil(N/128),1,1]`、无共享或 scratch 存储 |
+| F | 上述数据流子集，Triton 3.7.1；identity 可展开成多对 LLVM 调用 |
+| 形状 | `1 <= N <= 2147483520`，N 是 ASK 张量元素总数，ShapeSnapshot 保留原始维度 |
+| 固定策略 | BLOCK 为 1–1024 的二次幂；4 或 8 warps；`grid=[ceil(N/BLOCK),1,1]`；保留请求策略，无共享或 scratch 存储 |
 | 目标 | CUDA sm80，warp32；运行器核对设备二进制兼容性 |
 | ABI | 两个 i32 数据指针、两个已证明未使用的 scratch 指针，后两者传 null |
 | 运行输入 | Python i32 列表，复制到连续且互不重叠的设备缓冲区 |
@@ -126,6 +128,6 @@ PYTHONPATH=python python3 examples/triton_fused_gpu.py \
 
 脚本要求新缓存，验证 N 为 1、10、127、128、129、257、4097 的七组输入，覆盖整 block、尾部 mask、多 block、正负边界和固定种子随机数；再分别修改 ASK 常量、Triton DSL 和形状检查失效。输出 `execution.json`、代码生成命令和文件摘要，以及总表 `validation.json`。GPU 测试需要实际设备，普通 CTest 不会把“无 GPU 时跳过”记作数值验证成功。
 
-无 GPU 的测试另行检查真实 Triton 导出后的 LLVM link/inline、失配的形状/摘要/边界拒绝，以及缓存损坏、失败后重试和多进程竞争。相关实现：[Fuse.cpp](../lib/LLIR/Fuse.cpp)、[Triton 边界导出](../adapters/triton/fusion.py)、[GPU 编译入口](../python/ask/gpu.py)、[CUDA 运行器](../python/ask/cuda.py)、[IR 缓存](../python/ask/cache.py)。
+无 GPU 的测试另行检查真实 Triton 导出后的 LLVM link/inline、失配的形状/摘要/边界拒绝，以及缓存损坏、失败后重试和多进程竞争。相关实现：[通用内联](../lib/LLIR/Inline.cpp)、[ASK 图衔接](../lib/LLIR/Fuse.cpp)、[Triton 边界绑定](../lib/Adapters/TritonBoundary.cpp)、[Triton 边界导出](../adapters/triton/fusion.py)、[GPU 编译入口](../python/ask/gpu.py)、[CUDA 运行器](../python/ask/cuda.py)、[IR 缓存](../python/ask/cache.py)。
 
-本次在 RTX 3080（sm86）上使用 Triton 3.7.1、锁定 LLVM 23.0.0git 和 ptxas 12.8.93 实测：17 次 GPU 执行全部逐位一致，IR 缓存 7 次命中、10 次未命中。另一次故意破坏 `fused.ll` 缓存文件，返回 `invalid` 并重建，GPU 结果仍正确。核心构建的 8 组 CTest 和 Triton 构建的 10 组 CTest 均通过。这里只证明表中子集，未宣称任意 Triton kernel 可以融合。
+在 RTX 3080（sm86）上使用 Triton 3.7.1、锁定 LLVM 23.0.0git 和 ptxas 12.8.93 实测：默认 17 例全部逐位一致，IR 缓存 7 次命中、10 次未命中；另已验证损坏 `fused.ll` 后返回 `invalid` 并重建。加入 `--extended` 的 31 例也全部通过，共比较 12409 个 i32 结果，缓存 14 次命中、17 次未命中，并逐次核对形状和报告入口。核心构建的 10 组 CTest 和 Triton 构建的 12 组 CTest 均通过。这里只证明表中子集，未宣称任意 Triton kernel 可以融合。

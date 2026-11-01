@@ -39,6 +39,7 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     artifact = json.loads((success / "exports/external-0.artifact.json").read_text())
     assert report["phase"] == "fused_llvm"
     assert report["fusion"]["inlined_helpers"] == 2
+    assert report["fusion"]["entry"] == artifact["entry"]
     assert report["fusion"]["removed_boundary_markers"] == 2
     assert "ASK_BOUNDARY" not in fused and "__ask_pre" not in fused
     assert "ld.global.b32" in fused and "st.global.b32" in fused
@@ -64,7 +65,7 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
             "p=argparse.ArgumentParser()\np.add_argument('--request')\np.add_argument('--output')\n"
             "a=p.parse_args()\n"
             f"Path(a.output).write_bytes(Path({str(response)!r}).read_bytes())\n")
-        fuse(name, graph, fake_worker, message)
+        return fuse(name, graph, fake_worker, message)
 
     bad = copy.deepcopy(artifact)
     bad["payload"] += "\n; corruption\n"
@@ -78,6 +79,12 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     bad = copy.deepcopy(artifact)
     bad["fusion_contract"]["proof"]["same_mask"] = False
     replay("mask-proof", bad, "same_mask")
+    bad = copy.deepcopy(artifact)
+    bad["fusion_contract"]["proof"]["layout"]["matched_uninstrumented_baseline"] = False
+    replay("changed-layout", bad, "preserved the producer layout")
+    bad = copy.deepcopy(artifact)
+    bad["fusion_contract"]["input"]["marker_count"] += 1
+    replay("site-coverage", bad, "count")
     bad = copy.deepcopy(artifact)
     bad["fusion_contract"]["shape"] = [11]
     replay("shape", bad, "shape/constexpr")
@@ -97,4 +104,22 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
         replay(name, bad, message)
     replay("post-other-input", artifact, "different graph input",
            source.replace('"ask.add"(%um, %threes)', '"ask.add"(%um, %x)'))
-    print("Native LLVM helper linking/inlining verified; 10 inconsistent boundary requests rejected")
+    # Equivalent predicates must not depend on the producer's exact spelling.
+    import re
+    equivalent = copy.deepcopy(artifact)
+    equivalent["payload"], changed = re.subn(r'icmp slt i32 (%[\w.]+), 10',
+                                              r'icmp sle i32 \1, 9', equivalent["payload"])
+    assert changed
+    equivalent["fusion_contract"]["llir_sha256"] = hashlib.sha256(equivalent["payload"].encode()).hexdigest()
+    replay("equivalent-predicate", equivalent, None)
+
+    # BLOCK > physical threads creates two value sites per logical boundary.
+    # N=19 also makes one masked lane group normalize to a sign-bit expression.
+    multiple = source.replace("tensor<10xi32>", "tensor<19xi32>").replace(
+        "array<i64: 10>", "array<i64: 19>").replace("N = 10", "N = 19").replace(
+        "BLOCK = 128", "BLOCK = 256")
+    multi = fuse("multiple-sites", multiple)
+    multi_report = json.loads((multi / "report.json").read_text())
+    assert multi_report["fusion"]["removed_boundary_markers"] == 4
+    assert "ASK_BOUNDARY" not in (multi / "fused.ll").read_text()
+    print("Native LLVM fusion verified including equivalent masks and multiple sites; 12 inconsistent requests rejected")

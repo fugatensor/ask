@@ -47,10 +47,15 @@ def _contract(artifact):
     invocation = artifact.get("invocation", {})
     _require(isinstance(invocation, dict) and invocation.get("kind") == "cuda-kernel" and invocation.get("version") == 1,
              "unsupported invocation kind/version")
-    _require(invocation.get("block") == [128, 1, 1]
-             and invocation.get("num_warps") == 4 and invocation.get("num_ctas") == 1
-             and invocation.get("shared_bytes") == 0,
-             "initial CUDA runtime requires original block128/4warps/1CTA/no shared memory")
+    warps = invocation.get("num_warps")
+    _require(type(warps) is int and 0 < warps <= 32 and warps & (warps - 1) == 0,
+             "num_warps must be a positive power of two within CUDA's thread-block limit")
+    block = invocation.get("block")
+    _require(isinstance(block, list) and len(block) == 3
+             and all(type(n) is int for n in block) and block == [warps * target["warp_size"], 1, 1],
+             "launch block must match the producer's declared num_warps and warp size")
+    _require(invocation.get("num_ctas") == 1 and invocation.get("shared_bytes") == 0,
+             "current CUDA runner requires one CTA per program and no shared memory")
     grid = invocation.get("grid")
     _require(isinstance(grid, list) and len(grid) == 3
              and all(type(n) is int and 0 < n <= 2**31 - 1 for n in grid), "invalid launch grid")
@@ -81,9 +86,12 @@ def _contract(artifact):
     size = constants.get("N")
     _require(type(size) is int and 0 <= size <= 2**31 - 1,
              "initial CUDA runner requires explicit nonnegative constexpr N")
-    _require(constants.get("BLOCK") == 128, "initial CUDA runner requires constexpr BLOCK=128")
-    _require(grid == [max(1, (size + 127) // 128), 1, 1],
-             "initial CUDA runner requires the original one-dimensional grid covering N with block128")
+    elements_per_program = constants.get("BLOCK")
+    _require(type(elements_per_program) is int and 0 < elements_per_program <= 2**30
+             and elements_per_program & (elements_per_program - 1) == 0,
+             "constexpr BLOCK must be a positive power of two within the signed-index range")
+    _require(grid == [max(1, (size + elements_per_program - 1) // elements_per_program), 1, 1],
+             "launch grid must match the producer's declared N/BLOCK element partition")
     return entry, invocation, size
 
 
@@ -91,7 +99,8 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
     """Compile the exact supplied LLVM bytes to a new cubin; never reuse Triton binaries.
 
     llc and ptxas are explicit executable paths. No target or launch policy is
-    selected here: the first supported contract fixes sm_80 and block128.
+    selected here. The current target is sm_80; launch dimensions come from the
+    producer artifact rather than a runtime-selected scheduling policy.
     """
     entry, invocation, _ = _contract(artifact)
     llvm_ir, output_directory = Path(llvm_ir).resolve(), Path(output_directory).resolve()
@@ -237,8 +246,10 @@ def execute_i32(artifact, codegen, values, *, device_ordinal=0, driver_library=N
     grid = invocation["grid"]
     _require(all(value <= driver.attribute(device, attr) for value, attr in zip(grid, (5, 6, 7))),
              "launch grid exceeds device limits")
-    _require(driver.attribute(device, 1) >= 128 and driver.attribute(device, 2) >= 128,
-             "device cannot launch the fixed block size")
+    block = invocation["block"]
+    _require(driver.attribute(device, 1) >= block[0]
+             and all(value <= driver.attribute(device, attr) for value, attr in zip(block, (2, 3, 4))),
+             "device cannot launch the producer's block dimensions")
     context, module = ctypes.c_void_p(), ctypes.c_void_p()
     allocations = []
     # Use push/pop context semantics so a caller's existing current context is
@@ -262,8 +273,8 @@ def execute_i32(artifact, codegen, values, *, device_ordinal=0, driver_library=N
         _require(status == 1, "compiled kernel must have exactly four parameters")
         _require(driver.function_attribute(function, 1) == 0,
                  "compiled kernel unexpectedly requires static shared memory")
-        _require(driver.function_attribute(function, 0) >= 128,
-                 "compiled kernel resource use cannot support the fixed block128")
+        _require(driver.function_attribute(function, 0) >= block[0],
+                 "compiled kernel resource use cannot support the producer's block dimensions")
         registers = driver.function_attribute(function, 4)
         storage = ctypes.c_int32 * max(size, 1)
         host_input, host_output = storage(*values), storage()

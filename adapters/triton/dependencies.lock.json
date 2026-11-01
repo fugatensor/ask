@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "adapter_version": "0.2.0",
+  "adapter_version": "0.3.0",
   "protocol_version": 1,
   "compiler": {"name": "triton", "version": "3.7.1"},
   "observed_python_version": "3.14.7",
@@ -26,7 +26,7 @@
     "public_api_export": "passed",
     "gpu_execution": "passed: fresh LLVM-to-PTX-to-cubin on RTX 3080 (sm86)",
     "native_llvm_fusion": "passed: ASK pre/post helpers linked and inlined into Triton LLIR",
-    "ir_cache": "passed: 17-request matrix, 7 hits and 10 misses",
-    "scope": "static 1D i32 pointwise, two data pointers, N/BLOCK constexprs, num_warps=4, zero shared/scratch"
+    "ir_cache": "passed: 31-request extended GPU matrix, 14 hits and 17 misses",
+    "scope": "static contiguous i32 pointwise, two data pointers, N/BLOCK constexprs, num_warps=4 or 8, zero shared/scratch"
   }
 }

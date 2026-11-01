@@ -2,7 +2,7 @@
 
 ASK 用 MLIR 的 `ask` dialect 接收上层框架生成的计算图，以原生 LLVM IR 承接低层产物。这个仓库已开始实现编译器初稿；当前入口是 Python SDK 和原生 `ask-opt`。
 
-目前可以构建、检查和准备单基本块的 i32 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。可选优化支持常量折叠、死代码消除、自有逐元素多输出融合，以及原生 LLVM 基础清理。另已跑通受限的一维 i32 ASK→Triton→ASK 融合：链接并内联原生 LLVM IR，重新生成 cubin，在 GPU 上执行；提供持久 IR 缓存和命中统计。支持范围及复现命令见[GPU 融合与 IR 缓存](docs/12-GPU融合与IR缓存.md)。完整混合图调度仍待实现。
+目前可以构建、检查和准备单基本块的 i32 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。可选优化支持常量折叠、死代码消除、自有逐元素多输出融合，以及原生 LLVM 基础清理。另已跑通受限的静态 i32 ASK→Triton→ASK 融合：链接并内联原生 LLVM IR，重新生成 cubin，在 GPU 上执行；提供持久 IR 缓存和命中统计。支持范围及复现命令见[GPU 融合与 IR 缓存](docs/12-GPU融合与IR缓存.md)。完整混合图调度仍待实现。
 
 ## 构建
 
@@ -42,6 +42,8 @@ build/core/bin/ask-opt tests/ir/pipeline.mlir \
 ```
 
 SDK 用法、当前支持范围和诊断处理见[上层框架接入](docs/10-上层框架接入.md)。架构设计从[核心思想](docs/核心思想.md)开始，分阶段说明见[文档目录](docs/README.md)。设计文档中的完整接口不等于当前版本已经实现的 API。
+
+低层还提供[通用 LLVM 值边界内联接口](docs/13-通用LLVM值边界内联.md)：接收已确认的边界和 typed helper，支持多参数、多站点、整数、浮点和定长向量，失败时保留输入模块。Triton 的源码、布局和启动检查放在适配器中。GPU 示例的 `--extended` 覆盖多维形状、不同 BLOCK/warp 配置及每线程多个元素。
 
 C++ 框架也可以通过安装后的 `ASK::Core` 直接构造和准备 MLIR，无需 Python。[C++ 示例](examples/cpp/frontend.cpp)及其 [CMake 项目](examples/cpp/CMakeLists.txt)演示独立消费已安装的 SDK，构建命令见接入文档第 8 节。
 

@@ -66,7 +66,7 @@ with tempfile.TemporaryDirectory(prefix="ask-triton-e2e-") as directory:
     # A failed selected-worker request must not publish an exported manifest.
     bad_graph = Path(directory) / "unsupported-options.mlir"
     bad_graph.write_text((root / "tests/ir/pipeline.mlir").read_text().replace(
-        "num_warps = 4", "num_warps = 8"))
+        "num_warps = 4", "num_warps = 16"))
     rejected = Path(directory) / "rejected"
     rejected_output = Path(directory) / "rejected.mlir"
     failed = subprocess.run([driver, str(bad_graph), "--export-external",

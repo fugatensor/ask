@@ -6,6 +6,8 @@
 #include "llvm/Support/JSON.h"
 
 namespace ask::llir {
+// ASK graph -> helper lowering and the currently registered Triton path.
+// For compiler-independent native LLVM transformations use Inline.h.
 // The adapter's boundary contract is a trusted compiler artifact, not a proof
 // inferred from unknown inline assembly. Unsupported graphs fail closed.
 // graph must have passed prepareModule (including marker extraction).

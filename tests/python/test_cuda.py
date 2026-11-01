@@ -13,14 +13,14 @@ sys.path.insert(0, str(ROOT / "python"))
 from ask.cuda import CUDAError, compile_cuda, execute_i32
 
 
-def artifact(size=10):
+def artifact(size=10, *, block=128, num_warps=4):
     return {
         "format": "llvm-ir", "entry": "scale2", "payload": "define void @fixture() { ret void }\n",
         "target": {"backend": "cuda", "arch": 80, "warp_size": 32},
-        "specializations": {"constants": {"N": size, "BLOCK": 128}},
+        "specializations": {"constants": {"N": size, "BLOCK": block}},
         "invocation": {"kind": "cuda-kernel", "version": 1,
-                       "grid": [max(1, (size + 127) // 128), 1, 1], "block": [128, 1, 1],
-                       "num_warps": 4, "num_ctas": 1, "shared_bytes": 0,
+                       "grid": [max(1, (size + block - 1) // block), 1, 1], "block": [num_warps * 32, 1, 1],
+                       "num_warps": num_warps, "num_ctas": 1, "shared_bytes": 0,
                        "arguments": [
                            {"argument": 0, "binding": "input:0", "llvm_type": "ptr addrspace(1)"},
                            {"argument": 1, "binding": "output:0", "llvm_type": "ptr addrspace(1)"},
@@ -69,6 +69,16 @@ class CUDAContractTests(unittest.TestCase):
                 result = self.compile_fixture(Path(temporary), value)
                 self.assertEqual(result["invocation"]["grid"], value["invocation"]["grid"])
 
+    def test_element_partition_and_thread_block_are_independent(self):
+        # BLOCK counts logical elements. num_warps determines physical threads;
+        # a thread may process several elements, or not own an active element.
+        for block, warps in ((64, 4), (128, 8), (256, 4), (512, 8), (1024, 4)):
+            with self.subTest(block=block, warps=warps), tempfile.TemporaryDirectory() as temporary:
+                value = artifact(513, block=block, num_warps=warps)
+                result = self.compile_fixture(Path(temporary), value)
+                self.assertEqual(result["invocation"]["block"], [warps * 32, 1, 1])
+                self.assertEqual(result["invocation"]["grid"], [(513 + block - 1) // block, 1, 1])
+
     def test_invalid_launch_and_abi_rejected_before_tools_or_driver(self):
         changes = [
             lambda a: a["invocation"].update(grid=[0, 1, 1]),
@@ -82,7 +92,13 @@ class CUDAContractTests(unittest.TestCase):
             lambda a: a["specializations"]["constants"].update(N=-1),
             lambda a: a["specializations"]["constants"].update(N=True),
             lambda a: a["specializations"]["constants"].update(N=129),
-            lambda a: a["specializations"]["constants"].update(BLOCK=64),
+            lambda a: a["specializations"]["constants"].update(BLOCK=0),
+            lambda a: a["specializations"]["constants"].update(BLOCK=96),
+            lambda a: a["specializations"]["constants"].update(BLOCK=True),
+            lambda a: a["invocation"].update(num_warps=0),
+            lambda a: a["invocation"].update(num_warps=3),
+            lambda a: a["invocation"].update(num_warps=True),
+            lambda a: a["invocation"].update(num_warps=8),
             lambda a: a["invocation"]["arguments"][0].update(binding="output:0"),
             lambda a: a["invocation"]["arguments"][1].update(llvm_type="i64"),
             lambda a: a["invocation"]["arguments"].pop(),

@@ -65,37 +65,118 @@ def _integer(node):
     return None
 
 
-def _assignment(statement, used):
+def _assignment(statement, protected):
     require(isinstance(statement, ast.Assign) and len(statement.targets) == 1 and
             isinstance(statement.targets[0], ast.Name), "expected a single local assignment")
     name = statement.targets[0].id
-    require(name not in used, "reassignment or shadowing is outside the fusion subset: " + name)
-    used.add(name)
+    require(name not in protected, "kernel parameters and compiler modules cannot be shadowed: " + name)
     return name
 
 
-def _keywords(call, expected):
-    names = [item.arg for item in call.keywords]
-    require(set(names) == set(expected) and len(names) == len(expected),
-            "unsupported or repeated keyword on boundary memory operation")
-    return {item.arg: item.value for item in call.keywords}
+def _bind(call, parameters):
+    """Bind public call parameters, independent of keyword/positional spelling."""
+    require(len(call.args) <= len(parameters), "too many memory/index call arguments")
+    result = dict(zip(parameters, call.args))
+    for item in call.keywords:
+        require(item.arg in parameters and item.arg not in result,
+                "unknown or repeated memory/index call argument")
+        result[item.arg] = item.value
+    require(set(result) == set(parameters), "missing explicit memory/index call argument")
+    return result
 
 
-def _pointwise(node, values, constants):
-    number = _integer(node)
-    if number is not None:
-        require(-(2**31) <= number < 2**31, "pointwise literal must fit signed i32")
-        return
-    if isinstance(node, ast.Name):
-        require(node.id in values or node.id in constants,
-                "pointwise arithmetic may use only loaded values, prior results, and constexprs")
-        return
-    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
-        _pointwise(node.left, values, constants)
-        _pointwise(node.right, values, constants)
-        return
-    raise FusionError("pointwise subset permits only i32 values, literals, add, sub, and multiply")
+def _linear(pid=0, lane=0, constant=0):
+    return ("linear", (pid, lane, constant))
 
+
+class _Dataflow:
+    """Small abstract interpreter for scalar arithmetic and contiguous addresses.
+
+    Affine coefficients describe program_id(0), arange(0, BLOCK), and a constant.
+    Values loaded from memory remain opaque numeric values. Every call and
+    statement is checked; proving one address never hides an unknown effect.
+    """
+    def __init__(self, constants, bindings):
+        self.constants = constants
+        self.names = {name: _linear(constant=value) for name, value in constants.items()}
+        self.names.update({name: ("pointer", binding, (0, 0, 0))
+                           for name, binding in bindings.items()})
+        self.index = (constants["BLOCK"], 1, 0)
+        self.mask = ("mask", self.index, constants["N"])
+        # Construct an immutable index expression from the proved affine form.
+        # Referencing a local name here would be wrong after that local is
+        # reassigned between the input and output boundary.
+        self.index_ast = _expression("tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)")
+
+    def evaluate(self, node):
+        number = _integer(node)
+        if number is not None:
+            require(-(2**31) <= number < 2**31, "literal must fit signed i32")
+            return _linear(constant=number)
+        if isinstance(node, ast.Name):
+            require(node.id in self.names, "unknown or forward local reference: " + node.id)
+            return self.names[node.id]
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            value = self.evaluate(node.operand)
+            require(value[0] in ("linear", "value"), "unary arithmetic requires numeric values")
+            if isinstance(node.op, ast.UAdd):
+                return value
+            return ("linear", tuple(-x for x in value[1])) if value[0] == "linear" else value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult)):
+            left, right = self.evaluate(node.left), self.evaluate(node.right)
+            if left[0] == "pointer" or right[0] == "pointer":
+                # Only pointer + element offset (either order), or pointer -
+                # offset. Pointer-pointer arithmetic and numeric casts escape.
+                if right[0] == "pointer" and isinstance(node.op, ast.Add):
+                    left, right = right, left
+                require(left[0] == "pointer" and right[0] == "linear" and
+                        isinstance(node.op, (ast.Add, ast.Sub)), "unsupported pointer arithmetic")
+                sign = -1 if isinstance(node.op, ast.Sub) else 1
+                return ("pointer", left[1], tuple(a + sign * b for a, b in zip(left[2], right[1])))
+            require(left[0] in ("linear", "value") and right[0] in ("linear", "value"),
+                    "arithmetic requires numeric values")
+            if left[0] == right[0] == "linear":
+                a, b = left[1], right[1]
+                if isinstance(node.op, (ast.Add, ast.Sub)):
+                    sign = -1 if isinstance(node.op, ast.Sub) else 1
+                    return ("linear", tuple(x + sign * y for x, y in zip(a, b)))
+                if a[:2] == (0, 0):
+                    return ("linear", tuple(a[2] * y for y in b))
+                if b[:2] == (0, 0):
+                    return ("linear", tuple(b[2] * x for x in a))
+            # Non-affine pure arithmetic can compute a stored value, but cannot
+            # serve as a proven address or mask in this adapter.
+            return ("value",)
+        if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
+            left, right = self.evaluate(node.left), self.evaluate(node.comparators[0])
+            if isinstance(node.ops[0], ast.Gt):
+                left, right = right, left
+            else:
+                require(isinstance(node.ops[0], ast.Lt), "boundary predicate must be a strict upper bound")
+            require(left[0] == right[0] == "linear" and right[1][:2] == (0, 0),
+                    "predicate must compare an affine index with a constexpr bound")
+            return ("mask", left[1], right[1][2])
+        if _call(node, "program_id"):
+            args = _bind(node, ("axis",))
+            require(self.evaluate(args["axis"]) == _linear(), "only program_id axis 0 is supported")
+            return _linear(pid=1)
+        if _call(node, "arange"):
+            args = _bind(node, ("start", "end"))
+            require(self.evaluate(args["start"]) == _linear() and
+                    self.evaluate(args["end"]) == _linear(constant=self.constants["BLOCK"]),
+                    "arange must span [0, BLOCK)")
+            return _linear(lane=1)
+        raise FusionError("unsupported expression or call in boundary dataflow")
+
+    def address(self, node, binding):
+        require(self.evaluate(node) == ("pointer", binding, self.index),
+                "memory address does not cover the declared port at the logical index")
+
+    def predicate(self, node):
+        require(self.evaluate(node) == self.mask, "memory mask must describe the logical index < N")
+
+    def numeric(self, node):
+        require(self.evaluate(node)[0] in ("linear", "value"), "stored value must be numeric")
 
 def _trace(value, address, index, mask, asm):
     mask_i32 = ast.Call(func=ast.Attribute(value=copy.deepcopy(mask), attr="to", ctx=ast.Load()),
@@ -104,7 +185,7 @@ def _trace(value, address, index, mask, asm):
         ast.keyword(arg="asm", value=ast.Constant(asm)),
         ast.keyword(arg="constraints", value=ast.Constant(CONSTRAINTS)),
         ast.keyword(arg="args", value=ast.List(elts=[copy.deepcopy(value), copy.deepcopy(address),
-                                                    ast.Name(id=index, ctx=ast.Load()), mask_i32],
+                                                    copy.deepcopy(index), mask_i32],
                                                 ctx=ast.Load())),
         ast.keyword(arg="dtype", value=_expression("tl.int32")),
         ast.keyword(arg="is_pure", value=ast.Constant(False)),
@@ -120,11 +201,16 @@ def instrument(request):
     count = constants["N"]
     require(type(count) is int and 1 <= count <= MAX_ELEMENTS,
             f"fusion requires 1 <= N <= {MAX_ELEMENTS}; zero-sized graphs use ordinary execution")
-    require(constants["BLOCK"] == 128, "fusion currently requires the existing BLOCK=128 strategy")
-    require(request["grid"] == [(count + 127) // 128, 1, 1],
-            "fusion requires the existing grid to cover exactly ceil(N / 128) blocks")
-    require(request["fixed_options"] == {"num_warps": 4},
-            "fusion currently requires the existing num_warps=4 strategy")
+    block = constants["BLOCK"]
+    require(type(block) is int and 1 <= block <= 1024 and block & (block - 1) == 0,
+            "BLOCK must be a power of two no larger than 1024")
+    require(request["grid"] == [(count + block - 1) // block, 1, 1] and
+            request["grid"][0] * block <= 2**31,
+            "grid must cover ceil(N / BLOCK) blocks without overflowing signed i32 indices")
+    warps = request["fixed_options"].get("num_warps")
+    require(set(request["fixed_options"]) == {"num_warps"} and
+            type(warps) is int and warps in (4, 8),
+            "fusion supports the requested num_warps=4 or 8 strategy")
     input_name = next(name for name, binding in request["source_bindings"].items()
                       if binding == "input:0")
     output_name = next(name for name, binding in request["source_bindings"].items()
@@ -136,53 +222,47 @@ def instrument(request):
     used = {argument.arg for argument in function.args.args}
     require(not used.intersection({"tl", "triton"}), "kernel arguments must not shadow Triton modules")
     used.update({"tl", "triton"})
-    statements = function.body
-    require(len(statements) >= 3, "fusion requires index, load, and store statements")
-    index = _assignment(statements[0], used)
-    require(_same(statements[0].value,
-                  _expression("tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)")),
-            "index must be program_id(0) * BLOCK + arange(0, BLOCK)")
-    mask_expression = _expression(index + " < N")
-    cursor = 1
-    mask = mask_expression
-    if isinstance(statements[cursor], ast.Assign) and _same(statements[cursor].value, mask_expression):
-        mask_name = _assignment(statements[cursor], used)
-        mask = ast.Name(id=mask_name, ctx=ast.Load())
-        cursor += 1
-    require(cursor < len(statements) - 1, "missing guarded input load")
-    load_statement = statements[cursor]
-    loaded_name = _assignment(load_statement, used)
-    load = load_statement.value
-    require(_call(load, "load") and len(load.args) == 1,
-            "fusion requires exactly one assigned tl.load")
-    require(_same(load.args[0], _expression(input_name + " + " + index)),
-            "input load address must be input pointer plus the canonical index")
-    load_keywords = _keywords(load, {"mask", "other"})
-    require(_same(load_keywords["mask"], mask) and _integer(load_keywords["other"]) == 0,
-            "input load requires the canonical mask and other=0")
-
-    values = {loaded_name}
-    for statement in statements[cursor + 1:-1]:
-        name = _assignment(statement, used)
-        _pointwise(statement.value, values, constants)
-        values.add(name)
-    last = statements[-1]
-    require(isinstance(last, ast.Expr) and _call(last.value, "store") and len(last.value.args) == 2,
-            "fusion requires exactly one final tl.store")
-    store = last.value
-    require(_same(store.args[0], _expression(output_name + " + " + index)),
-            "output store address must use the same canonical index")
-    store_keywords = _keywords(store, {"mask"})
-    require(_same(store_keywords["mask"], mask), "output store must use the input load mask")
-    _pointwise(store.args[1], values, constants)
-
-    # Keep every original computation. Only the load's result and store's value
-    # pass through a register-to-register identity with explicit boundary data.
-    input_trace = ast.Assign(targets=[ast.Name(id=loaded_name, ctx=ast.Store())],
-                             value=_trace(ast.Name(id=loaded_name, ctx=ast.Load()),
-                                          load.args[0], index, mask, INPUT_ASM))
-    store.args[1] = _trace(store.args[1], store.args[0], index, mask, OUTPUT_ASM)
-    function.body.insert(cursor + 1, input_trace)
+    flow = _Dataflow(constants, request["source_bindings"])
+    rewritten = []
+    input_trace = store = None
+    for statement in function.body:
+        if isinstance(statement, ast.Assign):
+            name = _assignment(statement, used)
+            if _call(statement.value, "load"):
+                require(input_trace is None and store is None, "expected exactly one input load before output store")
+                args = _bind(statement.value, ("pointer", "mask", "other"))
+                flow.address(args["pointer"], "input:0")
+                flow.predicate(args["mask"])
+                require(flow.evaluate(args["other"]) == _linear(), "input load requires other=0")
+                flow.names[name] = ("value",)
+                input_trace = ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())],
+                    value=_trace(ast.Name(id=name, ctx=ast.Load()), args["pointer"],
+                                 flow.index_ast, args["mask"], INPUT_ASM))
+                rewritten.extend((statement, input_trace))
+                continue
+            result = flow.evaluate(statement.value)
+            flow.names[name] = result
+            rewritten.append(statement)
+        elif isinstance(statement, ast.Expr) and _call(statement.value, "store"):
+            require(input_trace is not None and store is None, "expected exactly one output store after input load")
+            store = statement.value
+            args = _bind(store, ("pointer", "value", "mask"))
+            flow.address(args["pointer"], "output:0")
+            flow.predicate(args["mask"])
+            flow.numeric(args["value"])
+            traced = _trace(args["value"], args["pointer"], flow.index_ast, args["mask"], OUTPUT_ASM)
+            # Normalize call argument binding only; preserve the user's address,
+            # value arithmetic, predicate and every original local computation.
+            store.args = [args["pointer"], traced]
+            store.keywords = [ast.keyword(arg="mask", value=args["mask"])]
+            rewritten.append(statement)
+        elif isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant) and \
+                isinstance(statement.value.value, str):
+            rewritten.append(statement)
+        else:
+            raise FusionError("only local assignments and the output store are supported")
+    require(input_trace is not None and store is not None, "both input load and output store are required")
+    function.body = rewritten
     ast.fix_missing_locations(tree)
     source = ast.unparse(tree) + "\n"
 
@@ -194,16 +274,16 @@ def instrument(request):
 
     contract = {
         "protocol": PROTOCOL, "entry": request["entry"], "dtype": "i32", "shape": [count],
-        "block": 128, "grid": list(request["grid"]), "num_warps": 4,
+        "block": block, "grid": list(request["grid"]), "num_warps": warps,
         "original_source_sha256": hashlib.sha256(request["source"].encode()).hexdigest(),
         "instrumented_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "input": {**boundary(input_name, "input:0", INPUT_ASM), "other": 0},
         "output": boundary(output_name, "output:0", OUTPUT_ASM),
-        "proof": {"source_subset": "canonical-pointwise-i32-v1", "input_loads": 1,
+        "proof": {"source_subset": "affine-pointwise-i32-v2", "input_loads": 1,
                   "output_stores": 1, "same_index": True, "same_mask": True,
                   "no_pointer_escape": True, "only_output_store_has_effect": True,
                   "requires_disjoint_input_output": True,
-                  "index_range": [0, request["grid"][0] * 128], "active_range": [0, count]},
+                  "index_range": [0, request["grid"][0] * block], "active_range": [0, count]},
     }
     return source, contract
 
@@ -211,12 +291,11 @@ def instrument(request):
 def _layout(ttgir):
     require(isinstance(ttgir, str), "Triton did not expose TTGIR for layout comparison")
     layouts = set(re.findall(r"#ttg\.blocked<\{([^{}]*)\}>", ttgir))
-    canonical = "sizePerThread=[1],threadsPerWarp=[32],warpsPerCTA=[4],order=[0]"
     normalized = {re.sub(r"\s+", "", value) for value in layouts}
-    require(normalized == {canonical}, "fusion requires the canonical one-element-per-lane blocked layout")
+    require(bool(normalized), "missing blocked layout encoding")
     require(not re.search(r"#ttg\.(?:slice|dot_op|nvidia_mma|shared)", ttgir),
             "additional layout encodings are outside the fusion subset")
-    return canonical
+    return sorted(normalized)
 
 
 def _llvm_string(text):
@@ -237,15 +316,15 @@ def finalize_contract(contract, baseline, compiled, artifact):
         boundary = contract[role]
         # These are our own exact identity strings, not Triton's memory asm.
         # The core subsequently verifies actual CallInst types/operands and uses.
-        require(payload.count(_llvm_string(boundary["marker_asm"])) == 1,
-                "expected exactly one surviving " + role + " identity trace")
+        count = payload.count(_llvm_string(boundary["marker_asm"]))
+        require(count > 0, "missing surviving " + role + " identity trace")
+        boundary["marker_count"] = count
         binding = next(item for item in artifact["port_map"]
                        if item["source_parameter"] == boundary["source_parameter"])
         require(binding["logical_port"] == boundary["source_binding"],
                 "compiled boundary parameter binding changed")
         boundary["kernel_argument"] = binding["argument"]
     contract["llir_sha256"] = hashlib.sha256(payload.encode()).hexdigest()
-    contract["proof"]["layout"] = {"size_per_thread": [1], "threads_per_warp": [32],
-                                      "warps_per_cta": [4], "order": [0],
+    contract["proof"]["layout"] = {"blocked_encodings": _layout(compiled.asm.get("ttgir")),
                                       "matched_uninstrumented_baseline": True}
     return contract
