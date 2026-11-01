@@ -6,16 +6,19 @@ ASK 用 MLIR 的 `ask` dialect 接收上层框架生成的计算图，以原生 
 
 ## 构建
 
-需要 C++17、CMake 3.28 或更新版本、Ninja，以及配套的 LLVM/MLIR 开发安装。LLVM/MLIR 的具体版本和修订以仓库锁定记录及 CMake 检查为准；不要把系统上不同版本的两套库混用。Triton 导出与 reader 的兼容性记录见 [dependencies.lock.json](adapters/triton/dependencies.lock.json)。
+需要 C++17、CMake 3.28 或更新版本、Ninja，以及配套的 LLVM/MLIR 开发安装。当前使用 LLVM/MLIR `23.0.0git`，修订和 SDK 校验值锁定在 [cmake/llvm.lock.json](cmake/llvm.lock.json)；不要只按版本号混用别的构建。Triton 导出与 reader 的兼容性记录见 [dependencies.lock.json](adapters/triton/dependencies.lock.json)。
 
 ```bash
+python3 tools/fetch_llvm.py
 cmake --preset core \
-  -DLLVM_DIR=/path/to/llvm/lib/cmake/llvm \
-  -DMLIR_DIR=/path/to/llvm/lib/cmake/mlir
+  -DLLVM_DIR="$PWD/.deps/llvm-1f126a6d-ubuntu-x64-1/lib/cmake/llvm" \
+  -DMLIR_DIR="$PWD/.deps/llvm-1f126a6d-ubuntu-x64-1/lib/cmake/mlir"
 cmake --build --preset core
 ctest --preset core
 build/core/bin/ask-opt --capabilities
 ```
+
+下载脚本取锁定的 Ubuntu x64 SDK。其他平台需要准备同一修订的 LLVM/MLIR，并将两个路径指向对应安装。
 
 `core` 使用 `ASK_THIRD_PARTY_COMPILERS=none`，不需要 Triton、NumPy 或 PyTorch。它仍能检查包含 `ask.external` 的图；真正请求编译外部 DSL 时才检查该编译器是否启用。第三方编译器可选择 `none`、`all` 或明确的名称，目标后端另外选择；当前后端选项只实现 `none` 和 `host`。见[构建说明](docs/09-构建与可选编译器.md)。
 
@@ -39,6 +42,8 @@ build/core/bin/ask-opt tests/ir/pipeline.mlir \
 ```
 
 SDK 用法、当前支持范围和诊断处理见[上层框架接入](docs/10-上层框架接入.md)。架构设计从[核心思想](docs/核心思想.md)开始，分阶段说明见[文档目录](docs/README.md)。设计文档中的完整接口不等于当前版本已经实现的 API。
+
+C++ 框架也可以通过安装后的 `ASK::Core` 直接构造和准备 MLIR，无需 Python。[C++ 示例](examples/cpp/frontend.cpp)及其 [CMake 项目](examples/cpp/CMakeLists.txt)演示独立消费已安装的 SDK，构建命令见接入文档第 8 节。
 
 ## 测试
 

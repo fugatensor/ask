@@ -37,7 +37,7 @@ class NativeTests(unittest.TestCase):
                 continue
             with self.subTest(name=path.name):
                 result = run(path, "--prepare")
-                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertGreater(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("error", result.stderr.lower())
 
     def test_native_llvm_import_preserves_inline_ptx(self):
@@ -51,12 +51,23 @@ define void @f() {
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('asm sideeffect "bar.sync 0;"', result.stdout)
         invalid = run("-", "--check-llir", source="define void @f() { ret i32 1 }")
-        self.assertNotEqual(invalid.returncode, 0)
+        self.assertGreater(invalid.returncode, 0)
         self.assertIn("reader", invalid.stderr)
+
+    def test_external_request_preserves_boolean_options(self):
+        source = (ROOT / "tests/ir/pipeline.mlir").read_text().replace(
+            'options = {num_warps = 4 : i64}',
+            'options = {num_warps = 4 : i64, enable_fp_fusion = true}')
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            result = run("-", "--prepare", "--report-json", report, source=source)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            options = json.loads(report.read_text())["external_requests"][0]["fixed_options"]
+            self.assertIs(options["enable_fp_fusion"], True)
 
     def test_external_is_not_silently_lowered_as_semantic_identity(self):
         result = run(ROOT / "tests/ir/pipeline.mlir", "--emit-llvm")
-        self.assertNotEqual(result.returncode, 0)
+        self.assertGreater(result.returncode, 0)
         self.assertIn("external", result.stderr)
 
     def test_disabled_exporter_rejected_before_artifacts(self):
@@ -67,7 +78,7 @@ define void @f() {
             destination = Path(directory) / "exports"
             result = run(ROOT / "tests/ir/pipeline.mlir", "--export-external",
                          "--export-dir", destination)
-            self.assertNotEqual(result.returncode, 0)
+            self.assertGreater(result.returncode, 0)
             self.assertIn("not enabled", result.stderr)
             self.assertFalse(destination.exists())
 

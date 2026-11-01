@@ -344,18 +344,27 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
   llvm::json::Array bindings;
   llvm::json::Array specializations;
   llvm::json::Array rules;
-  std::string digestInput = "ask.shape.prototype.v1;" + std::to_string(semanticRevision);
+  std::string digestInput = "ask.shape.prototype.v1;";
+  // IDs may contain punctuation, including the separators used in diagnostics.
+  // Length-prefix each field so distinct identity tuples cannot hash the same text.
+  auto appendDigest = [&](StringRef component) {
+    digestInput += std::to_string(component.size()) + ":";
+    digestInput.append(component.data(), component.size());
+  };
+  appendDigest(std::to_string(semanticRevision));
   for (SemanticsOp semantics : module.getOps<SemanticsOp>()) {
     std::string descriptor = printAttribute(semantics->getAttrDictionary());
     rules.push_back(llvm::json::Object{{"symbol", semantics.getNameAttr().getValue().str()},
                                      {"definition", descriptor}});
-    digestInput += descriptor;
+    appendDigest(descriptor);
   }
   for (func::FuncOp function : functions) {
     auto appendShape = [&](Value value, bool input, unsigned index) {
       std::string identity = logicalIds.lookup(value);
       std::string type = printType(value.getType());
-      digestInput += function.getSymName().str() + ":" + identity + ":" + type + ";";
+      appendDigest(function.getSymName());
+      appendDigest(identity);
+      appendDigest(type);
       if (auto tensor = dyn_cast<RankedTensorType>(value.getType())) {
         bindings.push_back(llvm::json::Object{
             {"function", function.getSymName().str()}, {"value_id", identity},

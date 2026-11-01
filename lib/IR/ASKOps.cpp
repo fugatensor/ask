@@ -114,11 +114,11 @@ LogicalResult SemanticsOp::verify() {
   auto rule = (*this)->getAttrOfType<StringAttr>("shape_rule");
   if (!rule || (rule.getValue() != "same_as" && rule.getValue() != "fixed"))
     return emitOpError("requires shape_rule = \"same_as\" or \"fixed\"");
+  auto operand = (*this)->getAttrOfType<IntegerAttr>("shape_operand");
+  if ((*this)->hasAttr("shape_operand") &&
+      (!operand || !operand.getType().isSignlessInteger(64)))
+    return emitOpError("shape_operand must be an i64 integer");
   if (rule.getValue() == "same_as") {
-    auto operand = (*this)->getAttrOfType<IntegerAttr>("shape_operand");
-    if ((*this)->hasAttr("shape_operand") &&
-        (!operand || operand.getValue().getBitWidth() > 64))
-      return emitOpError("shape_operand must be an integer of at most 64 bits");
     int64_t index = operand ? operand.getInt() : 0;
     if (index < 0 || static_cast<uint64_t>(index) >= type.getNumInputs())
       return emitOpError("shape_operand is outside the semantic input list");
