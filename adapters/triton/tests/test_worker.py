@@ -23,6 +23,7 @@ def compiled(metadata_changes=None, llvm_ir=None, ttir="tensor<128xi32>"):
     metadata = {"name": "scale2", "triton_version": "3.7.1",
                 "target": {"backend": "cuda", "arch": 80, "warp_size": 32},
                 "num_warps": 4, "warp_size": 32, "num_ctas": 1,
+                "enable_fp_fusion": True,
                 "shared": 0, "global_scratch_size": 0, "global_scratch_align": 1,
                 "profile_scratch_size": 0, "profile_scratch_align": 1,
                 "tmem_size": 0, "tensordesc_meta": [], "instrumentation_mode": "",
@@ -190,6 +191,12 @@ class ArtifactTests(unittest.TestCase):
         artifact = worker.build_artifact(value, compiled(), "3.7.1", ["t", "u"])
         self.assertEqual([p["element_type"] for p in artifact["port_map"]], ["f32", "f32"])
         self.assertEqual(artifact["entry_signature"]["parameters"][0]["llvm_type"], "ptr addrspace(1)")
+        self.assertEqual(artifact["invocation"]["version"], 2)
+        self.assertEqual(artifact["codegen"], {"fp_contract": "fast", "ptx_version": 80})
+        self.assertEqual(artifact["port_map"][0]["shape"], [10])
+        self.assertEqual(artifact["port_map"][0]["layout"], "contiguous_row_major")
+        self.assertNotIn("compiler_metadata", artifact["invocation"])
+        self.assertEqual(artifact["producer_metadata"]["num_warps"], 4)
 
     def test_records_both_zero_resource_hidden_parameters(self):
         artifact = worker.build_artifact(request(), compiled(), "3.7.1", ["t", "u"])

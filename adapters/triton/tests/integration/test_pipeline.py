@@ -6,7 +6,7 @@ import sys
 import tempfile
 
 driver, python, worker = sys.argv[1:]
-root = Path(__file__).resolve().parents[1]
+root = Path(__file__).resolve().parents[4]
 
 
 def checked(args):
@@ -20,8 +20,8 @@ with tempfile.TemporaryDirectory(prefix="ask-triton-e2e-") as directory:
     destination = Path(directory) / "exports"
     prepared = Path(directory) / "prepared.mlir"
     checked([driver, str(root / "tests/ir/pipeline.mlir"), "--export-external",
-             "--export-dir", str(destination), "--triton-python", python,
-             "--triton-worker", worker, "-o", str(prepared)])
+             "--export-dir", str(destination), "--compiler-python", "triton=" + python,
+             "--compiler-worker", "triton=" + worker, "-o", str(prepared)])
     manifest = json.loads((destination / "manifest.json").read_text())
     assert manifest["phase"] == "exported"
     assert len(manifest["markers"]) == 2
@@ -70,8 +70,8 @@ with tempfile.TemporaryDirectory(prefix="ask-triton-e2e-") as directory:
     rejected = Path(directory) / "rejected"
     rejected_output = Path(directory) / "rejected.mlir"
     failed = subprocess.run([driver, str(bad_graph), "--export-external",
-                             "--export-dir", str(rejected), "--triton-python", python,
-                             "--triton-worker", worker, "-o", str(rejected_output)],
+                             "--export-dir", str(rejected), "--compiler-python", "triton=" + python,
+                             "--compiler-worker", "triton=" + worker, "-o", str(rejected_output)],
                             text=True, capture_output=True, timeout=180)
     assert failed.returncode != 0, "unsupported worker options must fail the driver"
     assert "UnsupportedOptions" in failed.stderr
@@ -97,12 +97,46 @@ with tempfile.TemporaryDirectory(prefix="ask-triton-e2e-") as directory:
     wrong_prepared = Path(directory) / "wrong-grid-prepared.mlir"
     invalid_response = subprocess.run(
         [driver, str(root / "tests/ir/pipeline.mlir"), "--export-external",
-         "--export-dir", str(wrong_destination), "--triton-python", python,
-         "--triton-worker", str(fake_worker), "-o", str(wrong_prepared)],
+         "--export-dir", str(wrong_destination), "--compiler-python", "triton=" + python,
+         "--compiler-worker", "triton=" + str(fake_worker), "-o", str(wrong_prepared)],
         text=True, capture_output=True, timeout=180)
     assert invalid_response.returncode > 0, "changed-grid response must fail validation"
     assert "grid" in invalid_response.stderr.lower(), invalid_response.stderr
     assert not (wrong_destination / "external-0.ll").exists()
     assert not (wrong_destination / "manifest.json").exists()
     assert not wrong_prepared.exists()
+    # Common routing preflights reject missing/duplicate/unknown routes before
+    # creating a destination or attempting a worker invocation.
+    for label, routes in (
+        ("missing-python", ["--compiler-worker", "triton=" + worker]),
+        ("malformed", ["--compiler-python", python]),
+        ("duplicate", ["--compiler-python", "triton=" + python,
+                       "--compiler-python", "triton=" + python]),
+        ("disabled", ["--compiler-worker", "not_registered=" + worker]),
+    ):
+        dest = Path(directory) / label
+        result = subprocess.run([driver, str(root / "tests/ir/pipeline.mlir"), "--export-external",
+                                 "--export-dir", str(dest), *routes], text=True, capture_output=True)
+        assert result.returncode > 0, (label, result.stderr)
+        assert not dest.exists(), label
+
+    # Two calls to one implementation still produce two independently routed
+    # requests/artifacts; no singleton worker state is inferred from the graph.
+    two_graph = Path(directory) / "two-external.mlir"
+    graph_text = (root / "tests/ir/pipeline.mlir").read_text()
+    extra = ('    %second = "ask.external"(%u) {ask.id = "F2", ask.value_id = "v_second", '
+             'semantics = @scale2_i32_v1, implementation = @triton_scale2} '
+             ': (tensor<10xi32>) -> tensor<10xi32>\n')
+    graph_text = graph_text.replace('    %three =', extra + '    %three =').replace('"ask.add"(%um, %threes)',
+                                                                                 '"ask.add"(%second, %threes)')
+    two_graph.write_text(graph_text)
+    wrong_reply.write_text(json.dumps(artifact))  # reuse the recording worker with a genuine response
+    two_destination = Path(directory) / "two-exports"
+    checked([driver, str(two_graph), "--export-external", "--export-dir", str(two_destination),
+             "--compiler-python", "triton=" + python, "--compiler-worker", "triton=" + str(fake_worker),
+             "-o", str(Path(directory) / "two-prepared.mlir")])
+    two_manifest = json.loads((two_destination / "manifest.json").read_text())
+    assert [item["op_id"] for item in two_manifest["external_requests"]] == ["F", "F2"]
+    assert [item["compiler"] for item in two_manifest["external_artifacts"]] == ["triton", "triton"]
+    assert (two_destination / "external-0.ll").read_bytes() == (two_destination / "external-1.ll").read_bytes()
     print("Triton 3.7.1 original LLVM IR exported/verified; optional LLVM cleanup verified; no GPU execution")

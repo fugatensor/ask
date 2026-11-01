@@ -32,7 +32,7 @@ public:
                                             bool readonly = false);
   std::shared_ptr<Kernel> load(const std::string &cubin, const std::string &entry,
                                const std::vector<std::string> &requiredTypes,
-                               int arch, unsigned expectedParameters = 4);
+                               int arch, unsigned expectedParameters);
   std::shared_ptr<Event> submit(const std::shared_ptr<Kernel> &kernel,
       const std::vector<std::shared_ptr<DeviceBuffer>> &buffers,
       std::array<unsigned, 3> grid, std::array<unsigned, 3> block,

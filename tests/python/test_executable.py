@@ -40,6 +40,8 @@ class ResidentExecutableTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         directory = Path(self.temporary.name)
         value = artifact()
+        for port in value["port_map"]:
+            port["shape"] = [2, 5]
         source, binary = directory / "input.ll", directory / "kernel.cubin"
         source.write_text(value["payload"])
         binary.write_bytes(b"synthetic cubin for metadata-only test")
@@ -63,10 +65,30 @@ class ResidentExecutableTests(unittest.TestCase):
             for _ in range(3):
                 executable.submit(source, destination)
         self.assertEqual(len(self.session.loads), 1)
+        self.assertEqual(self.session.loads[0][1]["expected_parameters"], 2)
         self.assertEqual(len(self.session.submissions), 3)
         args, kwargs = self.session.submissions[0]
-        self.assertEqual(args[1], [source, destination, None, None])
+        self.assertEqual(args[1], [source, destination])
         self.assertEqual(kwargs, {"grid": [1, 1, 1], "block": [128, 1, 1], "shared_bytes": 0})
+
+    def test_arbitrary_null_arguments_and_launch_axes_are_preserved(self):
+        value = self.kernel.artifact
+        bindings = ["null", "output:0", "null", "input:0", "null"]
+        value["invocation"].update(arguments=[{"argument": index, "binding": binding,
+                                              "llvm_type": "ptr addrspace(1)"}
+                                             for index, binding in enumerate(bindings)],
+                                   grid=[2, 3, 4], block=[3, 5, 7], shared_bytes=256)
+        for port in value["port_map"]:
+            port["argument"] = bindings.index(port["logical_port"])
+        self.kernel.codegen["invocation"] = copy.deepcopy(value["invocation"])
+        self.kernel.codegen["artifact_sha256"] = _artifact_digest(value)
+        executable = self.kernel.prepare(self.session)
+        source, destination = tensor(), tensor(pointer=8192)
+        executable.submit(source, destination)
+        self.assertEqual(self.session.loads[0][1]["expected_parameters"], 5)
+        self.assertEqual(self.session.submissions[0][0][1], [None, destination, None, source, None])
+        self.assertEqual(self.session.submissions[0][1],
+                         {"grid": [2, 3, 4], "block": [3, 5, 7], "shared_bytes": 256})
 
     def test_rejects_equal_size_but_wrong_shape_and_dtype(self):
         executable = self.kernel.prepare(self.session)
@@ -106,7 +128,7 @@ class ResidentExecutableTests(unittest.TestCase):
     def test_prepared_contract_does_not_alias_mutable_package(self):
         executable = self.kernel.prepare(self.session)
         self.kernel.artifact["invocation"]["grid"][0] = 999
-        self.kernel.report["shape_snapshot"]["shape_bindings"][0]["shape"][0] = 99
+        self.kernel.artifact["port_map"][0]["shape"][0] = 99
         executable.submit(tensor(), tensor(pointer=8192))
         self.assertEqual(executable.shape, (2, 5))
         self.assertEqual(self.session.submissions[0][1]["grid"], [1, 1, 1])
@@ -124,7 +146,7 @@ class ResidentExecutableTests(unittest.TestCase):
         self.assertEqual(self.session.loads[0][1]["required_types"], ["bf16", "f32", "i32"])
         source, destination = tensor(), tensor(pointer=8192)
         executable.submit(source, destination)
-        self.assertEqual(self.session.submissions[0][0][1], [destination, source, None, None])
+        self.assertEqual(self.session.submissions[0][0][1], [destination, source])
 
 
 if __name__ == "__main__":

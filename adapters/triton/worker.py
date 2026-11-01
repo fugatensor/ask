@@ -23,7 +23,7 @@ import sys
 import tempfile
 
 PROTOCOL_VERSION = 1
-ADAPTER_VERSION = "0.6.0"
+ADAPTER_VERSION = "0.7.0"
 ELEMENT_TYPES = {"*i1": "bool", "*i32": "i32", "*i64": "i64",
                  "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
 STORAGE_BYTES = {"bool": 1, "i32": 4, "i64": 8, "f32": 4, "f16": 2, "bf16": 2}
@@ -381,6 +381,8 @@ def build_artifact(request, compiled, triton_version, source_order):
     if "enable_fp_fusion" in request["fixed_options"]:
         require(metadata.get("enable_fp_fusion") is request["fixed_options"]["enable_fp_fusion"],
                 "compiled floating contraction policy differs from request", "ArtifactMismatch", "artifact")
+    require(type(metadata.get("enable_fp_fusion")) is bool,
+            "compiled floating contraction policy is missing", "ArtifactMismatch", "artifact")
     for name in ("shared", "global_scratch_size", "profile_scratch_size", "tmem_size"):
         require(type(metadata.get(name)) is int and metadata[name] == 0,
                 f"initial ABI requires zero {name}; found {metadata.get(name)!r}",
@@ -403,12 +405,17 @@ def build_artifact(request, compiled, triton_version, source_order):
             all(p["unused_scratch_attributes"] for p in parameters[2:]),
             "unexpected data/scratch parameter attributes", "UnsupportedEntryABI", "artifact")
     port_map, arguments = [], []
+    count = request["constants"].get("N")
+    require(type(count) is int and count >= 0,
+            "Triton pointwise exporter requires an explicit nonnegative N logical shape",
+            "UnsupportedShape", "artifact")
     for ordinal, name in enumerate(source_order):
         binding = request["source_bindings"][name]
         element_type = ELEMENT_TYPES[request["signature"][name]]
         port_map.append({"source_parameter": name, "logical_port": binding,
                          "argument": ordinal, "element_type": element_type,
-                         "storage_bytes": STORAGE_BYTES[element_type]})
+                         "storage_bytes": STORAGE_BYTES[element_type],
+                         "shape": [count], "layout": "contiguous_row_major"})
         arguments.append({"argument": ordinal, "binding": binding,
                           "llvm_type": parameters[ordinal]["llvm_type"]})
     resources = {}
@@ -433,11 +440,14 @@ def build_artifact(request, compiled, triton_version, source_order):
                          "python_version": platform.python_version(), "llvm_version": None},
             "target": {**request["target"], "data_layout": layout[0]},
             "port_map": port_map, "required_element_types": sorted(required_types),
-            "invocation": {"kind": "cuda-kernel", "version": 1,
+            "codegen": {"fp_contract": "fast" if metadata.get("enable_fp_fusion") is True else "off",
+                        "ptx_version": 80},
+            "producer_metadata": {"num_warps": metadata["num_warps"], "num_ctas": 1,
+                                  "resources": resources, "compiler_metadata": metadata},
+            "invocation": {"kind": "cuda-kernel", "version": 2,
                            "grid": request["grid"], "block": [metadata["num_warps"] * metadata["warp_size"], 1, 1],
-                           "num_warps": metadata["num_warps"], "num_ctas": 1, "shared_bytes": 0,
-                           "arguments": arguments, "resources": resources,
-                           "completion": "device-event", "compiler_metadata": metadata},
+                           "shared_bytes": 0, "arguments": arguments,
+                           "completion": "device-event"},
             "dependencies": dependencies,
             "specializations": {"constants": request["constants"],
                                 "fixed_options": request["fixed_options"],
@@ -513,6 +523,8 @@ def export(request):
                 try:
                     artifact["fusion_contract"] = fusion.finalize_contract(
                         contract, compiled, traced, artifact)
+                    artifact["required_element_types"] = sorted(set(artifact["required_element_types"]) |
+                        set(artifact["fusion_contract"]["required_element_types"]))
                 except fusion.FusionError as exc:
                     raise WorkerError("UnsupportedFusion", str(exc), "fusion") from exc
                 artifact["instrumented_source"] = instrumented_source

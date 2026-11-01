@@ -16,24 +16,22 @@ from ask.cuda import (CUDAError, compile_cuda, execute, execute_i32, _host_buffe
                       _decode_output, _check_device_dtype)
 
 
-def artifact(size=10, *, block=128, num_warps=4, dtype="i32"):
+def artifact(size=10, *, block=128, dtype="i32"):
+    # This fixture deliberately has no producer name, DSL constants, scheduling
+    # metadata or scratch arguments. The execution contract stands on its own.
     return {
         "format": "llvm-ir", "entry": "scale2", "payload": "define void @fixture() { ret void }\n",
-        "target": {"backend": "cuda", "arch": 80, "warp_size": 32},
-        "specializations": {"constants": {"N": size, "BLOCK": block}},
-        "port_map": [{"argument": 0, "logical_port": "input:0", "element_type": dtype},
-                     {"argument": 1, "logical_port": "output:0", "element_type": dtype}],
-        "invocation": {"kind": "cuda-kernel", "version": 1,
-                       "grid": [max(1, (size + block - 1) // block), 1, 1], "block": [num_warps * 32, 1, 1],
-                       "num_warps": num_warps, "num_ctas": 1, "shared_bytes": 0,
-                       "compiler_metadata": {"enable_fp_fusion": True, "enable_reflect_ftz": True},
-                       "arguments": [
-                           {"argument": 0, "binding": "input:0", "llvm_type": "ptr addrspace(1)"},
-                           {"argument": 1, "binding": "output:0", "llvm_type": "ptr addrspace(1)"},
-                           {"argument": 2, "binding": "null", "resource": "global_scratch", "llvm_type": "ptr addrspace(1)"},
-                           {"argument": 3, "binding": "null", "resource": "profile_scratch", "llvm_type": "ptr addrspace(1)"}],
-                       "resources": {"global_scratch": {"size_bytes": 0},
-                                     "profile_scratch": {"size_bytes": 0}}},
+        "target": {"backend": "cuda", "arch": 80},
+        "port_map": [{"argument": index, "logical_port": binding, "element_type": dtype,
+                      "shape": [size], "layout": "contiguous_row_major"}
+                     for index, binding in enumerate(("input:0", "output:0"))],
+        "invocation": {"kind": "cuda-kernel", "version": 2,
+                       "grid": [max(1, (size + block - 1) // block), 1, 1], "block": [block, 1, 1],
+                       "shared_bytes": 0,
+                       "arguments": [{"argument": index, "binding": binding, "llvm_type": "ptr addrspace(1)"}
+                                     for index, binding in enumerate(("input:0", "output:0"))]},
+        "codegen": {"fp_contract": "fast", "ptx_version": 80},
+        "required_element_types": [dtype],
     }
 
 
@@ -63,7 +61,7 @@ class CUDAContractTests(unittest.TestCase):
             self.assertEqual(result["commands"][0][4], "--fp-contract=fast")
             self.assertEqual(result["commands"][0][5], str(directory / "source.ll"))
             self.assertEqual(result["commands"][1][1], "--gpu-name=sm_80")
-            self.assertFalse(result["original_triton_binary_used"])
+            self.assertFalse(result["original_producer_binary_used"])
             self.assertEqual(json.loads((directory / "codegen/codegen.json").read_text()), result)
             with self.assertRaisesRegex(CUDAError, "already contains"):
                 compile_cuda(directory / "source.ll", value, directory / "codegen",
@@ -76,44 +74,31 @@ class CUDAContractTests(unittest.TestCase):
                 result = self.compile_fixture(Path(temporary), value)
                 self.assertEqual(result["invocation"]["grid"], value["invocation"]["grid"])
 
-    def test_element_partition_and_thread_block_are_independent(self):
-        # BLOCK counts logical elements. num_warps determines physical threads;
-        # a thread may process several elements, or not own an active element.
-        for block, warps in ((64, 4), (128, 8), (256, 4), (512, 8), (1024, 4)):
-            with self.subTest(block=block, warps=warps), tempfile.TemporaryDirectory() as temporary:
-                value = artifact(513, block=block, num_warps=warps)
+    def test_launch_dimensions_and_storage_shape_are_independent(self):
+        for grid, block in (([2, 3, 4], [3, 5, 7]), ([1, 2, 1], [1, 16, 1]), ([8, 1, 1], [256, 1, 1])):
+            with self.subTest(grid=grid, block=block), tempfile.TemporaryDirectory() as temporary:
+                value = artifact(513)
+                value["invocation"].update(grid=grid, block=block, shared_bytes=512)
                 result = self.compile_fixture(Path(temporary), value)
-                self.assertEqual(result["invocation"]["block"], [warps * 32, 1, 1])
-                self.assertEqual(result["invocation"]["grid"], [(513 + block - 1) // block, 1, 1])
+                self.assertEqual(result["invocation"]["block"], block)
+                self.assertEqual(result["invocation"]["grid"], grid)
+                self.assertEqual(result["invocation"]["shared_bytes"], 512)
 
     def test_invalid_launch_and_abi_rejected_before_tools_or_driver(self):
         changes = [
             lambda a: a["invocation"].update(grid=[0, 1, 1]),
-            lambda a: a["invocation"].update(grid=[1, 2, 1]),
             lambda a: a["invocation"].update(grid=[True, 1, 1]),
             lambda a: a["invocation"].update(grid=[1, 1]),
-            lambda a: a["invocation"].update(grid=[2, 1, 1]),
-            lambda a: a["invocation"].update(block=[64, 1, 1]),
-            lambda a: a["invocation"].update(shared_bytes=4),
+            lambda a: a["invocation"].update(block=[1, -2, 1]),
+            lambda a: a["invocation"].update(shared_bytes=-1),
+            lambda a: a["invocation"].update(shared_bytes=True),
+            lambda a: a["invocation"].update(version=1),
             lambda a: a["target"].update(arch="90a"),
-            lambda a: a["specializations"]["constants"].update(N=-1),
-            lambda a: a["specializations"]["constants"].update(N=True),
-            lambda a: a["specializations"]["constants"].update(N=129),
-            lambda a: a["specializations"]["constants"].update(BLOCK=0),
-            lambda a: a["specializations"]["constants"].update(BLOCK=96),
-            lambda a: a["specializations"]["constants"].update(BLOCK=True),
-            lambda a: a["invocation"].update(num_warps=0),
-            lambda a: a["invocation"].update(num_warps=3),
-            lambda a: a["invocation"].update(num_warps=True),
-            lambda a: a["invocation"].update(num_warps=8),
             lambda a: a["invocation"]["arguments"][0].update(binding="output:0"),
             lambda a: a["invocation"]["arguments"][1].update(llvm_type="i64"),
             lambda a: a["invocation"]["arguments"].pop(),
-            lambda a: a["invocation"]["resources"]["global_scratch"].update(size_bytes=16),
-            lambda a: a["invocation"].update(resources=None),
             lambda a: a.update(target=None),
             lambda a: a.update(invocation=None),
-            lambda a: a.update(specializations=None),
             lambda a: a["invocation"]["arguments"][0].update(binding={}),
             lambda a: a.pop("payload"),
             lambda a: a.pop("port_map"),
@@ -122,7 +107,16 @@ class CUDAContractTests(unittest.TestCase):
             lambda a: a["port_map"][0].update(element_type="f32"),
             lambda a: a["port_map"][0].update(argument=True),
             lambda a: a["port_map"][0].update(logical_port="output:0"),
-            lambda a: a.update(source_fusion_contract={"dtype": "f32"}),
+            lambda a: a["port_map"][0].update(shape=[-1]),
+            lambda a: a["port_map"][0].update(shape=[True]),
+            lambda a: a["port_map"][0].update(shape=[2**63]),
+            lambda a: a["port_map"][0].update(layout="strided"),
+            lambda a: a["port_map"][0].update(storage_bytes=1),
+            lambda a: a.pop("codegen"),
+            lambda a: a["codegen"].update(fp_contract="unknown"),
+            lambda a: a["codegen"].update(ptx_version=True),
+            lambda a: a.update(required_element_types=["f64"]),
+            lambda a: a.pop("required_element_types"),
         ]
         for index, change in enumerate(changes):
             with self.subTest(case=index), patch("ask.cuda._Driver") as driver:
@@ -213,7 +207,7 @@ class CUDAContractTests(unittest.TestCase):
     def test_internal_bf16_requires_a_capable_compilation_target(self):
         value = artifact(1, dtype="i32")
         value["target"]["arch"] = 75
-        value["fusion_contract"] = {"dtype": "i32", "required_element_types": ["i32", "bf16"]}
+        value["required_element_types"] = ["i32", "bf16"]
         with tempfile.TemporaryDirectory() as temporary, patch("ask.cuda.subprocess.run") as compiler:
             with self.assertRaisesRegex(CUDAError, "bf16 compilation requires"):
                 compile_cuda(Path(temporary) / "missing.ll", value, temporary,
@@ -256,13 +250,11 @@ class CUDAContractTests(unittest.TestCase):
             def attribute(self, device, attribute):
                 return {75: 7, 76: 5}[attribute]
 
-        for dtype, location in (("bf16", None), ("i32", "fusion_contract"), ("f32", "artifact")):
+        for dtype, location in (("bf16", None), ("i32", "artifact"), ("f32", "artifact")):
             with self.subTest(dtype=dtype, location=location), tempfile.TemporaryDirectory() as temporary:
                 value = artifact(1, dtype=dtype)
-                if location == "fusion_contract":
-                    value["fusion_contract"] = {"dtype": "i32", "required_element_types": ["i32", "bf16"]}
-                elif location == "artifact":
-                    value["required_element_types"] = ["f32", "bf16"]
+                if location == "artifact":
+                    value["required_element_types"] = [dtype, "bf16"]
                 codegen = self.compile_fixture(Path(temporary), value)
                 driver = UnsupportedDriver()
                 with patch("ask.cuda._Driver", return_value=driver):
@@ -298,35 +290,22 @@ class CUDAContractTests(unittest.TestCase):
                     execute(value, result, [1.0])
                 driver.assert_not_called()
 
-    def test_float_codegen_preserves_raw_and_fused_contraction_policies(self):
+    def test_normalized_codegen_policy_is_independent_of_storage_dtype(self):
         for dtype in ("bool", "i32", "i64", "f32", "f16", "bf16"):
-            for fused in (False, True):
-                for enabled in (False, True):
-                    with self.subTest(dtype=dtype, fused=fused, enabled=enabled), tempfile.TemporaryDirectory() as temporary:
-                        value = artifact(1, dtype=dtype)
-                        metadata = value["invocation"]["compiler_metadata"]
-                        metadata["enable_fp_fusion"] = enabled
-                        if fused:
-                            value["validation"] = {"stage": "fused_llvm", "llvm_module_verified": True}
-                            value["source_fusion_contract"] = {"dtype": dtype, "numerics": dict(metadata)}
-                            value["fusion"] = {
-                                "ask_numerics": ("bool-exact" if dtype == "bool" else dtype + "-wrap"
-                                                 if dtype in ("i32", "i64") else f"{dtype}-rne-no-fast-math-no-contract"),
-                                "required_element_types": [dtype, "f32"],
-                                "producer_numerics": {
-                                    "producer_enable_fp_fusion": enabled, "producer_enable_reflect_ftz": True,
-                                    "representation": "original-F-instruction-contract-flags"}}
-                        result = self.compile_fixture(Path(temporary), value)
-                        expected = "on" if fused else "fast" if enabled else "off"
-                        self.assertEqual(result["fp_contract"], expected)
-                        self.assertIn("--fp-contract=" + expected, result["commands"][0])
-                        if fused:
-                            value["fusion"]["producer_numerics"]["producer_enable_fp_fusion"] = not enabled
-                            with patch("ask.cuda.subprocess.run") as compiler:
-                                with self.assertRaisesRegex(CUDAError, "normalization"):
-                                    compile_cuda(Path(temporary) / "source.ll", value, Path(temporary) / "bad",
-                                                 llc="/test/llc", ptxas="/test/ptxas")
-                                compiler.assert_not_called()
+            for policy in ("off", "on", "fast"):
+                with self.subTest(dtype=dtype, policy=policy), tempfile.TemporaryDirectory() as temporary:
+                    value = artifact(1, dtype=dtype)
+                    value["codegen"]["fp_contract"] = policy
+                    result = self.compile_fixture(Path(temporary), value)
+                    self.assertEqual(result["fp_contract"], policy)
+                    self.assertIn("--fp-contract=" + policy, result["commands"][0])
+
+    def test_legacy_contract_requires_explicit_adapter_migration(self):
+        value = artifact()
+        value["invocation"]["version"] = 1
+        with patch("ask.cuda._Driver") as driver, self.assertRaisesRegex(CUDAError, "re-export legacy"):
+            execute(value, {}, [0] * 10)
+        driver.assert_not_called()
 
     def test_compiler_failure_has_no_success_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -355,7 +334,7 @@ class CUDAContractTests(unittest.TestCase):
                 return {75: self.major, 76: self.minor, 10: 32}.get(attribute, 2**20)
 
             def function_attribute(self, function, attribute):
-                return {0: 128, 1: 0, 4: 14}[attribute]
+                return {0: 128, 1: 1024, 4: 14, 8: 48000}[attribute]
 
             def call(self, name, *args):
                 self.calls.append(name)

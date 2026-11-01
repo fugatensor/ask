@@ -23,6 +23,8 @@ build/core/bin/ask-opt --capabilities
 
 `core` 使用 `ASK_THIRD_PARTY_COMPILERS=none`，不需要 Triton、NumPy 或 PyTorch。Python API 和 nanobind 绑定是基础组成，三种模式全部构建，不提供独立关闭选项。它仍能检查包含 `ask.external` 的图；真正请求编译外部 DSL 时才检查该编译器是否启用。第三方编译器可选择 `none`、`all` 或明确的名称，目标后端另外选择；当前后端选项只实现 `none` 和 `host`。见[构建说明](docs/09-构建与可选编译器.md)。
 
+第三方适配按 `adapters/<id>/` 集中存放：构建规则、worker、Python 策略、原生边界检查和专属测试都在该目录。公共核心通过显式注册接口调用它们，CUDA 运行时只读取标准化的参数与启动契约。新增编译器的文件和接口见[适配与注册](docs/17-第三方编译器适配与注册.md)；当前真实适配器仍只有 Triton。
+
 ## 从上层框架提交图
 
 构建完成后，使用匹配构建解释器的原生扩展。`Compiler()` 默认进程内调用 C++；显式传入 `ask-opt` 路径则使用 CLI 兼容入口：

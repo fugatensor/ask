@@ -39,7 +39,7 @@ void bindRuntime(nb::module_ &module) {
         std::string binary(static_cast<const char *>(data.data()),data.size());
         nb::gil_scoped_release release;return session.load(binary,entry,types,arch,parameters);
       },nb::arg("cubin"),nb::arg("entry"),nb::arg("required_types"),nb::arg("arch"),
-        nb::arg("expected_parameters")=4)
+        nb::arg("expected_parameters"))
       .def("submit",&Session::submit,nb::arg("kernel"),nb::arg("buffers"),nb::arg("grid"),
            nb::arg("block"),nb::arg("shared_bytes")=0,nb::call_guard<nb::gil_scoped_release>())
       .def("wait_for_external_stream",&Session::waitForExternalStream,nb::call_guard<nb::gil_scoped_release>())

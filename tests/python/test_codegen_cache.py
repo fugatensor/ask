@@ -64,9 +64,9 @@ class ExecutableCacheTests(unittest.TestCase):
             changes = [
                 lambda value: value.update(payload=value["payload"] + "; new LLVM bytes\n"),
                 lambda value: value["target"].update(arch=86),
-                lambda value: value["invocation"].update(block=[256, 1, 1], num_warps=8),
-                lambda value: value["invocation"]["compiler_metadata"].update(enable_fp_fusion=False),
-                lambda value: value["specializations"]["constants"].update(N=11),
+                lambda value: value["invocation"].update(block=[16, 4, 2]),
+                lambda value: value["codegen"].update(fp_contract="off"),
+                lambda value: [port.update(shape=[11]) for port in value["port_map"]],
                 lambda value: value.update(producer={"version": "new producer receipt"}),
             ]
             keys = {base["executable_cache"]["key"]}

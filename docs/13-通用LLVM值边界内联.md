@@ -1,6 +1,6 @@
 # 通用 LLVM 值边界内联
 
-[返回顶层设计](核心思想.md#ask-c) · [C 层优化](04-C层统一处理与可选优化.md) · [Triton GPU 路径](12-GPU融合与IR缓存.md)
+[返回顶层设计](核心思想.md#ask-c) · [C 层优化](04-C层统一处理与可选优化.md) · [Triton GPU 路径](12-GPU融合与IR缓存.md) · [适配器注册](17-第三方编译器适配与注册.md)
 
 一个融合实现需要回答两个不同的问题：在哪里替换值才是合法的，以及确认位置后怎样改写 LLVM。前者需要图、访存和编译器信息；后者可以共用。现在两部分通过 `BoundaryInlineSite` 交接。
 
@@ -55,7 +55,9 @@ helper 不能引入内存访问、指针计算、未知 asm/call、整数除零�
 | 已掌握含义的普通 LLVM 模块 | 提供方直接绑定 identity 调用及参数 | `inlineValueBoundaries` |
 | 当前 Triton 适配器 | DSL 数据流分析、公开 identity 追踪、产物摘要和 LLVM 地址/掩码检查 | 同一个 `inlineValueBoundaries` |
 
-Triton 的检查放在 [fusion.py](../adapters/triton/fusion.py) 和 [TritonBoundary.cpp](../lib/Adapters/TritonBoundary.cpp)。它们处理版本、PTX 标记格式和启动说明，再把已确认的位置交给核心。[Fuse.cpp](../lib/LLIR/Fuse.cpp) 负责当前 ASK 图的 helper 降级与这条路径的衔接。
+Triton 的检查放在 [fusion.py](../adapters/triton/fusion.py) 和 [TritonBoundary.cpp](../adapters/triton/lib/TritonBoundary.cpp)。它们处理版本、PTX 标记格式和启动说明，再把已确认的位置交给核心。[Fuse.cpp](../lib/LLIR/Fuse.cpp) 接收调用方传入的 `CompilerAdapter`，调用它的 `prepareFusion`，取得输入/输出值边界以及已规范化的代码生成选项，再降级 ASK helper。核心不根据编译器名字选择分支。
+
+适配器的 `validateArtifact` 检查私有证据，`finalizeArtifact` 在模块改写后处理已失效的来源信息。通用导出入口负责请求与响应的一致性、LLVM 模块验证和实际入口 ABI。生产注册表只装配构建选中的适配器；核心测试可以直接注入测试描述符，不把假编译器放进生产注册表。接口和接入步骤见[第 17 章](17-第三方编译器适配与注册.md)。
 
 接入另一种编译器时，需要提供该编译器的导出和边界绑定方式，无需复制链接、内联、类型检查和事务处理。暂时拿不到边界依据的模块，仍可以导入、验证和运行其他适用的 Pass；不能因此擅自删除其访存。
 
@@ -67,7 +69,7 @@ Triton 路径使用请求里的 `BLOCK` 和 `num_warps`，保留原来的执行�
 
 DSL 检查沿赋值追踪整数、索引、掩码、指针和已加载值。它接受位置/关键字 mask、局部别名、等价的交换运算，以及能按赋值顺序解释的局部重赋值。索引仍需满足已支持的逻辑关系，但不再要求源码逐句长成示例的样子。
 
-ASK 图接受相同形状的任意 rank 静态 bool / i32 / i64 / f32 / f16 / bf16 张量。当前外部 ABI 仍使用连续缓冲区，N 是元素总数；ShapeSnapshot 保留原始多维形状。运行器把逻辑 BLOCK 与物理线程数分别读取，不再混为固定的 128。
+ASK 图接受相同形状的任意 rank 静态 bool / i32 / i64 / f32 / f16 / bf16 张量。当前高级 CUDA 入口仍使用一个输入、一个同形状同 dtype 的输出和连续缓冲区。Triton 适配器中的 N 是元素总数，ShapeSnapshot 和规范 `port_map.shape` 保留原始多维形状。通用运行器只读取端口形状和三轴启动尺寸，不解释 BLOCK、N 或 warp 数。
 
 ## 5. 哪些能力仍然没有实现
 
@@ -83,7 +85,7 @@ GPU 验证使用同一组图覆盖不同 dtype，包含二维、三维形状、�
 
 ```bash
 # 工具路径与第 12 章相同，使用新的缓存和输出目录。
-PYTHONPATH=python python3 examples/triton_fused_gpu.py \
+PYTHONPATH=build/triton/python:python python3 examples/triton_fused_gpu.py \
   --ask-opt build/triton/bin/ask-opt \
   --triton-python /path/to/triton/python \
   --triton-worker adapters/triton/worker.py \
@@ -95,4 +97,6 @@ PYTHONPATH=python python3 examples/triton_fused_gpu.py \
 
 该验证同时检查 GPU 输出、冷/热缓存状态和多维 ShapeSnapshot。LLVM 结构合法、融合位置正确和设备数值一致，分别验收。图与数值参考的复用方式见[多精度测试](14-多精度测试.md)。
 
-本轮六类型基础矩阵加专项共通过 266 次融合 GPU 执行，比较 28842 个结果，缓存命中与未命中各 133 次。覆盖 36 个 cast 方向、显式 f32 中间计算、二维 / 三维形状、4 / 8 warps、多个边界站点和源码别名；i64 舍入、混合精度下溢和 F 的 FMA 开关也通过。完整数量和硬件验证范围见[GPU 数值验证](12-GPU融合与IR缓存.md#6-如何复现数值验证)。独立 host 测试还执行了其他浮点、整数和向量接口，结果不依赖 Triton 导出。
+此前类型与混合精度实现阶段，六类型基础矩阵加专项共通过 266 次融合 GPU 执行，比较 28842 个结果，缓存命中与未命中各 133 次。覆盖 36 个 cast 方向、显式 f32 中间计算、二维 / 三维形状、4 / 8 warps、多个边界站点和源码别名；i64 舍入、混合精度下溢和 F 的 FMA 开关也通过。完整数量和硬件验证范围见[GPU 数值验证](12-GPU融合与IR缓存.md#6-如何复现数值验证)。独立 host 测试还执行了其他浮点、整数和向量接口，结果不依赖 Triton 导出。
+
+适配器拆分后，另用手写 LLVM kernel 在 `none` 构建的运行时上执行 2/5 参数、三维启动和共享内存，576 个数值结果通过。此检查覆盖通用 CUDA 执行契约；测试描述符覆盖适配接口，并不构成第二个真实编译器的接入记录。

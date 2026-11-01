@@ -6,11 +6,10 @@ include(CMakePackageConfigHelpers)
 include(CTest)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(AskCompilerSelection)
+include(AskCompilerRegistry)
 
 set(ASK_THIRD_PARTY_COMPILERS "none" CACHE STRING "none, all, or semicolon-separated compiler IDs")
 set(ASK_TARGET_BACKENDS "host" CACHE STRING "none or host (initial implementation)")
-set(ASK_TRITON_PYTHON_EXECUTABLE "" CACHE FILEPATH "Python executable in the Triton worker environment")
-set(ASK_SUPPORTED_COMPILERS triton)
 ask_resolve_compilers("${ASK_THIRD_PARTY_COMPILERS}" "${ASK_SUPPORTED_COMPILERS}" ASK_ENABLED_COMPILERS)
 if(NOT ASK_TARGET_BACKENDS STREQUAL "none" AND NOT ASK_TARGET_BACKENDS STREQUAL "host")
   message(FATAL_ERROR "This draft implements ASK_TARGET_BACKENDS=none or host; requested '${ASK_TARGET_BACKENDS}'")
@@ -65,23 +64,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-set(ASK_WITH_TRITON 0)
-if("triton" IN_LIST ASK_ENABLED_COMPILERS)
-  if(NOT ASK_TRITON_PYTHON_EXECUTABLE OR NOT EXISTS "${ASK_TRITON_PYTHON_EXECUTABLE}")
-    message(FATAL_ERROR "Triton selected: set ASK_TRITON_PYTHON_EXECUTABLE to its environment's Python")
-  endif()
-  execute_process(COMMAND "${ASK_TRITON_PYTHON_EXECUTABLE}"
-    "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/worker.py" --probe
-    RESULT_VARIABLE probe_status OUTPUT_VARIABLE probe_output ERROR_VARIABLE probe_error TIMEOUT 60)
-  if(NOT probe_status EQUAL 0)
-    message(FATAL_ERROR "Triton environment check failed: ${probe_error}")
-  endif()
-  set(ASK_WITH_TRITON 1)
-  file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/triton-environment.json" "${probe_output}")
-  add_custom_target(ask_exporter_triton ALL SOURCES adapters/triton/worker.py)
-  install(FILES adapters/triton/worker.py adapters/triton/fusion.py DESTINATION ${CMAKE_INSTALL_DATADIR}/ask/adapters/triton COMPONENT CompilerTriton)
-endif()
-
 set(ASK_WITH_HOST 0)
 if(ASK_TARGET_BACKENDS STREQUAL "host")
   set(ASK_WITH_HOST 1)
@@ -92,7 +74,7 @@ configure_file(cmake/BuildConfig.h.in generated/ask/BuildConfig.h @ONLY)
 add_library(ask_core STATIC
   lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp lib/Frontend/Compiler.cpp
   lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/LLIR/Inline.cpp
-  lib/Adapters/TritonBoundary.cpp lib/Lowering/Host.cpp
+  lib/Lowering/Host.cpp
   lib/Transforms/Optimize.cpp)
 add_library(ASK::Core ALIAS ask_core)
 target_compile_features(ask_core PUBLIC cxx_std_17)
@@ -116,6 +98,37 @@ add_executable(ask-opt tools/ask-opt.cpp)
 target_link_libraries(ask-opt PRIVATE ASK::Core)
 set_target_properties(ask-opt PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
 
+if(SKBUILD)
+  set(ASK_PYTHON_INSTALL_DIR "ask")
+  set(ASK_ADAPTER_INSTALL_DIR "ask/share/ask/adapters")
+  install(TARGETS ask-opt RUNTIME DESTINATION ask/_bin COMPONENT Core)
+else()
+  set(ASK_PYTHON_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages/ask")
+  set(ASK_ADAPTER_INSTALL_DIR "${CMAKE_INSTALL_DATADIR}/ask/adapters")
+endif()
+ask_configure_compilers()
+
+# Only this assembly target depends on selected compiler implementations.
+# ASK::Core can still be linked by itself without any producer implementation.
+add_library(ask_compilers STATIC lib/Adapters/Registry.cpp ${ASK_ADAPTER_OBJECTS})
+add_library(ASK::Compilers ALIAS ask_compilers)
+set_target_properties(ask_compilers PROPERTIES EXPORT_NAME Compilers POSITION_INDEPENDENT_CODE ON)
+target_compile_features(ask_compilers PUBLIC cxx_std_17)
+target_include_directories(ask_compilers PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+  PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+foreach(ASK_DEPENDENCY_INCLUDE IN LISTS LLVM_INCLUDE_DIRS)
+  target_include_directories(ask_compilers SYSTEM PUBLIC $<BUILD_INTERFACE:${ASK_DEPENDENCY_INCLUDE}>)
+endforeach()
+target_compile_options(ask_compilers PUBLIC ${ASK_LLVM_DEFINITIONS})
+if(NOT LLVM_ENABLE_RTTI)
+  target_compile_options(ask_compilers PUBLIC $<$<CXX_COMPILER_ID:GNU,Clang>:-fno-rtti>)
+endif()
+target_link_libraries(ask_compilers PUBLIC ${ASK_LLVM_LIBS})
+target_link_libraries(ask-opt PRIVATE ASK::Compilers)
+install(TARGETS ask_compilers EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
+
 add_library(ask_runtime STATIC lib/Runtime/CUDA.cpp)
 add_library(ASK::Runtime ALIAS ask_runtime)
 set_target_properties(ask_runtime PROPERTIES EXPORT_NAME Runtime POSITION_INDEPENDENT_CODE ON)
@@ -126,7 +139,7 @@ target_include_directories(ask_runtime PUBLIC
 target_link_libraries(ask_runtime PRIVATE ${CMAKE_DL_LIBS})
 
 nanobind_add_module(_native NB_STATIC bindings/compiler.cpp bindings/compiler_bridge.cpp bindings/runtime.cpp)
-target_link_libraries(_native PRIVATE ASK::Core ASK::Runtime)
+target_link_libraries(_native PRIVATE ASK::Core ASK::Runtime ASK::Compilers)
 # LLVM is built without RTTI, but nanobind's own bound runtime classes require it.
 # The bridge keeps LLVM headers/types in a separate no-RTTI translation unit.
 set_source_files_properties(bindings/compiler.cpp bindings/runtime.cpp PROPERTIES
@@ -138,18 +151,14 @@ foreach(source IN LISTS ASK_PYTHON_SOURCES)
   get_filename_component(name "${source}" NAME)
   configure_file("${source}" "${CMAKE_CURRENT_BINARY_DIR}/python/ask/${name}" COPYONLY)
 endforeach()
-if(SKBUILD)
-  set(ASK_PYTHON_INSTALL_DIR "ask")
-  install(TARGETS ask-opt RUNTIME DESTINATION ask/_bin COMPONENT Core)
-else()
-  set(ASK_PYTHON_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages/ask")
-endif()
 install(TARGETS _native LIBRARY DESTINATION "${ASK_PYTHON_INSTALL_DIR}" COMPONENT Core)
 install(DIRECTORY python/ask/ DESTINATION "${ASK_PYTHON_INSTALL_DIR}" COMPONENT Core FILES_MATCHING PATTERN "*.py")
 install(TARGETS ask_runtime EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
 
 install(TARGETS ask_core EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
-install(TARGETS ask-opt RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Core)
+if(NOT SKBUILD)
+  install(TARGETS ask-opt RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Core)
+endif()
 install(DIRECTORY include/ask DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT Core)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/BuildConfig.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ask COMPONENT Core)
 install(EXPORT ASKCoreTargets NAMESPACE ASK:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Core)
@@ -162,6 +171,9 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BIN
 install(FILES cmake/llvm.lock.json cmake/nanobind.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 
 if(BUILD_TESTING)
+  add_executable(ask-compiler-adapter-test tests/test_compiler_adapter.cpp)
+  target_link_libraries(ask-compiler-adapter-test PRIVATE ASK::Core)
+  add_test(NAME ask-compiler-adapter COMMAND ask-compiler-adapter-test)
   add_executable(ask-boundary-inline-test tests/test_boundary_inline.cpp)
   target_link_libraries(ask-boundary-inline-test PRIVATE ASK::Core)
   add_test(NAME ask-boundary-inline COMMAND ask-boundary-inline-test)
@@ -178,14 +190,7 @@ if(BUILD_TESTING)
   add_test(NAME ask-build-selection COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_build_selection.py")
   add_test(NAME ask-fetch-nanobind COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fetch_nanobind.py")
   add_test(NAME ask-fetch-llvm COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fetch_llvm.py")
-  add_test(NAME ask-triton-worker COMMAND "${Python_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/tests" -v)
-  if(ASK_WITH_TRITON)
-    set_tests_properties(ask-triton-worker PROPERTIES ENVIRONMENT "ASK_TEST_TRITON_PYTHON=${ASK_TRITON_PYTHON_EXECUTABLE}")
-    add_test(NAME ask-triton-pipeline COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_pipeline.py"
-      "$<TARGET_FILE:ask-opt>" "${ASK_TRITON_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/worker.py")
-    add_test(NAME ask-triton-fusion COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_fusion.py"
-      "$<TARGET_FILE:ask-opt>" "${ASK_TRITON_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/worker.py")
-  endif()
+
 endif()
 message(STATUS "ASK compiler selection: '${ASK_THIRD_PARTY_COMPILERS}' -> [${ASK_ENABLED_COMPILERS}]")
 message(STATUS "ASK target backends: ${ASK_TARGET_BACKENDS}; LLVM/MLIR ${LLVM_PACKAGE_VERSION}")

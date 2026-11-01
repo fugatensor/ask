@@ -7,7 +7,7 @@ import json
 import math
 from pathlib import Path
 
-from ask import Compiler
+from ask import Compiler, CompilerEnvironment
 from .pointwise import (DTYPES, GRAPH_CASES, GraphCase, build_module, expected_values,
                         input_values, json_values, numerically_equal)
 
@@ -121,7 +121,8 @@ def main(argv=None):
         kernel = compiler.compile_cuda(
             module, cache_dir=arguments.cache_dir,
             output_dir=arguments.output_dir / label,
-            triton_python=arguments.triton_python, triton_worker=arguments.triton_worker,
+            compilers={"triton": CompilerEnvironment(python=arguments.triton_python,
+                                                   worker=arguments.triton_worker)},
             llc=arguments.llc, ptxas=arguments.ptxas)
         tensor_bindings = [binding for binding in kernel.report["shape_snapshot"]["shape_bindings"]
                            if binding["type"].startswith("tensor<")]
@@ -148,7 +149,7 @@ def main(argv=None):
                                  "use a fresh --cache-dir when repeating the validation")
         if not expected_hit and kernel.cache["status"] != "miss":
             raise AssertionError(f"{label}: expected a cold miss, got {kernel.cache}")
-        if not execution["device_execution_performed"] or execution["original_triton_binary_used"]:
+        if not execution["device_execution_performed"] or execution["original_producer_binary_used"]:
             raise AssertionError(f"{label}: expected execution of the newly generated cubin")
         (arguments.output_dir / label / "execution.json").write_text(
             json.dumps({**execution, "output": json_values(actual)}, indent=2, allow_nan=False) + "\n")

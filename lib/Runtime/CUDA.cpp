@@ -179,7 +179,7 @@ struct Kernel::Impl {
   std::shared_ptr<SessionState> state;
   Handle module = nullptr, function = nullptr;
   std::string name;
-  unsigned parameters = 0, maxThreads = 0;
+  unsigned parameters = 0, maxThreads = 0, maxDynamicSharedBytes = 0;
 };
 struct Event::Impl {
   std::shared_ptr<SessionState> state;
@@ -267,7 +267,7 @@ std::shared_ptr<DeviceBuffer> Session::importBuffer(std::uint64_t pointer,std::s
 std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string &entry,
     const std::vector<std::string> &requiredTypes,int arch,unsigned parameters) {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();checkTypes(requiredTypes);
-  require(arch>=70 && s.major==arch/10 && s.minor>=arch%10,"CUDA cubin target is incompatible with the selected device");
+  require(arch>=10 && s.major==arch/10 && s.minor>=arch%10,"CUDA cubin target is incompatible with the selected device");
   require(cubin.size()>=64 && cubin.compare(0,4,"\x7f" "ELF")==0,"runtime load requires a compiled CUDA cubin ELF image");
   require(!cubin.empty() && !entry.empty() && entry.find('\0')==std::string::npos,"kernel binary and entry must be nonempty");
   require(parameters>0 && parameters<=64,"unsupported kernel parameter count");
@@ -288,11 +288,15 @@ std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string
     require(offset==i*sizeof(DevicePointer) && size==sizeof(DevicePointer),"kernel ABI requires consecutive 64-bit pointer parameters"); }
   std::size_t offset=0,size=0;
   require(d.cuFuncGetParamInfo(function,parameters,&offset,&size)==1,"kernel parameter count differs from the declared ABI");
-  int shared=0,maxThreads=0;
-  d.check(d.cuFuncGetAttribute(&shared,1,function),"cuFuncGetAttribute(shared)");
+  int maxDynamicShared=0,maxThreads=0;
+  // The driver accounts for statically allocated shared memory in this limit.
+  // Attribute 8 is CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES. We do not
+  // silently opt in to a larger per-block allocation than the module requests.
+  d.check(d.cuFuncGetAttribute(&maxDynamicShared,8,function),"cuFuncGetAttribute(max dynamic shared)");
   d.check(d.cuFuncGetAttribute(&maxThreads,0,function),"cuFuncGetAttribute(max threads)");
-  require(shared==0,"kernel requires undeclared static shared memory");
+  require(maxDynamicShared>=0 && maxThreads>0,"invalid CUDA kernel resource limits");
   kernel->impl->maxThreads=maxThreads;
+  kernel->impl->maxDynamicSharedBytes=maxDynamicShared;
   impl->kernels.emplace(std::move(key),kernel);++s.counters["module_loads"];return kernel;
 }
 std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
@@ -301,7 +305,7 @@ std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   require(kernel && kernel->impl->state==impl->state,"kernel belongs to a different CUDA execution session");
   require(buffers.size()==kernel->impl->parameters,"kernel argument count differs from its ABI");
-  require(sharedBytes==0,"dynamic shared memory is not declared by this runtime ABI");
+  require(sharedBytes<=kernel->impl->maxDynamicSharedBytes,"dynamic shared memory exceeds the compiled kernel configured limit");
   std::uint64_t threads=1;
   for(unsigned i=0;i<3;++i) { require(grid[i] && grid[i]<=s.maxGrid[i],"launch grid exceeds device limits");
     require(block[i] && block[i]<=s.maxBlock[i],"launch block exceeds device limits");threads*=block[i]; }

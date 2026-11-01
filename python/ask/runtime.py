@@ -310,11 +310,11 @@ class ExecutionSession:
                             producer_stream=producer_stream)
 
     @_serialized
-    def load(self, cubin, entry, *, required_types, arch, expected_parameters=4):
+    def load(self, cubin, entry, *, required_types, arch, expected_parameters):
         self._check_open()
         _require(isinstance(cubin, bytes), "load expects cubin bytes")
         _require(isinstance(entry, str) and entry.isascii() and entry.isidentifier(), "invalid CUDA kernel entry")
-        _require(type(arch) is int and arch >= 70, "CUDA target architecture must be an integer >= 70")
+        _require(type(arch) is int and arch >= 10, "CUDA target architecture must be an integer >= 10")
         _require(isinstance(required_types, (list, tuple)) and
                  all(isinstance(dtype, str) and dtype in _WIDTH for dtype in required_types),
                  "required_types must name all kernel element types")

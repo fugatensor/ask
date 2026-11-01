@@ -37,25 +37,18 @@ class PreparedCUDAKernel:
         binary = Path(codegen["cubin"]).read_bytes()
         _require(_digest(binary) == codegen.get("cubin_sha256"), "cubin digest mismatch")
 
-        # The current graph bridge compiles shape-preserving pointwise regions.
-        # Preserve the graph's rank instead of treating equal element counts as
-        # interchangeable tensor shapes. Raw packages without a graph report
-        # retain the explicit one-dimensional N contract.
-        snapshot = kernel.report.get("shape_snapshot", {})
-        bindings = snapshot.get("shape_bindings", [])
-        shapes = [item["shape"] for item in bindings
-                  if isinstance(item, dict) and item.get("type", "").startswith("tensor<")]
-        shape = shapes[0] if shapes else [size]
-        _require(isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape)
-                 and math.prod(shape) == size and all(other == shape for other in shapes),
-                 "compiled pointwise graph has inconsistent logical tensor shapes")
+        # Shape is part of the normalized execution ABI, independent of the
+        # producer's graph report or its original specialization vocabulary.
+        shape = next(port["shape"] for port in artifact["port_map"]
+                     if port["logical_port"] == "input:0")
 
         self._session = session
         self._shape, self._dtype = tuple(shape), dtype
         self._nbytes = size * ctypes.sizeof(_STORAGE_TYPES[dtype])
         self._invocation = invocation
         self._kernel = session.load(binary, entry, arch=arch,
-                                    required_types=sorted(_required_types(artifact, dtype)))
+                                    required_types=sorted(_required_types(artifact, dtype)),
+                                    expected_parameters=len(invocation["arguments"]))
 
     @property
     def shape(self):
@@ -82,8 +75,8 @@ class PreparedCUDAKernel:
                  or output.data_ptr + output.nbytes <= input.data_ptr,
                  "compiled graph requires non-overlapping input and output buffers")
         bindings = {"input:0": input, "output:0": output}
-        parameters = [bindings[argument["binding"]] if index < 2 else None
-                      for index, argument in enumerate(self._invocation["arguments"])]
+        parameters = [bindings[argument["binding"]] if argument["binding"] != "null" else None
+                      for argument in self._invocation["arguments"]]
         return self._session.submit(self._kernel, parameters,
                                     grid=self._invocation["grid"],
                                     block=self._invocation["block"],

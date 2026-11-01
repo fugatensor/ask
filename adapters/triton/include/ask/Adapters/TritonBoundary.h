@@ -1,5 +1,6 @@
 #pragma once
 
+#include "ask/Adapters/Compiler.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Module.h"
@@ -28,4 +29,7 @@ bindTritonBoundaries(llvm::Module &module, const llvm::json::Object &artifact);
 // their strict arithmetic must not inherit Triton's global codegen option.
 llvm::Expected<llvm::json::Object>
 normalizeTritonNumerics(llvm::Module &module, const llvm::json::Object &artifact);
+
+// Referenced only by the generated enabled-adapter assembly registry.
+const CompilerAdapter &tritonCompilerAdapter();
 }

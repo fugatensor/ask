@@ -333,7 +333,7 @@ class RealBoundaryExportTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     artifact = json.loads(output.read_text())
                     self.assertEqual(artifact["target"]["arch"], arch)
-                    self.assertEqual(artifact["invocation"]["compiler_metadata"]["target"], value["target"])
+                    self.assertEqual(artifact["producer_metadata"]["compiler_metadata"]["target"], value["target"])
                     self.assertIn(f"call {llvm_type} asm sideeffect", artifact["payload"])
                     self.assertTrue(artifact["fusion_contract"]["proof"]["layout"]["matched_uninstrumented_baseline"])
                     self.assertEqual([port["storage_bytes"] for port in artifact["port_map"]], [width, width])
@@ -412,8 +412,8 @@ class RealBoundaryExportTests(unittest.TestCase):
                     self.assertIn("fmul float", traced["payload"])
                     self.assertIn("fadd float", traced["payload"])
                     for name in ("enable_fp_fusion", "enable_reflect_ftz"):
-                        self.assertEqual(baseline["invocation"]["compiler_metadata"][name],
-                                         traced["invocation"]["compiler_metadata"][name])
+                        self.assertEqual(baseline["producer_metadata"]["compiler_metadata"][name],
+                                         traced["producer_metadata"]["compiler_metadata"][name])
 
     def test_real_trace_exports_bind_source_ir_layout_and_partial_final_block(self):
         with tempfile.TemporaryDirectory(prefix="ask-boundary-export-test-") as directory:
@@ -444,7 +444,7 @@ class RealBoundaryExportTests(unittest.TestCase):
                     self.assertTrue(contract["proof"]["layout"]["matched_uninstrumented_baseline"])
                     self.assertEqual(contract["shape"], [count])
                     self.assertEqual(artifact["invocation"]["grid"], value["grid"])
-                    self.assertEqual(artifact["invocation"]["num_warps"], warps)
+                    self.assertEqual(artifact["producer_metadata"]["num_warps"], warps)
                     self.assertEqual(artifact["invocation"]["block"], [warps * 32, 1, 1])
                     self.assertEqual(artifact["invocation"]["shared_bytes"], 0)
                     self.assertFalse(artifact["validation"]["device_execution_performed"])

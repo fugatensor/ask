@@ -1,8 +1,8 @@
 # 从 Python 提交设备张量，重复执行已编译代码
 
-[返回顶层设计：执行流程](核心思想.md#ask-pipeline) · [构建选择](09-构建与可选编译器.md#core) · [框架接入](10-上层框架接入.md) · [GPU 编译](12-GPU融合与IR缓存.md)
+[返回顶层设计：执行流程](核心思想.md#ask-pipeline) · [构建选择](09-构建与可选编译器.md#core) · [框架接入](10-上层框架接入.md) · [GPU 编译](12-GPU融合与IR缓存.md) · [适配器注册](17-第三方编译器适配与注册.md)
 
-Python 负责构图和调用。`Compiler.prepare/optimize/capabilities` 以及 CUDA 资源管理通过 nanobind 调用 C++。冷编译的 GPU 融合流程仍由 Python 装配 `ask-opt`、外部 worker 和代码生成工具；这部分没有冒充已经全部迁入进程内。Python 绑定属于 ASK 基础组成，`none/all/triton` 都包含它；Triton 仍在独立 worker 中编译 DSL。这两条路径不能混在一起。
+Python 负责构图和调用。`Compiler.prepare/optimize/capabilities` 以及 CUDA 资源管理通过 nanobind 调用 C++。冷编译的 GPU 融合流程由 Python 调用 `ask-opt`、外部 worker 和代码生成工具，仍包含这些子进程。Python 绑定属于 ASK 基础组成，`none/all/triton` 都包含它。编译外部 DSL 时，注册表按 compiler ID 选择 worker；当前真实适配器是 Triton，它仍使用独立 Python 环境。运行已经编译好的规范产物无需加载该适配器，`none` 构建也可执行。
 
 ## 1. 编译一次，加载一次，再重复提交
 
@@ -27,7 +27,22 @@ with ExecutionSession(device=0) as session:
 
 `prepare` 校验产物、LLVM 和 cubin 摘要，固定参数说明，再加载模块。之后 `submit` 检查张量的形状、类型、所属 Session 和读写条件，绑定设备地址并入队；不读取产物文件，不上传输入，不下载结果，也不创建上下文或重新分配 x/y。
 
-当前高级执行入口沿用已有逐元素图 ABI：一个输入、一个输出、两个空 scratch 指针。运行时没有扩展编译器的算子集合，也没有实现任意混合图调度。`DeviceTensor` 的形状描述本身支持多维；同样有 15 个元素的 `(15,)` 与 `(3, 5)` 不被当成同一张量类型。
+当前高级执行入口要求一个输入、一个同 shape/dtype 的输出，连续且不重叠。参数绑定来自产物，可以包含额外的 null 指针，不要求恰好四个参数，也不知道 scratch 名称。底层 Session 支持 1–64 个 64 位指针参数，类型为 LLVM `ptr` 或 `ptr addrspace(1)`；高级入口的输入、输出至少占两个参数。当前没有标量参数或任意多输入输出调度。`DeviceTensor` 支持多维形状；同样有 15 个元素的 `(15,)` 与 `(3, 5)` 不能混用。
+
+运行器只读取规范执行字段：
+
+| 字段 | 用途 |
+|---|---|
+| `port_map` | 每个逻辑端口的参数序号、dtype、具体 shape 和连续布局 |
+| `invocation.version=2` | 明确使用这版执行契约 |
+| `invocation.arguments` | 按参数顺序绑定 input/output 或 null |
+| `invocation.grid/block/shared_bytes` | 三轴启动尺寸和动态共享内存字节数 |
+| `codegen.fp_contract/ptx_version` | LLVM 到 PTX 的明确代码生成设置 |
+| `required_element_types` | 包括中间值在内的类型需求，用于 bf16 能力检查 |
+
+加载后还通过 CUDA Driver 检查每个参数的实际偏移和宽度。静态共享内存由 cubin 声明；动态共享内存不得超过该函数当前配置的限额。启动尺寸按设备及函数的真实资源限制检查，不强制 warp 数、sm70 下限或一维 grid。运行器不会自动调高共享内存配置；含 bf16 的内核仍要求实际设备计算能力至少为 8.0。
+
+Triton 私有字段只由 `adapters/triton/` 解释，再转换成上述字段。旧 `invocation.version=1` 产物会明确拒绝，需从原图和 DSL 重新导出并编译；只修改 JSON 版本号不构成迁移。直接调用 `session.load` 时必须传 `expected_parameters`，高级 `kernel.prepare(session)` 则从参数表计算它。
 
 ## 2. 设备张量保存什么
 
@@ -71,7 +86,9 @@ bf16 检查针对实际选定的设备，且包括只在内核中间值使用 bf
 
 参数错误、缓存损坏、类型或形状不符、只读输出和重叠缓冲区在各自入口拒绝。没有 GPU 的测试只能验证契约和缓存行为；真实设备运行单独记录，不能用模拟驱动通过代替。
 
-在 RTX 3080（sm86）上，本轮 15 个图/dtype 组合全部通过，覆盖六种存储类型、多维形状和显式 f32 中间计算。120 次重复提交期间没有增加分配、模块加载或同步；12 个组合还验证了跨 Session 的 stream 依赖与零拷贝传递。IR 和可执行缓存分别为 15 次 miss、15 次 hit、0 次 invalid。另测 120 次跨线程提交、事件及外部 owner 生命周期；`none` 构建独立执行六类型产物也通过，未导入 Triton。这里记录功能和计数验证，不据此推算性能加速倍数。
+此前常驻运行时实现阶段，在 RTX 3080（sm86）上 15 个图/dtype 组合全部通过，覆盖六种存储类型、多维形状和显式 f32 中间计算。120 次重复提交期间没有增加分配、模块加载或同步；12 个组合还验证了跨 Session 的 stream 依赖与零拷贝传递。IR 和可执行缓存分别为 15 次 miss、15 次 hit、0 次 invalid。另测 120 次跨线程提交、事件及外部 owner 生命周期；`none` 构建独立执行六类型产物也通过，未导入 Triton。这里记录功能和计数验证，不据此推算性能加速倍数。
+
+本轮另用 `none` 构建运行手写 LLVM kernel，检查 2/5 参数、generic/global 指针、三维 grid/block 及静态/动态共享内存。同步和常驻入口共 6 次实际执行，576 个结果正确；超额动态共享内存在启动前拒绝。该测试没有外部编译器依赖，命令见[通用运行契约验证](14-多精度测试.md#通用运行契约验证)。
 
 实现入口：[原生运行时](../include/ask/Runtime/CUDA.h)、[设备张量 API](../python/ask/runtime.py)、[产物检查与提交](../python/ask/executable.py)、[共用图验证](../tests/support/runtime_validation.py)。
 

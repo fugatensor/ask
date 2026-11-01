@@ -1,7 +1,7 @@
 """Explicit CUDA execution with host buffers typed by the artifact's logical ports.
 
 Importing this module needs only the standard library. The driver is loaded only
-by execute; neither a Triton module nor a Triton compiled kernel is imported.
+by execute; no third-party compiler package is imported.
 Code generation consumes the supplied LLVM file, including ASK's transformations.
 """
 from __future__ import annotations
@@ -10,6 +10,7 @@ import ctypes
 import ctypes.util
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -42,91 +43,74 @@ def _artifact_digest(artifact):
 
 
 def _contract(artifact):
-    """Check metadata, without trying to infer memory semantics from LLVM/PTX."""
+    """Validate the compiler-independent CUDA invocation schema (version 2).
+
+    A producer adapter supplies concrete port shapes, pointer bindings, launch
+    dimensions and backend options. The runner does not reconstruct these from
+    a producer's DSL constants, scheduling metadata or private proof records.
+    """
     _require(isinstance(artifact, dict), "artifact must be an object")
     _require(artifact.get("format") == "llvm-ir", "expected native LLVM IR artifact")
     _require(isinstance(artifact.get("payload"), str) and bool(artifact["payload"]),
              "artifact must carry the LLVM IR that will actually be compiled")
     entry = artifact.get("entry")
-    _require(isinstance(entry, str) and entry.isascii() and entry.isidentifier(),
-             "unsupported entry name")
-    target = artifact.get("target", {})
+    _require(isinstance(entry, str) and entry.isascii() and entry.isidentifier(), "unsupported entry name")
+    target = artifact.get("target")
     _require(isinstance(target, dict) and target.get("backend") == "cuda"
-             and type(target.get("arch")) is int and target["arch"] >= 70
-             and target.get("warp_size") == 32,
-             "CUDA runtime requires an explicit ordinary sm architecture >= 70 and warp32")
-    invocation = artifact.get("invocation", {})
-    _require(isinstance(invocation, dict) and invocation.get("kind") == "cuda-kernel" and invocation.get("version") == 1,
-             "unsupported invocation kind/version")
-    warps = invocation.get("num_warps")
-    _require(type(warps) is int and 0 < warps <= 32 and warps & (warps - 1) == 0,
-             "num_warps must be a positive power of two within CUDA's thread-block limit")
-    block = invocation.get("block")
-    _require(isinstance(block, list) and len(block) == 3
-             and all(type(n) is int for n in block) and block == [warps * target["warp_size"], 1, 1],
-             "launch block must match the producer's declared num_warps and warp size")
-    _require(invocation.get("num_ctas") == 1 and invocation.get("shared_bytes") == 0,
-             "current CUDA runner requires one CTA per program and no shared memory")
-    grid = invocation.get("grid")
-    _require(isinstance(grid, list) and len(grid) == 3
-             and all(type(n) is int and 0 < n <= 2**31 - 1 for n in grid), "invalid launch grid")
+             and type(target.get("arch")) is int and 10 <= target["arch"] <= 999,
+             "CUDA runtime requires an explicit ordinary integer sm architecture")
+    invocation = artifact.get("invocation")
+    _require(isinstance(invocation, dict) and invocation.get("kind") == "cuda-kernel"
+             and invocation.get("version") == 2,
+             "CUDA invocation version 2 is required; re-export legacy artifacts through their compiler adapter")
+    for field in ("grid", "block"):
+        dimensions = invocation.get(field)
+        _require(isinstance(dimensions, list) and len(dimensions) == 3
+                 and all(type(n) is int and 0 < n < 2**32 for n in dimensions),
+                 f"CUDA {field} must contain three positive 32-bit dimensions")
+    _require(type(invocation.get("shared_bytes")) is int and 0 <= invocation["shared_bytes"] < 2**32,
+             "CUDA shared_bytes must be a nonnegative 32-bit integer")
     arguments = invocation.get("arguments")
-    _require(isinstance(arguments, list) and len(arguments) == 4,
-             "initial CUDA ABI requires two data pointers and two unused scratch pointers")
-    data_bindings = []
+    _require(isinstance(arguments, list) and 0 < len(arguments) <= 64,
+             "CUDA pointer ABI requires between 1 and 64 declared arguments")
+    bindings = {}
     for index, argument in enumerate(arguments):
-        _require(isinstance(argument, dict) and argument.get("argument") == index
-                 and argument.get("llvm_type") == "ptr addrspace(1)", "invalid pointer ABI mapping")
-        if index < 2:
-            binding = argument.get("binding")
-            _require(isinstance(binding, str), "data pointer binding must name a logical port")
-            data_bindings.append(binding)
-        else:
-            resource = ("global_scratch", "profile_scratch")[index - 2]
-            resources = invocation.get("resources", {})
-            _require(isinstance(resources, dict), "resources must describe the unused scratch buffers")
-            description = resources.get(resource, {})
-            _require(argument.get("binding") == "null" and argument.get("resource") == resource
-                     and isinstance(description, dict) and description.get("size_bytes") == 0,
-                     "scratch must be explicitly unused")
-    _require(set(data_bindings) == {"input:0", "output:0"}, "expected input:0 and output:0")
+        _require(isinstance(argument, dict) and type(argument.get("argument")) is int
+                 and argument["argument"] == index and argument.get("llvm_type") in ("ptr", "ptr addrspace(1)"),
+                 "invalid CUDA pointer argument mapping")
+        binding = argument.get("binding")
+        _require(isinstance(binding, str) and binding in ("input:0", "output:0", "null"),
+                 "current CUDA runner accepts input:0/output:0 buffer bindings and explicit null pointers")
+        if binding != "null":
+            _require(binding not in bindings, "logical buffer is mapped to multiple kernel arguments")
+            bindings[binding] = index
+    _require(set(bindings) == {"input:0", "output:0"}, "expected input:0 and output:0")
     ports = artifact.get("port_map")
-    _require(isinstance(ports, list) and len(ports) == 2,
-             "typed input/output port_map is required")
-    port_types = {}
+    _require(isinstance(ports, list) and len(ports) == 2, "two typed logical ports are required")
+    logical_ports = {}
     for port in ports:
         _require(isinstance(port, dict), "logical ports must be objects")
-        index, binding, dtype = port.get("argument"), port.get("logical_port"), port.get("element_type")
-        _require(type(index) is int and 0 <= index < 2 and binding == data_bindings[index]
-                 and binding not in port_types, "logical port and invocation argument mappings disagree")
-        _require(isinstance(dtype, str) and dtype in _STORAGE_TYPES,
-                 "CUDA buffers support bool, i32, i64, f32, f16 and bf16 element types")
-        port_types[binding] = dtype
-    dtype = port_types["input:0"]
-    _require(port_types["output:0"] == dtype,
-             "current CUDA runner requires matching input/output element types")
-    # A fused artifact keeps the removed markers' contract only as provenance.
-    # The active storage description is port_map; cross-check any provenance
-    # rather than interpreting opaque LLVM pointers as typed data pointers.
-    for name in ("fusion_contract", "source_fusion_contract"):
-        if name in artifact:
-            contract = artifact[name]
-            _require(isinstance(contract, dict) and contract.get("dtype") == dtype,
-                     "fusion provenance and logical port element types disagree")
-    specializations = artifact.get("specializations", {})
-    _require(isinstance(specializations, dict) and isinstance(specializations.get("constants"), dict),
-             "explicit constants specialization is required")
-    constants = specializations["constants"]
-    size = constants.get("N")
-    _require(type(size) is int and 0 <= size <= 2**31 - 1,
-             "initial CUDA runner requires explicit nonnegative constexpr N")
-    elements_per_program = constants.get("BLOCK")
-    _require(type(elements_per_program) is int and 0 < elements_per_program <= 2**30
-             and elements_per_program & (elements_per_program - 1) == 0,
-             "constexpr BLOCK must be a positive power of two within the signed-index range")
-    _require(grid == [max(1, (size + elements_per_program - 1) // elements_per_program), 1, 1],
-             "launch grid must match the producer's declared N/BLOCK element partition")
-    return entry, invocation, size, dtype
+        binding, dtype = port.get("logical_port"), port.get("element_type")
+        _require(isinstance(binding, str) and binding in bindings and binding not in logical_ports
+                 and type(port.get("argument")) is int and port["argument"] == bindings[binding],
+                 "logical port and invocation argument mappings disagree")
+        _require(isinstance(dtype, str) and dtype in _STORAGE_TYPES, "unsupported CUDA port element type")
+        shape = port.get("shape")
+        _require(isinstance(shape, list) and all(type(n) is int and n >= 0 for n in shape),
+                 "CUDA ports require concrete nonnegative shapes")
+        width = ctypes.sizeof(_STORAGE_TYPES[dtype])
+        _require(math.prod(shape) <= (2**63 - 1) // width, "CUDA tensor byte count overflows")
+        _require(port.get("layout") == "contiguous_row_major", "CUDA ports require contiguous row-major layout")
+        _require("storage_bytes" not in port or
+                 (type(port["storage_bytes"]) is int and port["storage_bytes"] == width),
+                 "port storage byte width disagrees with its element type")
+        logical_ports[binding] = port
+    incoming, outgoing = logical_ports["input:0"], logical_ports["output:0"]
+    _require(incoming["element_type"] == outgoing["element_type"] and incoming["shape"] == outgoing["shape"],
+             "current CUDA runner requires matching input/output shapes and element types")
+    _fp_contract(artifact)
+    _required_types(artifact, incoming["element_type"])
+    return entry, invocation, math.prod(incoming["shape"]), incoming["element_type"]
 
 
 def _host_buffers(values, size, dtype):
@@ -137,7 +121,7 @@ def _host_buffers(values, size, dtype):
     representable dtype range is rejected instead of silently becoming infinity.
     """
     _require(isinstance(values, (list, tuple)) and len(values) == size,
-             "input length must equal the artifact's explicit N specialization")
+             "input length must equal the artifact's concrete port shape")
     if dtype == "bool":
         _require(all(type(value) is bool for value in values), "bool input values must be Python bool scalars")
     elif dtype in ("i32", "i64"):
@@ -180,53 +164,23 @@ def _check_device_dtype(dtype, major, minor, name):
 
 
 def _required_types(artifact, dtype):
-    result = {dtype}
-    for field in (None, "fusion", "fusion_contract", "source_fusion_contract"):
-        receipt = artifact if field is None else artifact.get(field, {})
-        label = field or "artifact"
-        _require(isinstance(receipt, dict), label + " must be an object")
-        required = receipt.get("required_element_types", [])
-        _require(isinstance(required, list) and all(isinstance(t, str) and t in _STORAGE_TYPES for t in required),
-                 "invalid required element types in " + label)
-        result.update(required)
-    return result
+    required = artifact.get("required_element_types")
+    _require(isinstance(required, list) and
+             all(isinstance(value, str) and value in _STORAGE_TYPES for value in required),
+             "normalized artifact requires explicit required_element_types")
+    return {dtype, *required}
 
 
-def _fp_contract(artifact, dtype):
-    """Keep F's backend contraction setting without applying it to ASK ops."""
-    metadata = artifact["invocation"].get("compiler_metadata")
-    _require(isinstance(metadata, dict)
-             and type(metadata.get("enable_fp_fusion")) is bool
-             and type(metadata.get("enable_reflect_ftz")) is bool,
-             "floating code generation requires the producer's explicit numerical settings")
-    enabled = metadata["enable_fp_fusion"]
-    if "fusion" not in artifact and "source_fusion_contract" not in artifact:
-        # Triton's raw LLIR leaves this setting to its LLVM backend. There are
-        # no ASK operations in this artifact, so the original global policy is
-        # appropriate. After fusion that permission must be local to F instead.
-        return "fast" if enabled else "off"
-    fusion = artifact.get("fusion")
-    validation = artifact.get("validation")
-    _require(isinstance(fusion, dict) and isinstance(validation, dict)
-             and validation.get("stage") == "fused_llvm"
-             and validation.get("llvm_module_verified") is True,
-             "floating fused code generation requires a verified fusion receipt")
-    normalized = fusion.get("producer_numerics")
-    provenance = artifact.get("source_fusion_contract", {}).get("numerics")
-    expected = ("bool-exact" if dtype == "bool" else dtype + "-wrap" if dtype in ("i32", "i64")
-                else f"{dtype}-rne-no-fast-math-no-contract")
-    _require(isinstance(normalized, dict) and isinstance(provenance, dict)
-             and normalized.get("representation") == "original-F-instruction-contract-flags"
-             and normalized.get("producer_enable_fp_fusion") is enabled
-             and normalized.get("producer_enable_reflect_ftz") is metadata["enable_reflect_ftz"]
-             and provenance.get("enable_fp_fusion") is enabled
-             and provenance.get("enable_reflect_ftz") is metadata["enable_reflect_ftz"]
-             and fusion.get("ask_numerics") == expected,
-             "floating fusion numerical normalization does not match the producer settings")
-    return "on"
+def _fp_contract(artifact, dtype=None):
+    """Read the adapter-normalized backend policy, independent of its producer."""
+    options = artifact.get("codegen")
+    _require(isinstance(options, dict) and options.get("fp_contract") in ("on", "off", "fast")
+             and type(options.get("ptx_version")) is int and 10 <= options["ptx_version"] <= 999,
+             "normalized CUDA codegen requires fp_contract=on/off/fast and an explicit PTX version")
+    return options["fp_contract"]
 
 
-_CODEGEN_CACHE_VERSION = "ask.cuda.executable.v1"
+_CODEGEN_CACHE_VERSION = "ask.cuda.executable.v2"
 
 
 def _codegen_tool(path):
@@ -246,7 +200,7 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=N
     llc and ptxas are explicit executable paths. No target or launch policy is
     selected here. A cache hit skips both tools; it still validates the complete
     artifact and materializes PTX, cubin and a receipt in the requested directory.
-    No Triton-produced binary is reused. Cache counters describe this request.
+    No producer-supplied binary is reused. Cache counters describe this request.
     """
     entry, invocation, _, dtype = _contract(artifact)
     arch = artifact["target"]["arch"]
@@ -264,7 +218,8 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=N
     receipt = output_directory / "codegen.json"
     _require(not any(path.exists() for path in (ptx, cubin, receipt)),
              "codegen destination already contains artifacts; use a fresh directory")
-    options = [["-march=nvptx64", f"-mcpu=sm_{arch}", "-mattr=+ptx80", "--fp-contract=" + fp_contract],
+    ptx_version = artifact["codegen"]["ptx_version"]
+    options = [["-march=nvptx64", f"-mcpu=sm_{arch}", f"-mattr=+ptx{ptx_version}", "--fp-contract=" + fp_contract],
                [f"--gpu-name=sm_{arch}", "-v"]]
 
     def commands_for(directory):
@@ -313,7 +268,7 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=N
             "producer": artifact.get("producer", {}),
             "adapter": {"codegen_sha256": _digest(Path(__file__).read_bytes())},
             "tools": tools, "target": artifact["target"],
-            "shape": artifact["specializations"],
+            "shape": artifact["port_map"],
             "numerics": {"fp_contract": fp_contract, "required_element_types": sorted(required)},
         }
         built, stats = IRCache(cache_dir).get_or_create(key, build)
@@ -331,7 +286,7 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=N
               "commands": commands_for(output_directory), "compiler_logs": logs,
               "commands_role": "reproduction", "compiler_invocations": 0 if stats["status"] == "hit" else 2,
               "executable_cache": stats,
-              "invocation": invocation, "original_triton_binary_used": False}
+              "invocation": invocation, "original_producer_binary_used": False}
     created = []
     try:
         for path, payload in ((ptx, built["kernel.ptx"]), (cubin, built["kernel.cubin"]),
@@ -416,7 +371,7 @@ class _Driver:
 def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None):
     """Synchronously execute one explicit invocation, then release its resources.
 
-    This is an experimental runner for a trusted, verified N-element kernel, not
+    This is an experimental runner for a trusted, verified shape-specialized kernel, not
     a GPU memory-safety sandbox. The caller owns the kernel's logical contract.
     Failed launches are never replayed or silently replaced by another kernel.
     """
@@ -453,12 +408,11 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
     _require(major == arch // 10 and minor >= arch % 10,
              f"sm_{arch} cubin is incompatible with device capability {major}.{minor}; "
              "compile the graph for the selected device's target architecture")
-    _require(driver.attribute(device, 10) == 32, "device warp size disagrees with contract")
     grid = invocation["grid"]
     _require(all(value <= driver.attribute(device, attr) for value, attr in zip(grid, (5, 6, 7))),
              "launch grid exceeds device limits")
     block = invocation["block"]
-    _require(driver.attribute(device, 1) >= block[0]
+    _require(driver.attribute(device, 1) >= math.prod(block)
              and all(value <= driver.attribute(device, attr) for value, attr in zip(block, (2, 3, 4))),
              "device cannot launch the producer's block dimensions")
     context, module = ctypes.c_void_p(), ctypes.c_void_p()
@@ -472,19 +426,20 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
         function = ctypes.c_void_p()
         driver.call("cuModuleGetFunction", ctypes.byref(function), module, entry.encode("ascii"))
         parameter_layout = []
-        for index in range(4):
+        parameter_count = len(invocation["arguments"])
+        for index in range(parameter_count):
             offset, width = ctypes.c_size_t(), ctypes.c_size_t()
             driver.call("cuFuncGetParamInfo", function, index, ctypes.byref(offset), ctypes.byref(width))
             _require(offset.value == index * 8 and width.value == 8,
-                     "compiled kernel parameter layout differs from the four-pointer ABI")
+                     "compiled kernel parameter layout differs from the declared pointer ABI")
             parameter_layout.append({"offset": offset.value, "size": width.value})
         extra_offset, extra_width = ctypes.c_size_t(), ctypes.c_size_t()
-        status = driver.library.cuFuncGetParamInfo(function, 4, ctypes.byref(extra_offset),
+        status = driver.library.cuFuncGetParamInfo(function, parameter_count, ctypes.byref(extra_offset),
                                                   ctypes.byref(extra_width))
-        _require(status == 1, "compiled kernel must have exactly four parameters")
-        _require(driver.function_attribute(function, 1) == 0,
-                 "compiled kernel unexpectedly requires static shared memory")
-        _require(driver.function_attribute(function, 0) >= block[0],
+        _require(status == 1, "compiled kernel parameter count differs from the invocation")
+        _require(invocation["shared_bytes"] <= driver.function_attribute(function, 8),
+                 "dynamic shared memory exceeds the compiled kernel's configured limit")
+        _require(driver.function_attribute(function, 0) >= math.prod(block),
                  "compiled kernel resource use cannot support the producer's block dimensions")
         registers = driver.function_attribute(function, 4)
         for _ in range(2):
@@ -494,11 +449,11 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
         driver.call("cuMemcpyHtoD_v2", allocations[0], host_input, ctypes.sizeof(host_input))
         driver.call("cuMemcpyHtoD_v2", allocations[1], host_output, ctypes.sizeof(host_output))
         bindings = {"input:0": allocations[0], "output:0": allocations[1]}
-        parameters = [bindings[argument["binding"]] if index < 2 else ctypes.c_uint64(0)
-                      for index, argument in enumerate(invocation["arguments"])]
-        addresses = (ctypes.c_void_p * 4)(*[ctypes.cast(ctypes.byref(value), ctypes.c_void_p)
+        parameters = [bindings[argument["binding"]] if argument["binding"] != "null" else ctypes.c_uint64(0)
+                      for argument in invocation["arguments"]]
+        addresses = (ctypes.c_void_p * parameter_count)(*[ctypes.cast(ctypes.byref(value), ctypes.c_void_p)
                                          for value in parameters])
-        driver.call("cuLaunchKernel", function, *grid, *invocation["block"], 0, None, addresses, None)
+        driver.call("cuLaunchKernel", function, *grid, *invocation["block"], invocation["shared_bytes"], None, addresses, None)
         driver.call("cuCtxSynchronize")
         driver.call("cuMemcpyDtoH_v2", host_output, allocations[1], ctypes.sizeof(host_output))
         return {"output": _decode_output(host_output, size, dtype), "entry": entry, "element_type": dtype,
@@ -507,7 +462,7 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
                 "grid": grid, "block": invocation["block"],
                 "parameter_layout": parameter_layout, "registers_per_thread": registers,
                 "llvm_sha256": codegen["llvm_sha256"], "cubin_sha256": codegen["cubin_sha256"],
-                "device_execution_performed": True, "original_triton_binary_used": False}
+                "device_execution_performed": True, "original_producer_binary_used": False}
     finally:
         # Best-effort cleanup must not hide the original compiler/launch error.
         for allocation in reversed(allocations):

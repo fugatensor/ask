@@ -1,6 +1,6 @@
 #include "ask/LLIR/Fuse.h"
 #include "ask/IR/ASKOps.h"
-#include "ask/Adapters/TritonBoundary.h"
+#include "ask/Frontend/Compiler.h"
 #include "ask/LLIR/Inline.h"
 #include "ask/LLIR/Import.h"
 #include "ask/LLIR/Optimize.h"
@@ -21,23 +21,6 @@ std::string digest(llvm::StringRef text) {
   llvm::SHA256 hash;
   hash.update(text);
   return llvm::toHex(hash.final(), true);
-}
-
-llvm::json::Value attributeJSON(mlir::Attribute attr) {
-  if (auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr)) {
-    llvm::json::Object result;
-    for (auto item : dict) result[item.getName().strref()] = attributeJSON(item.getValue());
-    return result;
-  }
-  if (auto s = mlir::dyn_cast<mlir::StringAttr>(attr)) return s.getValue();
-  if (auto boolean = mlir::dyn_cast<mlir::BoolAttr>(attr)) return boolean.getValue();
-  if (auto n = mlir::dyn_cast<mlir::IntegerAttr>(attr)) return n.getInt();
-  if (auto array = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(attr)) {
-    llvm::json::Array result;
-    for (auto n : array.asArrayRef()) result.push_back(n);
-    return result;
-  }
-  return nullptr;
 }
 
 // Both helpers are scalar, pure functions of the ASK element type. Indices, masks, memory
@@ -102,7 +85,7 @@ llvm::Expected<llvm::Function *> helper(llvm::Module &m, llvm::StringRef name,
 
 llvm::Expected<std::unique_ptr<llvm::Module>>
 fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
-             llvm::LLVMContext &context, llvm::json::Object &report, std::string &helperIR) {
+             const adapters::CompilerAdapter &adapter, llvm::LLVMContext &context, llvm::json::Object &report, std::string &helperIR) {
   llvm::SmallVector<mlir::func::FuncOp> functions(graph.getOps<mlir::func::FuncOp>());
   if (functions.size() != 1) return error("fusion requires exactly one graph function");
   auto func = functions[0];
@@ -142,51 +125,36 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
     return error("fusion external boundaries must preserve graph storage types and shapes");
   if (external.resolveSemantics()->getAttrOfType<mlir::StringAttr>("effects").getValue() != "none")
     return error("fusion requires a pure external semantic contract");
-  auto *contract = artifact.getObject("fusion_contract");
+  auto impl = external.resolveImplementation();
+  auto compiler = impl->getAttrOfType<mlir::StringAttr>("compiler").getValue();
+  if (compiler != adapter.id)
+    return error("selected adapter does not match the graph implementation compiler");
+  if (!adapter.prepareFusion)
+    return error("selected compiler adapter does not support value-boundary fusion");
   auto payload = artifact.getString("payload");
   auto entryName = artifact.getString("entry");
-  auto *producer = artifact.getObject("producer");
-  auto *specializations = artifact.getObject("specializations");
-  if (!contract || !payload || !entryName || !producer || !specializations)
-    return error("missing external fusion artifact / boundary contract fields");
-  if (contract->getString("dtype") != dtype)
-    return error("external boundary dtype does not match the ASK graph element type");
-  auto impl = external.resolveImplementation();
-  auto source = impl->getAttrOfType<mlir::StringAttr>("source").getValue();
-  if (impl->getAttrOfType<mlir::StringAttr>("compiler").getValue() != "triton" ||
-      impl->getAttrOfType<mlir::StringAttr>("entry").getValue() != entryName)
-    return error("artifact entry/compiler does not match this implementation");
-  for (auto pair : {std::make_pair("constants", "constants"),
-                    std::make_pair("options", "fixed_options"),
-                    std::make_pair("source_bindings", "source_bindings")}) {
-    auto attr = impl->getAttr(pair.first);
-    if (!attr || !specializations->get(pair.second) ||
-        attributeJSON(attr) != *specializations->get(pair.second))
-      return error("artifact specialization does not match implementation: " + llvm::Twine(pair.first));
-  }
-  auto *target = artifact.getObject("target");
-  auto declaredTarget = impl->getAttrOfType<mlir::DictionaryAttr>("target");
-  if (!target || !declaredTarget) return error("missing target contract");
-  for (auto field : declaredTarget)
-    if (!target->get(field.getName().strref()) ||
-        *target->get(field.getName().strref()) != attributeJSON(field.getValue()))
-      return error("artifact target does not match implementation");
-  if (contract->getString("original_source_sha256") != digest(source) ||
-      specializations->getString("source_sha256") != digest(source))
-    return error("boundary contract does not describe this graph's DSL source");
-  auto instrumented = artifact.getString("instrumented_source");
-  if (!instrumented || contract->getString("instrumented_source_sha256") != digest(*instrumented))
-    return error("instrumented source digest does not match boundary contract");
-  auto *shape = contract->getArray("shape");
-  if (!shape || shape->size() != 1 || (*shape)[0].getAsInteger() != n)
-    return error("boundary shape/constexpr element count does not match the prepared graph");
-  auto *invocation = artifact.getObject("invocation");
-  if (!invocation || !invocation->get("grid") || !impl->getAttr("grid") ||
-      *invocation->get("grid") != attributeJSON(impl->getAttr("grid")))
-    return error("artifact launch grid does not match implementation");
+  if (!payload || payload->empty() || !entryName || entryName->empty() ||
+      artifact.getString("format") != "llvm-ir" ||
+      artifact.getInteger("protocol_version") != adapter.protocolVersion)
+    return error("missing or incompatible external LLVM artifact fields");
+  auto requests = ask::externalRequests(graph, true);
+  if (requests.size() != 1 || !requests[0].getAsObject())
+    return error("fusion requires one prepared external request");
+  const auto &request = *requests[0].getAsObject();
+  if (adapter.validateArtifact)
+    if (auto e = adapter.validateArtifact(artifact, request)) return std::move(e);
+  if (auto *types = artifact.getArray("required_element_types"))
+    for (const auto &element : *types) {
+      auto name = element.getAsString();
+      if (!name || name->empty()) return error("invalid external element type requirement");
+      requiredTypes.insert(name->str());
+    }
   auto imported = importLLVMIR(*payload, context, "external.boundary.ll");
   if (!imported) return imported.takeError();
   auto &m = **imported;
+  auto *entry = m.getFunction(*entryName);
+  if (!entry || entry->isDeclaration() || entry->isVarArg())
+    return error("external LLVM entry must be a defined non-variadic function");
   // Producer-local BF16 casts also require hardware support, even when graph
   // storage and all ASK expressions are f32. Include operand types for void
   // instructions such as stores as well as computed result types.
@@ -197,13 +165,10 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
         for (auto &operand : instruction.operands())
           if (operand->getType()->getScalarType()->isBFloatTy()) requiredTypes.insert("bf16");
       }
-  // Dispatch is producer-specific; native LLVM transformation is independent.
-  auto boundaries = adapters::bindTritonBoundaries(m, artifact);
+  auto boundaries = adapter.prepareFusion(m, artifact, {request, dtype, n});
   if (!boundaries) return boundaries.takeError();
-  // The producer's backend settings are not always encoded in its LLIR. Make
-  // F's contraction permission local before adding ASK's separately rounded ops.
-  auto numerics = adapters::normalizeTritonNumerics(m, artifact);
-  if (!numerics) return numerics.takeError();
+  if (boundaries->protocol.empty() || boundaries->inputs.empty() || boundaries->outputs.empty())
+    return error("compiler adapter did not provide complete input/output value boundaries");
   auto helpers = std::make_unique<llvm::Module>("ask.scalar.helpers", context);
   helpers->setTargetTriple(m.getTargetTriple());
   helpers->setDataLayout(m.getDataLayout());
@@ -216,14 +181,10 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
   llvm::raw_string_ostream helperStream(helperIR);
   helpers->print(helperStream, nullptr);
   llvm::SmallVector<BoundaryInlineSite> sites;
-  for (auto *marker : boundaries->inputs) {
-    llvm::IRBuilder<> b(marker);
-    auto *valid = b.CreateICmpNE(marker->getArgOperand(boundaries->maskArgument), b.getInt32(0));
-    auto *value = marker->getArgOperand(boundaries->valueArgument);
-    sites.push_back({marker, *pre, {value}, valid, value});
-  }
-  for (auto *marker : boundaries->outputs)
-    sites.push_back({marker, *post, {marker->getArgOperand(boundaries->valueArgument)}, nullptr, nullptr});
+  for (const auto &boundary : boundaries->inputs)
+    sites.push_back({boundary.marker, *pre, {boundary.value}, boundary.predicate, boundary.passthrough});
+  for (const auto &boundary : boundaries->outputs)
+    sites.push_back({boundary.marker, *post, {boundary.value}, boundary.predicate, boundary.passthrough});
   auto fused = inlineValueBoundaries(m, *helpers, sites, report);
   if (!fused) return fused.takeError();
   if (auto e = optimizeLLVMIR(**fused, report)) return std::move(e);
@@ -233,7 +194,7 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
     computeTypes.push_back(element);
     requiredElementTypes.push_back(element);
   }
-  report["fusion"] = llvm::json::Object{{"protocol", "ask.triton.boundary.v1"},
+  report["fusion"] = llvm::json::Object{{"protocol", boundaries->protocol}, {"compiler", adapter.id},
       {"external_op", external->getAttrOfType<mlir::StringAttr>("ask.id").getValue().str()},
       {"entry", entryName->str()}, {"inlined_helpers", static_cast<int64_t>(sites.size())},
       {"dtype", dtype},
@@ -243,11 +204,12 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
       {"compute_types", std::move(computeTypes)},
       {"required_element_types", std::move(requiredElementTypes)},
       {"cast_semantics", "rne-saturating-fptosi-nan-zero-v1"},
-      {"producer_numerics", std::move(*numerics)},
+      {"producer_numerics", std::move(boundaries->producerNumerics)},
+      {"codegen", std::move(boundaries->codegen)},
       {"removed_boundary_markers", static_cast<int64_t>(sites.size())},
       {"helper_functions", 2}, {"boundary_inliner", "ask.llvm.value-boundary.v1"},
       {"original_llir_sha256", digest(*payload)}, {"ask_helpers_sha256", digest(helperIR)},
-      {"launch_policy", "preserved"}, {"input_mask_other", "preserved"},
+      {"launch_policy", "preserved"}, {"input_predicate_passthrough", "preserved"},
       {"llvm_verified", true}, {"device_execution_performed", false}};
   return std::move(*fused);
 }

@@ -2,7 +2,7 @@
 
 [返回顶层设计：B 层](核心思想.md#ask-b) · [统一层的范围](核心思想.md#ask-architecture) · [文档索引](README.md)
 
-本篇定义通用接入接口，其中代码是设计示例。已经实现的 SDK、Triton worker 和受限融合入口分别见[框架接入](10-上层框架接入.md)与[GPU 融合与缓存](12-GPU融合与IR缓存.md)。LLIR 指原生 LLVM IR，允许包含目标 intrinsic 和 inline asm。第三方编译器使用 MLIR 时，由其导出路径生成原生 LLVM IR，再交给 ASK。
+本篇说明产物契约。`LLIRArtifact`、`ImportResult` 和 `ask.llir.import_artifact` 是完整接口的设计示例，尚未成为 Python 类或方法；当前实现使用 JSON 产物、CLI worker 协议和 C++ 回调，代码接口及目录见[适配与注册](17-第三方编译器适配与注册.md)。已有 SDK 见[框架接入](10-上层框架接入.md)，GPU 入口见[融合与缓存](12-GPU融合与IR缓存.md)。LLIR 指原生 LLVM IR，允许包含目标 intrinsic 和 inline asm。第三方编译器使用 MLIR 时，由其导出路径生成原生 LLVM IR，再交给 ASK。
 
 首期只实现 Triton 导出器。其他编译器先遵循同一个产物格式，不要求现在就解决所有工具链的导出问题。
 
@@ -72,7 +72,7 @@ result = ask.llir.import_artifact(artifact, binding=operator_binding)
 
 缺省与空值要区分。例如未知依赖不能写成“已确认无依赖”，未知资源大小不能写成零。模块已含目标信息时可以据此补充；缺少的信息也可由调用方显式提供，但不能从当前宿主机或同名文件猜测。
 
-LLVM 文本不一定包含原编译器的所有数值设置。已实现的 Triton 路径会把实际 `enable_fp_fusion` / `enable_reflect_ftz` 放入调用的 compiler metadata，融合契约再记录并核对。Triton 可以在 LLVM 到 PTX 时才允许 FMA，即使 `.ll` 中的乘加没有 `contract`。ASK 在插入自己的操作前，将这项许可落实到 F 的指令上，随后用标准 LLVM 规则生成代码。它不是为了融合放宽精度，而是把外部隐含的配置显式化。具体代码和验证见[GPU 融合](12-GPU融合与IR缓存.md)。其他导出器也要说明这类设置；有冲突时拒绝该次融合，不能用全模块 fast-math 覆盖所有区域。
+LLVM 文本不一定包含原编译器的所有数值设置。已实现的 Triton 路径会把实际 `enable_fp_fusion` / `enable_reflect_ftz` 保存在 `producer_metadata.compiler_metadata`，由 Triton 适配器核对并转换为标准 `codegen` 字段。Triton 可以在 LLVM 到 PTX 时才允许 FMA，即使 `.ll` 中的乘加没有 `contract`。ASK 在插入自己的操作前，将这项许可落实到 F 的指令上，随后用标准 LLVM 规则生成代码。它不是为了融合放宽精度，而是把外部隐含的配置显式化。具体代码和验证见[GPU 融合](12-GPU融合与IR缓存.md)。其他导出器也要说明这类设置；有冲突时拒绝该次融合，不能用全模块 fast-math 覆盖所有区域。
 
 `binding` 引用 A 层已经注册的 `OperatorSemantics`，并带本次类型、形状和常量。它不重复定义 F 的算法。导入器能检查签名、端口和声明是否一致，不能自动证明任意 LLVM 程序实现了该算法；实现注册方负责对应关系，实际测试验证结果。
 
@@ -103,43 +103,23 @@ specializations:
 
 这只是该签名下的例子，不能规定所有编译器都按这个顺序输出。参数可能被消除、拆分或聚合，也可能出现 scratch 指针等隐藏参数，最终符号也可能不同于 DSL 的源入口 `entry`。导出器结合源绑定和真实编译结果说明每个参数从哪里来；ASK 检查物理签名、输出位置与常量特化是否匹配。只有 `source_bindings` 而没有实际 `port_map`，还不能构造调用。
 
-首版 `port_map` 支持直接参数、写入指针的输出和返回值，以及明确的特化常量。更复杂的封送使用版本化的目标调用适配器或显式 wrapper；在支持之前报告不支持，不用任意 Python 回调藏起未知参数规则。
+完整设计允许 `port_map` 表达直接参数、写入指针的输出、返回值和特化常量。当前 CUDA 执行入口仅实现一输入一输出的连续指针端口，形状、dtype 和实际参数位置必须明确；更多参数形式在实现之前报不支持。具体字段与限制见[CUDA v2 契约](17-第三方编译器适配与注册.md#3-先交付能调用的-llvm再考虑融合)。
 
 `invocation` 按调用种类区分。例如普通主机调用需要 calling convention 和返回规则，GPU kernel 还需要 grid、block 或等价配置、共享/临时资源及完成事件。通用层只保存类型与版本，目标后端验证和执行对应描述。PTX 的启动字段不进入所有编译器都必须实现的公共字段。
 
-## 4. 要让 ASK 代为编译，只实现一个导出回调
+## 4. 用注册的 worker 代为编译
 
-已有离线 LLVM 文件不需要插件。图编译需要让 ASK 按 external 节点路由 DSL 时，第三方提供下面一个回调即可；`id` 是实现记录中 `compiler_id` 所选的导出器标识。示例假定 `my-compiler` 已加入当前构建及安装允许清单，否则注册被拒绝：
+当前导出流程按 `ask.external` 实现记录的 compiler ID 选 worker。worker 的计算职责仍是 `export(request) -> artifact`；进程协议使用 `--request FILE --output FILE`，传 JSON 文件。Python worker 用指定解释器执行，原生 worker 可以直接执行。尚未提供动态 `ask.llir.register_exporter` API，也不扫描系统插件。
 
-```python
-def export(request: ExportRequest) -> LLIRArtifact:
-    compiled = compile_with_public_api(
-        request.source,
-        signature=request.signature,
-        constants=request.constants,
-        target=request.target,
-        options=request.fixed_options,
-    )
-    return artifact_from_public_output(compiled, request)
+一个新适配器需要在自己的目录交付三部分：worker 负责公开 DSL 编译与产物导出；Python 策略负责环境与缓存身份；原生 `CompilerAdapter` 负责产物的专属验证，按需提供融合边界。它们通过同一份 `registration.json` 注册，当前构建允许的 ID 才能加载。新增步骤见[适配器目录与注册](17-第三方编译器适配与注册.md#6-新增一个编译器的具体步骤)。
 
-ask.llir.register_exporter(
-    id="my-compiler",
-    version="1",
-    export=export,
-)
-```
+请求包含源码字符串、源入口、签名、源参数绑定、常量、目标、固定选项和 grid。worker 核对自己的源码与配置约定，通过第三方公开编译 API 取得 LLVM，再依据实际输出建立端口映射，不能把源参数表直接当成降低后的 ABI。首期传递源码字符串；完整 `DSLSource` 内容存储与依赖包接口仍待实现。
 
-这里的两个函数是第三方适配器自己的实现，不是 ASK 或 Triton 已有 API。`ExportRequest` 包含实现引用、`source: DSLSource`、`source_bindings`、从冻结类型及源绑定得到的签名、常量、目标、固定编译选项，以及取消与时间预算。适配器解析 `source_ref`、核对内容摘要，用该编译器支持的源码对象调用公开接口；ASK 不替每种语言定义源码语法。`artifact_from_public_output` 再依据实际入口和产物建立 `port_map`，不能直接复制 `request.source_bindings`。
+公共驱动核对响应协议、源码摘要和固定配置，解析 LLVM 并对照真实入口签名；适配器再检查本编译器的来源证据。普通 `--export-external` 不要求融合标记。`--fuse-external` 才请求已证明的边界；没有融合能力时明确拒绝这次请求，不影响导出能力。
 
-在线路径拿到返回值后，仍调用第 1 节的 `import_artifact`。第三方不必再实现解析、通用验证、缓存或 Pass 管理接口。若本次导出失败，回调报告编译诊断；不得返回一份来自不同配置的旧文件冒充结果。
+F 的策略一旦选定，源码、常量、目标和固定选项就是基线。可以为取得缺失 IR 按相同配置重新导出，不能为了融合改 F 的 tiling、布局或执行映射。
 
-图路径仍要求框架提交 DSL。如果按该 DSL 和固定配置编译后只能取得二进制，B 层可为同一实现建立 `CallableArtifact`，保留独立调用。worker 返回的必须是可序列化代码、ABI、启动与依赖说明，不能通过 IPC 返回 `CompiledKernel`、Python launcher 或进程内句柄；执行句柄由 ASK 后端加载后创建。缺少独立调用所需资料时报告不支持，不隐含增加远程设备执行协议。
-
-这种产物不调用 `import_artifact`，也不伪造空 LLVM payload。`LLIRArtifact.fallback` 可给一份有效 IR 附带同一固定策略下的独立调用选择；选择它时仍记录 LLIR 路径未完成。低层工具显式接入现成产物，不改变图主入口要求 DSL 的约定。
-
-`register_exporter` 的类型与 SDK 始终可用，实际注册要核对构建与安装清单。首期 C++ 侧注册通用进程代理，真实导出回调在指定 Python worker 中运行；只有进入允许清单的 ID 才能建立这条路由。未启用、环境缺失与编译失败分别报告，离线 `import_artifact` 不需要注册源编译器。详见[构建能力与注册](09-构建与可选编译器.md#capabilities)。
-
-F 的策略一旦选定，`fixed_options` 及对应源码、常量、目标和启动约定就成为本次基线。允许为取得缺失 IR 按相同配置重新导出；不能为了更容易优化改 F 的 tiling、布局或执行映射。只影响产物保留与导出的选项可以调整，并记录在来源信息中。
+只有二进制、没有 LLVM 的 `CallableArtifact` 及自动独立调用回退仍属后续设计。当前 worker 不返回第三方 launcher、进程内句柄或空 payload 冒充 LLVM。导出不支持时返回错误；现有图融合入口不会悄悄建立多 kernel 调度。
 
 ## 5. 返回的是几项检查结果，不是一个“可融合”标记
 

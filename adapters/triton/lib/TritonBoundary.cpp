@@ -129,7 +129,8 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   auto *constants = specializations->getObject("constants");
   auto *options = specializations->getObject("fixed_options");
   auto *invocation = artifact.getObject("invocation");
-  if (!constants || !options || !invocation) return error("missing Triton launch/specialization contract");
+  auto *producerMetadata = artifact.getObject("producer_metadata");
+  if (!constants || !options || !invocation || !producerMetadata) return error("missing Triton launch/specialization contract");
   auto n = constants->getInteger("N"), block = constants->getInteger("BLOCK");
   auto warps = options->getInteger("num_warps"), warpSize = target->getInteger("warp_size");
   auto arch = target->getInteger("arch");
@@ -139,13 +140,17 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
       target->getString("backend") != "cuda" || !arch || *arch < 70 || *arch > 999)
     return error("unsupported Triton launch contract");
   auto *requiredTypes = contract->getArray("required_element_types");
-  if (!requiredTypes) return error("missing external computation type requirements");
+  auto *normalizedTypes = artifact.getArray("required_element_types");
+  if (!requiredTypes || !normalizedTypes) return error("missing external computation type requirements");
   bool containsPortType = false;
   for (const auto &type : *requiredTypes) {
     auto name = type.getAsString();
     if (name != "bool" && name != "i32" && name != "i64" &&
         name != "f32" && name != "f16" && name != "bf16")
       return error("unsupported external computation type requirement");
+    bool present = false;
+    for (const auto &normalized : *normalizedTypes) present |= normalized.getAsString() == name;
+    if (!present) return error("normalized computation types omit a producer requirement");
     containsPortType |= name == dtype;
     if (name == "bf16" && *arch < 80)
       return error("bf16 computation requires CUDA compute capability 8.0 or newer");
@@ -161,7 +166,7 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   int64_t threads = *warps * *warpSize;
   llvm::json::Array grid{(*n + *block - 1) / *block, 1, 1};
   if (!invocation->get("grid") || *invocation->get("grid") != llvm::json::Value(std::move(grid)) ||
-      invocation->getInteger("num_warps") != warps || invocation->getInteger("num_ctas") != 1 ||
+      producerMetadata->getInteger("num_warps") != warps || producerMetadata->getInteger("num_ctas") != 1 ||
       invocation->getInteger("shared_bytes") != 0 || !invocation->get("block") ||
       *invocation->get("block") != llvm::json::Value(llvm::json::Array{threads, 1, 1}))
     return error("boundary launch grid does not cover the logical tensor under the requested policy");
@@ -272,10 +277,10 @@ llvm::Expected<llvm::json::Object>
 normalizeTritonNumerics(llvm::Module &module, const llvm::json::Object &artifact) {
   auto *contract = artifact.getObject("fusion_contract");
   auto *specializations = artifact.getObject("specializations");
-  auto *invocation = artifact.getObject("invocation");
+  auto *producerMetadata = artifact.getObject("producer_metadata");
   auto *numerics = contract ? contract->getObject("numerics") : nullptr;
   auto *options = specializations ? specializations->getObject("fixed_options") : nullptr;
-  auto *metadata = invocation ? invocation->getObject("compiler_metadata") : nullptr;
+  auto *metadata = producerMetadata ? producerMetadata->getObject("compiler_metadata") : nullptr;
   auto entryName = artifact.getString("entry");
   auto *entry = entryName ? module.getFunction(*entryName) : nullptr;
   if (!numerics || !options || !metadata || !entry)
@@ -305,5 +310,97 @@ normalizeTritonNumerics(llvm::Module &module, const llvm::json::Object &artifact
       {"producer_enable_fp_fusion", *enabled}, {"producer_enable_reflect_ftz", *reflectFTZ},
       {"representation", "original-F-instruction-contract-flags"},
       {"tagged_instructions", static_cast<int64_t>(*enabled ? candidates.size() : 0)}};
+}
+
+namespace {
+llvm::Error validateTritonArtifact(const llvm::json::Object &artifact,
+                                    const llvm::json::Object &request) {
+  auto *producer = artifact.getObject("producer");
+  auto *specializations = artifact.getObject("specializations");
+  auto *target = artifact.getObject("target");
+  auto *requestedTarget = request.getObject("target");
+  auto *invocation = artifact.getObject("invocation");
+  auto source = request.getString("source");
+  if (request.getString("compiler") != "triton" || !producer ||
+      producer->getString("name") != "triton" || producer->getString("version") != "3.7.1" ||
+      artifact.getInteger("protocol_version") != 1 || artifact.getString("format") != "llvm-ir" ||
+      !artifact.getString("payload") || !specializations || !target || !requestedTarget ||
+      !invocation || !source || artifact.getString("entry") != request.getString("entry"))
+    return error("Triton artifact does not match its pinned producer or source entry");
+  for (llvm::StringRef key : {"constants", "fixed_options", "source_bindings"})
+    if (!request.get(key) || !specializations->get(key) ||
+        *request.get(key) != *specializations->get(key))
+      return error("artifact specialization does not match implementation: " + key);
+  for (const auto &field : *requestedTarget)
+    if (!target->get(field.first) || *target->get(field.first) != field.second)
+      return error("artifact target does not match implementation");
+  if (specializations->getString("source_sha256") != digest(*source))
+    return error("Triton artifact does not describe this graph's DSL source");
+  if (!invocation->get("grid") || !request.get("grid") ||
+      *invocation->get("grid") != *request.get("grid"))
+    return error("artifact launch grid does not match implementation");
+  return llvm::Error::success();
+}
+
+llvm::Expected<PreparedFusion> prepareTritonFusion(
+    llvm::Module &module, const llvm::json::Object &artifact,
+    const FusionRequest &request) {
+  if (auto e = validateTritonArtifact(artifact, request.exportRequest)) return std::move(e);
+  auto *contract = artifact.getObject("fusion_contract");
+  auto source = request.exportRequest.getString("source");
+  auto instrumented = artifact.getString("instrumented_source");
+  if (!contract || !source || !instrumented)
+    return error("missing Triton source / instrumentation evidence");
+  if (contract->getString("dtype") != request.elementType)
+    return error("external boundary dtype does not match the ASK graph element type");
+  if (contract->getString("original_source_sha256") != digest(*source))
+    return error("boundary contract does not describe this graph's DSL source");
+  if (contract->getString("instrumented_source_sha256") != digest(*instrumented))
+    return error("instrumented source digest does not match boundary contract");
+  auto *shape = contract->getArray("shape");
+  if (!shape || shape->size() != 1 || (*shape)[0].getAsInteger() != request.elementCount)
+    return error("boundary shape/constexpr element count does not match the prepared graph");
+  auto bound = bindTritonBoundaries(module, artifact);
+  if (!bound) return bound.takeError();
+  auto numerics = normalizeTritonNumerics(module, artifact);
+  if (!numerics) return numerics.takeError();
+  PreparedFusion result;
+  result.protocol = "ask.triton.boundary.v1";
+  result.producerNumerics = std::move(*numerics);
+  if (auto *codegen = artifact.getObject("codegen")) result.codegen = *codegen;
+  result.codegen["fp_contract"] = "on";
+  for (auto *marker : bound->inputs) {
+    llvm::IRBuilder<> builder(marker);
+    auto *valid = builder.CreateICmpNE(marker->getArgOperand(bound->maskArgument), builder.getInt32(0));
+    auto *value = marker->getArgOperand(bound->valueArgument);
+    result.inputs.push_back({marker, value, valid, value});
+  }
+  for (auto *marker : bound->outputs)
+    result.outputs.push_back({marker, marker->getArgOperand(bound->valueArgument), nullptr, nullptr});
+  return result;
+}
+
+llvm::Error finalizeTritonArtifact(llvm::json::Object &artifact,
+                                   const llvm::json::Object &fusionReport) {
+  if (fusionReport.getString("protocol") != "ask.triton.boundary.v1")
+    return error("unexpected fusion protocol while finalizing the Triton artifact");
+  auto *contract = artifact.get("fusion_contract");
+  if (!contract) return error("missing original Triton boundary evidence during finalization");
+  llvm::json::Value sourceContract = *contract;
+  artifact.erase("fusion_contract");
+  artifact["source_fusion_contract"] = std::move(sourceContract);
+  if (auto *validation = artifact.get("source_validation")) {
+    llvm::json::Value producerValidation = *validation;
+    artifact["producer_validation"] = std::move(producerValidation);
+  }
+  return llvm::Error::success();
+}
+} // namespace
+
+const CompilerAdapter &tritonCompilerAdapter() {
+  static const CompilerAdapter adapter{
+      "triton", 1, &validateTritonArtifact, &prepareTritonFusion, &finalizeTritonArtifact,
+      "worker.py", true};
+  return adapter;
 }
 } // namespace ask::adapters

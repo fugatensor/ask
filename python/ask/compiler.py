@@ -112,8 +112,8 @@ class Compiler:
         return self._process(module, ["--prepare"])
 
     def compile_cuda(self, module: Module | str, *, cache_dir, output_dir,
-                     triton_python, triton_worker, llc, ptxas):
-        """Fuse the supported ASK→Triton→ASK graph, reusing verified IR and executable caches.
+                     llc, ptxas, compilers=None, **legacy_environments):
+        """Compile an external graph using explicit registered compiler environments.
 
         Explicit paths keep producer dependencies out of SDK import and builds
         with no external compilers. See docs/12-GPU融合与IR缓存.md for the subset.
@@ -121,11 +121,10 @@ class Compiler:
         from .gpu import compile_graph
         # Check before cache lookup too: an IR hit must not mix the loaded
         # extension with another build's driver/toolchain fingerprint.
-        if self._native is not None and self.capabilities().get("triton_llir_fusion"):
+        if self._native is not None and self.capabilities().get("third_party_compilers"):
             self._check_companion()
         return compile_graph(self, module, cache_dir=cache_dir, output_dir=output_dir,
-                             triton_python=triton_python, triton_worker=triton_worker,
-                             llc=llc, ptxas=ptxas)
+                             compilers=compilers, llc=llc, ptxas=ptxas, **legacy_environments)
 
     def optimize(self, module: Module | str, *, fold_constants: bool = True,
                  eliminate_dead_code: bool = True,

@@ -8,7 +8,7 @@ import sys
 import tempfile
 
 driver, python, worker = sys.argv[1:]
-root = Path(__file__).resolve().parents[1]
+root = Path(__file__).resolve().parents[4]
 sys.path[:0] = [str(root / "tests"), str(root / "python")]
 from support.pointwise import build_module
 
@@ -23,8 +23,8 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
         (destination / "input.mlir").write_text(graph)
         result = subprocess.run([
             driver, str(destination / "input.mlir"), "--fuse-external",
-            "--export-dir", str(destination / "exports"), "--triton-python", python,
-            "--triton-worker", str(selected_worker), "-o", str(destination / "fused.ll"),
+            "--export-dir", str(destination / "exports"), "--compiler-python", "triton=" + python,
+            "--compiler-worker", "triton=" + str(selected_worker), "-o", str(destination / "fused.ll"),
             "--report-json", str(destination / "report.json")],
             capture_output=True, text=True, timeout=180)
         if expected_error:
@@ -75,10 +75,10 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     replay("digest", bad, "digest")
     bad = copy.deepcopy(artifact)
     del bad["fusion_contract"]
-    replay("missing-contract", bad, "boundary contract")
+    replay("missing-contract", bad, "source / instrumentation evidence")
     bad = copy.deepcopy(artifact)
     del bad["validation"]
-    replay("missing-validation", bad, "protocol 1")
+    replay("missing-validation", bad, "artifact protocol")
     bad = copy.deepcopy(artifact)
     bad["fusion_contract"]["proof"]["same_mask"] = False
     replay("mask-proof", bad, "same_mask")

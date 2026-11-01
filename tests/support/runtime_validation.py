@@ -6,7 +6,7 @@ import json
 import math
 from pathlib import Path
 
-from ask import Compiler
+from ask import Compiler, CompilerEnvironment
 from ask.runtime import ExecutionSession
 from .gpu_validation import plan_matrix
 from .pointwise import (DTYPES, build_module, expected_values, input_values,
@@ -49,7 +49,8 @@ def main(argv=None):
             for temperature in ("cold", "warm"):
                 kernel = compiler.compile_cuda(module, cache_dir=args.cache_dir,
                     output_dir=args.output_dir / (label + "-" + temperature),
-                    triton_python=args.triton_python, triton_worker=args.triton_worker,
+                    compilers={"triton": CompilerEnvironment(python=args.triton_python,
+                                                          worker=args.triton_worker)},
                     llc=args.llc, ptxas=args.ptxas)
                 wanted = "miss" if temperature == "cold" else "hit"
                 assert kernel.cache["status"] == wanted, (label, kernel.cache)
