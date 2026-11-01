@@ -3,7 +3,9 @@
 #include "ask/IR/ASKDialect.h"
 #include "ask/IR/ASKOps.h"
 #include "ask/LLIR/Import.h"
+#include "ask/LLIR/Optimize.h"
 #include "ask/Lowering/Host.h"
+#include "ask/Transforms/Optimize.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
@@ -24,9 +26,14 @@ namespace {
 cl::opt<std::string> input(cl::Positional, cl::desc("input ASK MLIR (or LLVM IR with --check-llir)"), cl::init("-"));
 cl::opt<std::string> output("o", cl::desc("output path"), cl::init("-"));
 cl::opt<bool> prepare("prepare", cl::desc("verify, infer shapes and extract identity markers"));
+cl::opt<bool> optimize("optimize", cl::desc("prepare ASK IR, fold constants, eliminate dead code and plan elementwise fusion"));
+cl::opt<bool> noConstantFold("no-constant-fold", cl::desc("disable constant folding in --optimize"));
+cl::opt<bool> noDCE("no-dce", cl::desc("disable dead code elimination in --optimize"));
+cl::opt<bool> noFusion("no-fusion", cl::desc("disable elementwise fusion in --optimize"));
 cl::opt<bool> emitLLVM("emit-llvm", cl::desc("prepare and lower self-owned graph to host LLVM IR"));
 cl::opt<bool> emitObject("emit-object", cl::desc("prepare and emit host object file"));
 cl::opt<bool> checkLLIR("check-llir", cl::desc("parse and verify native LLVM assembly; write verified IR"));
+cl::opt<bool> optimizeLLIR("optimize-llir", cl::desc("optimize native LLVM assembly with instcombine, simplifycfg and adce"));
 cl::opt<bool> capabilities("capabilities", cl::desc("print this build's capabilities as JSON"));
 cl::opt<bool> exportExternal("export-external", cl::desc("prepare and export external DSL to native LLVM IR artifacts"));
 cl::opt<std::string> reportPath("report-json", cl::desc("write preparation/ABI report"));
@@ -212,23 +219,36 @@ int main(int argc, char **argv) {
         {"schema_version", 1}, {"ask_version", ASK_VERSION}, {"llvm_version", ASK_LLVM_VERSION},
         {"third_party_compilers", std::move(compilers)}, {"prepare", true},
         {"native_llvm_import", true}, {"host_codegen", bool(ASK_WITH_HOST)},
+        {"ir_optimization", true}, {"elementwise_fusion", true}, {"llvm_optimization", true},
         {"external_export", bool(ASK_WITH_TRITON)}, {"gpu_execution", false},
         {"supported_element_types", json::Array{"i32"}}};
     outs() << formatv("{0:2}\n", result);
     return 0;
   }
-  if (int(emitLLVM) + int(emitObject) + int(checkLLIR) + int(exportExternal) > 1)
-    return fail("select only one of --emit-llvm, --emit-object, --check-llir, --export-external");
+  if (int(emitLLVM) + int(emitObject) + int(checkLLIR) + int(optimizeLLIR) + int(exportExternal) > 1)
+    return fail("select only one of --emit-llvm, --emit-object, --check-llir, --optimize-llir, --export-external");
+  if ((noConstantFold || noDCE || noFusion) && !optimize)
+    return fail("--no-constant-fold, --no-dce and --no-fusion require --optimize");
+  if ((checkLLIR || optimizeLLIR) && (prepare || optimize))
+    return fail("native LLVM input modes cannot be combined with ASK IR preparation or optimization");
   auto buffer = MemoryBuffer::getFileOrSTDIN(input);
   if (!buffer) return fail(buffer.getError().message());
-  if (checkLLIR) {
+  if (checkLLIR || optimizeLLIR) {
     LLVMContext context;
     auto module = ask::llir::importLLVMIR((*buffer)->getBuffer(), context, input);
     if (!module) return fail(toString(module.takeError()));
+    json::Object report{{"schema_version", 1}, {"phase", "llvm_verified"}};
+    if (optimizeLLIR) {
+      if (auto error = ask::llir::optimizeLLVMIR(**module, report))
+        return fail(toString(std::move(error)));
+      report["phase"] = "llvm_optimized";
+    }
     std::string text;
     raw_string_ostream stream(text);
     (*module)->print(stream, nullptr);
     if (auto error = writeText(output, text)) return fail(toString(std::move(error)));
+    if (!reportPath.empty())
+      if (auto error = writeJSON(reportPath, json::Value(std::move(report)))) return fail(toString(std::move(error)));
     return 0;
   }
   mlir::DialectRegistry registry;
@@ -239,9 +259,17 @@ int main(int argc, char **argv) {
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sources, &context);
   if (!module || mlir::failed(mlir::verify(*module))) return 1;
   json::Object report{{"schema_version", 1}, {"phase", "verified"}};
-  if (prepare || emitLLVM || emitObject || exportExternal) {
-    if (mlir::failed(ask::prepareModule(*module, report))) return 1;
-    report["phase"] = "prepared";
+  if (prepare || optimize || emitLLVM || emitObject || exportExternal) {
+    if (optimize) {
+      ask::OptimizationOptions options;
+      options.foldConstants = !noConstantFold;
+      options.eliminateDeadCode = !noDCE;
+      options.fuseElementwise = !noFusion;
+      if (mlir::failed(ask::optimizeModule(*module, report, options))) return 1;
+    } else if (mlir::failed(ask::prepareModule(*module, report))) {
+      return 1;
+    }
+    report["phase"] = optimize ? "optimized" : "prepared";
     report["external_requests"] = externalRequests(*module);
   }
   if (exportExternal) {

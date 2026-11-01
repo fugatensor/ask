@@ -22,7 +22,7 @@ class CompilerError(RuntimeError):
 
 @dataclass(frozen=True)
 class PreparedModule:
-    """Verified/prepared IR and diagnostics, not an executed or compiled kernel."""
+    """Verified/prepared or optimized IR and diagnostics, not an executed kernel."""
 
     ir: str
     report: dict[str, Any]
@@ -73,19 +73,36 @@ class Compiler:
         return capabilities
 
     def prepare(self, module: Module | str) -> PreparedModule:
+        return self._process(module, ["--prepare"])
+
+    def optimize(self, module: Module | str, *, fold_constants: bool = True,
+                 eliminate_dead_code: bool = True,
+                 fuse_elementwise: bool = True) -> PreparedModule:
+        """Prepare and optimize ASK IR using the native compiler's explicit passes."""
+        options = ["--optimize"]
+        for enabled, flag in ((fold_constants, "--no-constant-fold"),
+                              (eliminate_dead_code, "--no-dce"),
+                              (fuse_elementwise, "--no-fusion")):
+            if type(enabled) is not bool:
+                raise TypeError("optimization options must be bool values")
+            if not enabled:
+                options.append(flag)
+        return self._process(module, options)
+
+    def _process(self, module: Module | str, options: list[str]) -> PreparedModule:
         if isinstance(module, Module):
             source = module.to_mlir()
         elif isinstance(module, str):
             source = module
         else:
-            raise TypeError("prepare expects a Module or MLIR string")
+            raise TypeError("prepare/optimize expects a Module or MLIR string")
         with tempfile.TemporaryDirectory(prefix="ask-prepare-") as directory:
             path = Path(directory)
             input_path = path / "input.mlir"
             output_path = path / "prepared.mlir"
             report_path = path / "report.json"
             input_path.write_text(source, encoding="utf-8")
-            result = self._run([str(input_path), "-o", str(output_path), "--prepare",
+            result = self._run([str(input_path), "-o", str(output_path), *options,
                                 "--report-json", str(report_path)])
             try:
                 ir = output_path.read_text(encoding="utf-8")

@@ -51,6 +51,15 @@ with tempfile.TemporaryDirectory(prefix="ask-triton-e2e-") as directory:
     assert "captures(none)" in original_ir
     checked([driver, str(destination / "external-0.ll"), "--check-llir",
              "-o", str(Path(directory) / "verified.ll")])
+    optimized_llvm = Path(directory) / "optimized.ll"
+    optimization_report = Path(directory) / "optimization.json"
+    checked([driver, str(destination / "external-0.ll"), "--optimize-llir",
+             "-o", str(optimized_llvm), "--report-json", str(optimization_report)])
+    checked([driver, str(optimized_llvm), "--check-llir",
+             "-o", str(Path(directory) / "optimized-verified.ll")])
+    assert json.loads(optimization_report.read_text())["phase"] == "llvm_optimized"
+    assert (destination / "external-0.ll").read_text() == original_ir
+    assert "asm" in optimized_llvm.read_text(), "real Triton inline PTX must remain represented"
     assert '"ask.external"' in prepared.read_text()
     assert '"ask.mark"' not in prepared.read_text()
 
@@ -96,4 +105,4 @@ with tempfile.TemporaryDirectory(prefix="ask-triton-e2e-") as directory:
     assert not (wrong_destination / "external-0.ll").exists()
     assert not (wrong_destination / "manifest.json").exists()
     assert not wrong_prepared.exists()
-    print("Triton 3.7.1 original LLVM IR exported and verified by ASK; no GPU execution")
+    print("Triton 3.7.1 original LLVM IR exported/verified; optional LLVM cleanup verified; no GPU execution")

@@ -2,7 +2,7 @@
 
 ASK 用 MLIR 的 `ask` dialect 接收上层框架生成的计算图，以原生 LLVM IR 承接低层产物。这个仓库已开始实现编译器初稿；当前入口是 Python SDK 和原生 `ask-opt`。
 
-目前可以构建、检查和准备单基本块的 i32 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。`prepare` 不编译外部 DSL，也不执行 GPU kernel。完整的图运行时、跨编译器融合和通用优化流水线仍在设计中。
+目前可以构建、检查和准备单基本块的 i32 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。可选优化已支持常量折叠、死代码消除、自有逐元素多输出融合，以及原生 LLVM 基础清理。完整图运行时和跨编译器内核融合仍在设计中。
 
 ## 构建
 
@@ -44,6 +44,19 @@ build/core/bin/ask-opt tests/ir/pipeline.mlir \
 SDK 用法、当前支持范围和诊断处理见[上层框架接入](docs/10-上层框架接入.md)。架构设计从[核心思想](docs/核心思想.md)开始，分阶段说明见[文档目录](docs/README.md)。设计文档中的完整接口不等于当前版本已经实现的 API。
 
 C++ 框架也可以通过安装后的 `ASK::Core` 直接构造和准备 MLIR，无需 Python。[C++ 示例](examples/cpp/frontend.cpp)及其 [CMake 项目](examples/cpp/CMakeLists.txt)演示独立消费已安装的 SDK，构建命令见接入文档第 8 节。
+
+## 基础优化
+
+框架调用 `compiler.optimize(module)` 可取得优化后的 ASK IR 和报告；默认的 `prepare` 保持原有行为。也可以通过 CLI 运行：
+
+```bash
+PYTHONPATH=python python3 examples/optimize_frontend.py --emit-only > build/optimization-input.mlir
+build/core/bin/ask-opt build/optimization-input.mlir --optimize --emit-llvm \
+  -o build/optimized.ll --report-json build/optimization.json
+build/core/bin/ask-opt build/optimized.ll --optimize-llir -o build/cleaned.ll
+```
+
+融合计划由 host 后端落实为共享循环；外部算子仍保留边界。开关、形状和标记更新规则见[基础优化与逐元素融合](docs/11-基础优化与逐元素融合.md)。
 
 ## 测试
 

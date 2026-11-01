@@ -5,6 +5,8 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
@@ -93,6 +95,53 @@ llvm::json::Object describeArgument(mlir::Value value, mlir::func::FuncOp graph,
                             {"dtype", "i32"}, {"shape", std::move(shape)}};
 }
 
+llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
+  struct Group {
+    mlir::Type type;
+    unsigned operations = 0;
+  };
+  llvm::StringMap<Group> groups;
+  llvm::StringSet<> closedGroups;
+  std::string active;
+  for (mlir::Operation &op : function.front()) {
+    mlir::Attribute attribute = op.getAttr("ask.fusion_group");
+    if (!attribute) {
+      // Pure scalar arithmetic can occur between tensor operations in a group.
+      // Any other tensor computation ends the current contiguous tensor group.
+      if (llvm::any_of(op.getResultTypes(), [](mlir::Type type) {
+            return mlir::isa<mlir::RankedTensorType>(type);
+          })) {
+        if (!active.empty()) closedGroups.insert(active);
+        active.clear();
+      }
+      continue;
+    }
+    auto name = mlir::dyn_cast<mlir::StringAttr>(attribute);
+    auto tensor = op.getNumResults() == 1
+                      ? mlir::dyn_cast<mlir::RankedTensorType>(op.getResult(0).getType())
+                      : mlir::RankedTensorType();
+    if (!name || name.getValue().empty() || !tensor || !tensor.hasStaticShape() ||
+        !mlir::isa<SplatOp, AddOp, MulOp>(op))
+      return error("ask.fusion_group requires a nonempty string on a static tensor splat/add/mul");
+    llvm::StringRef id = name.getValue();
+    if (active != id) {
+      if (!active.empty()) closedGroups.insert(active);
+      if (closedGroups.contains(id))
+        return error("ask.fusion_group cannot resume across another tensor group or ungrouped tensor operation");
+      active = id.str();
+    }
+    Group &group = groups[id];
+    if (group.operations && group.type != tensor)
+      return error("ask.fusion_group members must have exactly the same tensor shape and type");
+    group.type = tensor;
+    ++group.operations;
+  }
+  for (const auto &entry : groups)
+    if (entry.second.operations < 2)
+      return error("ask.fusion_group must contain at least two tensor operations");
+  return llvm::Error::success();
+}
+
 llvm::Error validateFunction(mlir::func::FuncOp function) {
   if (function.isExternal() || !llvm::hasSingleElement(function.getBody()))
     return error("host lowering requires a defined single-block graph function");
@@ -121,7 +170,7 @@ llvm::Error validateFunction(mlir::func::FuncOp function) {
   }
   if (!mlir::isa<mlir::func::ReturnOp>(function.front().getTerminator()))
     return error("host graph requires func.return");
-  return llvm::Error::success();
+  return validateFusionGroups(function);
 }
 } // namespace
 
@@ -141,6 +190,8 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   auto *i32 = llvm::Type::getInt32Ty(context);
   auto *pointer = llvm::PointerType::getUnqual(context);
   llvm::json::Array functions;
+  uint64_t totalLoops = 0, totalUnfusedLoops = 0, totalFusedOutputGroups = 0;
+  uint64_t totalInputLoads = 0;
 
   for (mlir::Operation &op : source.getBody()->getOperations()) {
     if (mlir::isa<SemanticsOp, ImplementationOp>(op))
@@ -188,15 +239,60 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
 
     llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", function));
     auto returned = mlir::cast<mlir::func::ReturnOp>(graph.front().getTerminator());
+    struct OutputBatch {
+      llvm::SmallVector<unsigned> outputs;
+      mlir::Type type;
+      std::string group;
+      uint64_t count;
+    };
+    llvm::SmallVector<OutputBatch> batches;
+    llvm::StringMap<unsigned> batchForGroup;
+    uint64_t loopCount = 0, unfusedLoops = 0, fusedOutputGroups = 0;
+    uint64_t inputLoads = 0, emptyOutputs = 0;
     for (auto [outputIndex, value] : llvm::enumerate(returned.getOperands())) {
       auto count = elementCount(value.getType());
       if (!count)
         return count.takeError();
-      if (*count == 0)
+      if (*count != 0) ++unfusedLoops;
+      std::string group;
+      if (mlir::isa<mlir::RankedTensorType>(value.getType()))
+        if (auto *producer = value.getDefiningOp())
+          if (auto name = producer->getAttrOfType<mlir::StringAttr>("ask.fusion_group"))
+            group = name.getValue().str();
+      if (!group.empty()) {
+        auto previous = batchForGroup.find(group);
+        if (previous != batchForGroup.end()) {
+          OutputBatch &batch = batches[previous->second];
+          if (batch.type != value.getType() || batch.count != *count)
+            return error("fused output roots require identical tensor shape and type");
+          batch.outputs.push_back(outputIndex);
+          continue;
+        }
+        batchForGroup[group] = batches.size();
+      }
+      batches.push_back(OutputBatch{{unsigned(outputIndex)}, value.getType(), group, *count});
+    }
+
+    llvm::json::Array fusedGroups;
+    for (const OutputBatch &batch : batches) {
+      if (batch.count == 0) {
+        emptyOutputs += batch.outputs.size();
         continue; // No input or output pointer is dereferenced for empty results.
+      }
+      ++loopCount;
+      bool shared = batch.outputs.size() > 1;
+      if (shared) {
+        ++fusedOutputGroups;
+        llvm::json::Array outputIndices;
+        for (unsigned outputIndex : batch.outputs) outputIndices.push_back(int64_t(outputIndex));
+        fusedGroups.push_back(llvm::json::Object{
+            {"group", batch.group}, {"outputs", std::move(outputIndices)},
+            {"element_count", int64_t(batch.count)}});
+      }
 
       llvm::BasicBlock *before = builder.GetInsertBlock();
-      llvm::BasicBlock *body = llvm::BasicBlock::Create(context, "output.loop", function);
+      llvm::BasicBlock *body = llvm::BasicBlock::Create(
+          context, shared ? "fused.output.loop" : "output.loop", function);
       llvm::BasicBlock *after = llvm::BasicBlock::Create(context, "output.done", function);
       builder.CreateBr(body);
       builder.SetInsertPoint(body);
@@ -213,6 +309,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
           if (mlir::isa<mlir::RankedTensorType>(current.getType())) {
             auto *address = builder.CreateGEP(i32, argument->second, index, "input.address");
             computed = builder.CreateAlignedLoad(i32, address, llvm::Align(4), "input");
+            ++inputLoads;
           } else {
             computed = argument->second;
           }
@@ -233,13 +330,18 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         emitted[current] = computed;
         return computed;
       };
-      llvm::Value *computed = emit(value);
-      llvm::Value *output = function->getArg(graph.getNumArguments() + outputIndex);
-      auto *address = builder.CreateGEP(i32, output, index, "output.address");
-      builder.CreateAlignedStore(computed, address, llvm::Align(4));
+      // The memo is shared only within this iteration of the same-shape batch.
+      // Every public output still gets its own store under the existing noalias
+      // contract, including repeated returns of the same logical value.
+      for (unsigned outputIndex : batch.outputs) {
+        llvm::Value *computed = emit(returned.getOperand(outputIndex));
+        llvm::Value *output = function->getArg(graph.getNumArguments() + outputIndex);
+        auto *address = builder.CreateGEP(i32, output, index, "output.address");
+        builder.CreateAlignedStore(computed, address, llvm::Align(4));
+      }
       llvm::Value *next = builder.CreateAdd(index, builder.getInt64(1), "next");
       index->addIncoming(next, body);
-      builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(*count)), body, after);
+      builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(batch.count)), body, after);
       builder.SetInsertPoint(after);
     }
     builder.CreateRetVoid();
@@ -247,7 +349,19 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         {"name", graph.getSymName().str()}, {"calling_convention", "c"},
         {"inputs", std::move(inputs)}, {"outputs", std::move(outputs)},
         {"layout", "contiguous_row_major"}, {"minimum_alignment", 4},
-        {"requires_disjoint_outputs", true}, {"outputs_must_not_alias_inputs", true}});
+        {"requires_disjoint_outputs", true}, {"outputs_must_not_alias_inputs", true},
+        {"lowering", llvm::json::Object{
+            {"statistics_stage", "host_lowering"},
+            {"loop_count", int64_t(loopCount)},
+            {"unfused_output_loop_count", int64_t(unfusedLoops)},
+            {"fused_output_groups", int64_t(fusedOutputGroups)},
+            {"input_load_count", int64_t(inputLoads)},
+            {"zero_element_outputs", int64_t(emptyOutputs)},
+            {"groups", std::move(fusedGroups)}}}});
+    totalLoops += loopCount;
+    totalUnfusedLoops += unfusedLoops;
+    totalFusedOutputGroups += fusedOutputGroups;
+    totalInputLoads += inputLoads;
   }
   if (functions.empty())
     return error("host lowering requires at least one graph function");
@@ -258,7 +372,13 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   abiReport = llvm::json::Object{{"schema_version", 1},
                                 {"target_triple", result->getTargetTriple().str()},
                                 {"data_layout", result->getDataLayoutStr()},
-                                {"functions", std::move(functions)}};
+                                {"functions", std::move(functions)},
+                                {"lowering", llvm::json::Object{
+                                    {"statistics_stage", "host_lowering"},
+                                    {"loop_count", int64_t(totalLoops)},
+                                    {"unfused_output_loop_count", int64_t(totalUnfusedLoops)},
+                                    {"fused_output_groups", int64_t(totalFusedOutputGroups)},
+                                    {"input_load_count", int64_t(totalInputLoads)}}}};
   std::string abiText;
   llvm::raw_string_ostream abiStream(abiText);
   abiStream << llvm::json::Value(llvm::json::Object(abiReport));

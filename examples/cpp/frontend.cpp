@@ -1,5 +1,6 @@
 #include "ask/Frontend/Prepare.h"
 #include "ask/IR/ASKDialect.h"
+#include "ask/Transforms/Optimize.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
@@ -7,7 +8,12 @@
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
-int main() {
+int main(int argc, char **argv) {
+  bool optimize = argc == 2 && llvm::StringRef(argv[1]) == "--optimize";
+  if (argc > 1 && !optimize) {
+    llvm::errs() << "usage: ask-frontend-example [--optimize]\n";
+    return 1;
+  }
   mlir::DialectRegistry registry;
   registry.insert<ask::ASKDialect, mlir::func::FuncDialect>();
   mlir::MLIRContext context(registry);
@@ -51,7 +57,8 @@ int main() {
   mlir::OwningOpRef<mlir::ModuleOp> prepared(
       mlir::cast<mlir::ModuleOp>(module->getOperation()->clone()));
   llvm::json::Object report;
-  if (mlir::failed(ask::prepareModule(*prepared, report)))
+  if (mlir::failed(optimize ? ask::optimizeModule(*prepared, report)
+                            : ask::prepareModule(*prepared, report)))
     return 1;
 
   prepared->print(llvm::outs());
