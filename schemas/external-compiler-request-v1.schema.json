@@ -1,0 +1,136 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ASK external compiler worker request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "source",
+    "entry",
+    "signature",
+    "source_bindings",
+    "constants",
+    "fixed_options",
+    "target",
+    "grid"
+  ],
+  "properties": {
+    "protocol_version": {
+      "const": 1
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "entry": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "signature": {
+      "type": "object",
+      "minProperties": 2,
+      "additionalProperties": {
+        "enum": [
+          "*i1",
+          "*i32",
+          "*i64",
+          "*fp32",
+          "*fp16",
+          "*bf16"
+        ]
+      }
+    },
+    "source_bindings": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^(input|output):(0|[1-9][0-9]*)$"
+      }
+    },
+    "constants": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "integer",
+        "minimum": -9223372036854775808,
+        "maximum": 9223372036854775807
+      }
+    },
+    "fixed_options": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "num_warps"
+      ],
+      "properties": {
+        "num_warps": {
+          "enum": [
+            4,
+            8
+          ]
+        },
+        "enable_fp_fusion": {
+          "type": "boolean"
+        },
+        "num_stages": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        }
+      }
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "backend",
+        "arch",
+        "warp_size"
+      ],
+      "properties": {
+        "backend": {
+          "const": "cuda"
+        },
+        "arch": {
+          "type": "integer",
+          "minimum": 70,
+          "maximum": 999
+        },
+        "warp_size": {
+          "const": 32
+        }
+      }
+    },
+    "grid": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2147483647
+      }
+    },
+    "fusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        }
+      }
+    },
+    "port_shapes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

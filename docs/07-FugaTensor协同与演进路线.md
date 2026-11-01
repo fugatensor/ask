@@ -26,7 +26,7 @@ ASK 是上层张量框架 [FugaTensor](../../fugatensor/docs/README.md) 使用�
 - **前端与高层优化**：进程内 `nanobind` `ask.Compiler()`、C++ `ASK::Core` 与 `ask-opt` CLI；形状推导与 `ask.mark` 提取擦除；常量/类型折叠、死代码消除与多输出逐元素融合组规划。
 - **自有代码生成**：Host CPU 共享循环 LLVM IR / `.o` 代码生成；自有 CUDA `nvptx64` 多输入多输出异构端口代码生成（支持 0-D 标量、空张量与 64 位 grid-stride 循环，包含在 `core` 构建中）。
 - **外部编译器融合**：`adapters/<id>/` 注册机制；Triton 3.7.1 导出协议 v1 与执行契约 ABI v2；通用 C++ LLVM 值边界内联核心（支持多参数、多站点、定长向量与失败回滚）；单输入单输出静态逐元素 `ASK → Triton → ASK` 融合及指令级 FMA `contract` 隔离。
-- **图切分与复杂外部算子**：[MLIR 分区和 JSON 执行计划](08-图切分与多Kernel执行计划.md)，保留可融合区域，不能融合时使用独立外部 kernel 与设备中间缓冲区。Flash Attention 2 示例先验证前向，不提供完整训练接口。
+- **图切分与复杂外部算子**：[MLIR 分区和 JSON 执行计划](08-图切分与多Kernel执行计划.md)，保留可融合区域，不能融合时使用独立外部 kernel 与设备中间缓冲区。复杂算子（如 FlashAttention）由上层框架实现并注册，ASK 只负责导出、切分与调度。
 - **运行时与缓存**：动态加载 `libcuda.so.1` 的常驻 `ExecutionSession`、非阻塞 stream、异步 `Event`、五种非 `bf16` 类型的 `__cuda_array_interface__` v2/v3 零拷贝接入（含生产者流依赖与宿主对象保活），以及跨进程持久化的 IR / `cubin` 双层缓存。
 
 <a id="roadmap"></a>

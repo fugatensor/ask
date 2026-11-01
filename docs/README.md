@@ -13,7 +13,8 @@ ASK 是面向张量框架的底层编译与运行时引擎：上层以 MLIR `ask
 | [05. 常驻运行时与多级缓存](05-常驻运行时与多级缓存.md) | 动态加载 CUDA Driver、`ExecutionSession`、设备张量与 `__cuda_array_interface__` 零拷贝、异步事件、IR / `cubin` 双层持久缓存 | `lib/Runtime/CUDA.cpp`、`bindings/runtime.cpp`、`python/ask/gpu.py` |
 | [06. 工程结构与测试体系](06-工程结构与测试体系.md) | 仓库目录职责、5 个 CTest 测试集、共享多精度测试矩阵与独立数值参考实现 | `tests/`、`adapters/triton/tests/` |
 | [07. FugaTensor 协同与演进路线](07-FugaTensor协同与演进路线.md) | 与上层框架 [FugaTensor](../../fugatensor/docs/README.md) 的职责边界、已实现能力清单与当前限制 | `ask` ↔ `fugatensor` |
-| [08. 图切分与多 Kernel 执行计划](08-图切分与多Kernel执行计划.md) | 高层 MLIR 分区表示、执行计划 JSON v1、融合回退、常驻多 kernel 调度与 FlashAttention-2 前向接入 | `lib/Frontend/Partition.cpp`、`python/ask/plan.py`、`schemas/execution-plan-v1.schema.json` |
+| [08. 图切分与多 Kernel 执行计划](08-图切分与多Kernel执行计划.md) | 高层 MLIR 分区表示、执行计划 JSON v1、融合回退、常驻多 kernel 调度与复杂外部算子接入 | `lib/Frontend/Partition.cpp`、`python/ask/plan.py`、`schemas/execution-plan-v1.schema.json` |
+| [09. 外部编译器适配接入规范](09-外部编译器适配接入规范.md) | 适配器目录/注册、worker 请求与 artifact 契约、缓存身份、可选值边界融合与新编译器接入清单 | `adapters/`、`include/ask/Adapters/`、`python/ask/adapters.py`、`schemas/` |
 
 ## 关联仓库文档
 

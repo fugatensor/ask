@@ -52,11 +52,33 @@ def check_source():
     require(f"nanobind=={nanobind}" in config["build-system"]["requires"],
             "build-system nanobind pin differs from cmake/nanobind.lock.json")
     llvm = json.loads((ROOT / "cmake/llvm.lock.json").read_text())
-    catalog = json.loads((ROOT / "adapters/registry.json").read_text())["compilers"]
-    for directory in catalog.values():
+    registry = json.loads((ROOT / "adapters/registry.json").read_text())
+    require(registry.get("schema_version") == 1 and isinstance(registry.get("compilers"), dict),
+            "adapter registry must use schema_version 1 and a compiler map")
+    for directory in registry["compilers"].values():
         root = ROOT / "adapters" / directory
         lock = json.loads((root / "dependencies.lock.json").read_text())
         registration = json.loads((root / "registration.json").read_text())
+        require(registration.get("id") == directory and registration.get("protocol_version") == 1,
+                f"{directory}: registration id/protocol_version must match the registry directory")
+        require(type(registration.get("supports_fusion")) is bool,
+                f"{directory}: registration supports_fusion must be a boolean")
+        worker = registration.get("worker")
+        require(isinstance(worker, str) and worker and (root / worker).is_file(),
+                f"{directory}: registered worker file is missing")
+        aliases = registration.get("aliases", {})
+        require(isinstance(aliases, dict) and set(aliases.values()) <= {"python", "worker"},
+                f"{directory}: aliases must map to python or worker")
+        require(isinstance(registration.get("native_factory"), str)
+                and (root / "CMakeLists.txt").is_file(),
+                f"{directory}: adapters need native_factory and a CMakeLists.txt")
+        if registration["supports_fusion"]:
+            require(isinstance(registration.get("package"), str),
+                    f"{directory}: fusion adapters need a Python package")
+        if registration.get("requires_python"):
+            require(isinstance(registration.get("module"), str)
+                    and isinstance(registration.get("factory"), str),
+                    f"{directory}: Python adapters need module and factory")
         require(lock["protocol_version"] == registration["protocol_version"],
                 f"{directory}: lock and registration protocol versions differ")
         require(lock["ask_reader"]["revision"] == llvm["revision"]

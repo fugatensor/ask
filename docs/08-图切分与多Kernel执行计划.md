@@ -66,10 +66,12 @@ ASK 图描述数据依赖，执行计划描述哪些依赖需要落到设备缓�
 
 FugaTensor 在自动组图后直接提交完整静态图，由 ASK 决定融合和切分；读取数据、条件判断、反向传播与显式求值的触发方式不变。多 kernel 不改变梯度定义，未知外部算子的求导仍需显式规则。
 
-<a id="flash-attention"></a>
+<a id="complex-external"></a>
 
-## 5. Flash Attention 2 接入验证
+## 5. 复杂外部算子接入
 
-复杂 Triton 源码通过独立外部步骤接入，不要求将矩阵乘法、归约和在线 softmax 改写为逐元素边界。前向示例采用 query block 并行、KV block 循环、在线最大值与归一化和重标定、FP32 累加以及 `tl.dot`，避免构造完整注意力矩阵。算法依据 [FlashAttention-2 论文](https://arxiv.org/abs/2307.08691) 与 [Triton 官方 fused-attention 教程](https://github.com/triton-lang/triton/blob/v3.7.1/python/tutorials/06-fused-attention.py)。
+ASK 只定义外部 kernel 的导出、端口、缓存与调度接口，不在仓内实现注意力、矩阵乘、归约等算法。独立外部步骤不要求逐元素边界，因此可以使用多个输入、不同输入/输出形状或存储类型、FP32 中间累加、`tl.dot` 与动态共享内存；适配器负责把生产者的 LLVM IR 和端口映射校验后交给通用 CUDA 执行契约。
 
-GPU 数值验证覆盖 FP16/BF16、causal/非 causal、非整块序列长度、矩形注意力、不同 D/DV、多 batch/head 及大 logits；测试使用量化后输入与独立稳定 softmax 参考比较。示例固定 BLOCK_M=BLOCK_N=32，D/DV 支持 32、64、128，causal 使用左上对齐（key 下标不超过 query 下标），要求 sm80 或更新架构。该接入不代表实现 Flash Attention 2 的完整训练接口、反向传播或性能保证。
+复杂算子的算法语义和训练接口属于上层框架。例如 FugaTensor 维护 [FlashAttention-2 前向与反向实现](../../fugatensor/examples/flash_attention2.py)及其 [Triton 源码](../../fugatensor/examples/kernels/flash_attention2.py)，通过 `ft.fun` 的显式反向规则注册为多个 `ask.external`；ASK 将其切分为前向、统计量、dQ、dK、dV 等独立步骤并在同一会话 stream 上调度。该示例的数值验证、反向公式和适用边界由上层文档定义，ASK 不依赖或内置该算法。
+
+适配器接入新 DSL 的规范见[外部编译器适配接入规范](09-外部编译器适配接入规范.md#adapter-contract)，公开的 worker 请求与 artifact 结构见 [schemas/](../schemas/)。

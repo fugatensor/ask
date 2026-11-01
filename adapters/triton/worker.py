@@ -150,11 +150,12 @@ def validate_request(request):
     require(isinstance(grid, list) and len(grid) == 3 and
             all(type(v) is int and 0 < v <= 2**31 - 1 for v in grid),
             "grid must contain three positive signed 32-bit dimensions")
-    _validate_source(source, entry, set(signature), set(constants))
+    _validate_source(source, entry, set(signature), set(constants),
+                     allow_multiple=not request.get("fusion", {}).get("enabled", False))
     return request
 
 
-def _validate_source(source, entry, pointer_names, constant_names):
+def _validate_source(source, entry, pointer_names, constant_names, *, allow_multiple=False):
     """Reject unsupported source packaging before importing the module.
 
     This is a small source-format restriction, not a security sandbox. Kernel
@@ -183,9 +184,24 @@ def _validate_source(source, entry, pointer_names, constant_names):
             raise WorkerError("UnsupportedSource", "unsupported top-level source statement", "source")
     require(imports == {("triton", None), ("triton.language", "tl")},
             "source must import triton and triton.language as tl", "UnsupportedSource", "source")
-    require(len(functions) == 1 and functions[0].name == entry,
-            "source must define exactly the requested entry", "UnsupportedSource", "source")
-    function = functions[0]
+    if allow_multiple:
+        # Standalone exports may keep several independent kernels in one source
+        # file. The requested entry is compiled; the others are not dispatched.
+        require(all(len(function.decorator_list) == 1 and
+                    ast.dump(function.decorator_list[0]) == ast.dump(ast.parse("triton.jit", mode="eval").body)
+                    for function in functions),
+                "every top-level function must use exactly @triton.jit",
+                "UnsupportedSource", "source")
+        matching = [function for function in functions if function.name == entry]
+        require(len(matching) == 1 and len({function.name for function in functions}) == len(functions),
+                "source must define the requested entry exactly once",
+                "UnsupportedSource", "source")
+        function = matching[0]
+    else:
+        require(len(functions) == 1 and functions[0].name == entry,
+                "source must define exactly the requested entry",
+                "UnsupportedSource", "source")
+        function = functions[0]
     require(len(function.decorator_list) == 1 and
             ast.dump(function.decorator_list[0]) == ast.dump(ast.parse("triton.jit", mode="eval").body),
             "entry must use exactly @triton.jit", "UnsupportedSource", "source")
@@ -495,7 +511,7 @@ def build_artifact(request, compiled, triton_version, source_order):
                                 "source_sha256": hashlib.sha256(request["source"].encode()).hexdigest()},
             "validation": {"entry_abi": "checked-tested-subset", "llvm_module_verified": False,
                            "unresolved_link_dependencies": "not_analyzed",
-                           "device_execution_performed": False}}
+                           "device_execution_performed": False, "stage": "exported"}}
 
 
 def export(request):

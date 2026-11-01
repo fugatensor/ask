@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ASK compiler adapter registration v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "id",
+    "protocol_version",
+    "supports_fusion",
+    "worker",
+    "native_factory"
+  ],
+  "properties": {
+    "id": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_-]*$"
+    },
+    "protocol_version": {
+      "const": 1
+    },
+    "native_factory": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "supports_fusion": {
+      "type": "boolean"
+    },
+    "package": {
+      "type": "string",
+      "minLength": 1
+    },
+    "module": {
+      "type": "string",
+      "minLength": 1
+    },
+    "factory": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "requires_python": {
+      "type": "boolean"
+    },
+    "worker": {
+      "type": "string",
+      "minLength": 1
+    },
+    "aliases": {
+      "type": "object",
+      "additionalProperties": {
+        "enum": [
+          "python",
+          "worker"
+        ]
+      }
+    }
+  }
+}

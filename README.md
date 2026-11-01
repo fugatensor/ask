@@ -119,4 +119,4 @@ PYTHONPATH=build/core/python:python:tests ASK_OPT=build/core/bin/ask-opt \
 | [06. 工程结构与测试体系](docs/06-工程结构与测试体系.md) | 目录职责、5 个 CTest 测试集与共享多精度数值参考 |
 | [07. FugaTensor 协同与演进路线](docs/07-FugaTensor协同与演进路线.md) | 与 FugaTensor 的职责边界、已实现范围与当前限制 |
 
-图切分表示、执行计划 JSON v1 与独立外部 kernel 接入见[执行计划契约](docs/08-图切分与多Kernel执行计划.md)。
+图切分表示、执行计划 JSON v1 与独立外部 kernel 接入见[执行计划契约](docs/08-图切分与多Kernel执行计划.md)。 新增 Triton 同类外部编译器时按[适配器接入规范](docs/09-外部编译器适配接入规范.md)注册 worker 与 artifact 契约。

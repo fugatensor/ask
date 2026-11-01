@@ -140,6 +140,14 @@ class RequestTests(unittest.TestCase):
         with self.assertRaisesRegex(worker.WorkerError, "@triton.jit"):
             worker.validate_request(value)
 
+    def test_standalone_source_may_define_multiple_kernels(self):
+        value = request()
+        value["source"] += "\n@triton.jit\ndef unused_helper(value):\n    pass\n"
+        self.assertEqual(worker.validate_request(value), value)
+        value["fusion"] = {"enabled": True}
+        with self.assertRaisesRegex(worker.WorkerError, "exactly the requested entry"):
+            worker.validate_request(value)
+
     def test_unknown_options_are_not_ignored(self):
         value = request()
         value["fixed_options"]["made_up"] = 1
