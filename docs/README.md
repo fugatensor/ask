@@ -1,34 +1,24 @@
-# ASK 设计文档
+# ASK 文档目录
 
-从[《核心思想》](核心思想.md)开始读。ASK 用原生 LLVM IR 统一承接低层产物，保留目标 intrinsic 和内联 PTX；追踪、内联和融合按需作为 Pass 运行。首期外部编译器只接 Triton。
+ASK 是一个面向张量框架的统一底层编译与运行时引擎：上层用 MLIR `ask` dialect 提交静态计算图和可选的外部 DSL（如 Triton），ASK 负责语义与形状检查、基础图优化、原生 LLVM IR 降级与跨编译器值边界融合，并生成 CPU 目标文件或 CUDA `cubin` 交由常驻会话执行。
 
-图编译从上层框架生成的基础 ASK IR 开始。第三方区域用 `ask.external` 标出，并附对应编译器的 DSL；其操作、追踪标记、形状和降级规则集中在 [ASK IR 目录](ask-ir/README.md)。
+这套文档按“**顶层总览 ↔ 工程专题**”双向互链组织：先读 [核心思想](核心思想.md) 建立全局脉络，每节末尾可以直接跳到对应专题；每篇专题顶部也能随时回到总览或跳到上下游模块。
 
-仓库已有编译器初稿：Python SDK 生成真实 ASK MLIR，原生 `ask-opt` 检查 bool / i32 / i64 / f32 / f16 / bf16 图、推导形状并提取追踪记录；显式 cast 保留形状并支持混合精度表达式；可选优化支持常量折叠、死代码消除和自有逐元素多输出融合。实际用法见[上层框架接入](10-上层框架接入.md)、[基础优化](11-基础优化与逐元素融合.md)与[仓库 README](../README.md)。其余章节仍描述完整设计；尚未落地的接口和运行时不能视为已实现。
+## 阅读路线
 
-| 文档 | 内容 |
-|---|---|
-| [核心思想](核心思想.md) | 统一层接收什么，A/B/C 怎样配合 |
-| [00：阶段交接](00-总体契约与阶段边界.md) | 从导入、绑定到可选 Pass 和代码生成的完整流程 |
-| [01：A 层](01-A层高级IR与区域规划.md) | 检查图，记录读写和使用关系，建立执行分区 |
-| [ASK IR 专项设计](ask-ir/README.md) | 框架提交基础 ASK IR 与第三方 DSL；定义操作、追踪标记、形状与降级 |
-| [02：跨层追踪](02-跨层身份与追踪契约.md) | 按需将 LLVM 访问对应回高层元素，处理分析失效 |
-| [03：B 层](03-B层多源降级与低层归一化.md) | 自有降级、外部导入及原生 LLVM 产物检查 |
-| [04：C 层](04-C层统一处理与可选优化.md) | 统一管理分析和 Pass，按条件应用优化 |
-| [05：代码生成与运行时](05-代码生成与运行时.md) | 从原生 LLVM IR 生成代码，绑定参数和完成事件 |
-| [06：工程组织与验证](06-工程组织与验证.md) | 模块分工、Pass 管理、缓存、诊断与测试 |
-| [07：实施路线与示例](07-实施路线与端到端示例.md) | 先验证 Triton 导出和执行，再单独验证可选分析与优化 |
-| [08：第三方 LLIR 接入 API](08-第三方LLIR接入API.md) | 离线导入、单一导出回调、必填调用信息与可选追踪信息 |
-| [09：构建与可选编译器](09-构建与可选编译器.md) | none / all / 指定编译器，基础 Python 绑定、依赖隔离、安装与验收 |
-| [10：上层框架接入](10-上层框架接入.md) | 当前 Python SDK、真实 MLIR prepare、形状与追踪报告、诊断和实现边界 |
-| [11：基础优化与逐元素融合](11-基础优化与逐元素融合.md) | ASK 常量折叠、DCE、融合计划与 host 循环合并；原生 LLVM 基础优化 |
-| [12：GPU 融合与 IR 缓存](12-GPU融合与IR缓存.md) | Triton 边界证明、ASK LLVM helper 内联、新 cubin 执行、持久 IR 缓存和数值验证 |
-| [13：通用 LLVM 值边界内联](13-通用LLVM值边界内联.md) | 编译器无关的 typed helper 接口、多站点内联、失败回滚，以及适配器各自负责的合法性依据 |
-| [14：多精度测试](14-多精度测试.md) | 同一张图覆盖六种 dtype、6×6 转换、独立舍入参考、缓存与硬件拒绝测试 |
-| [15：类型转换与混合精度](15-类型转换与混合精度.md) | cast 的固定语义、bool / i64、显式 f32 中间计算、外部边界与硬件检查 |
-| [16：Python 绑定与常驻运行时](16-Python绑定与常驻运行时.md) | 设备张量、异步提交、资源生命周期、可执行缓存与模块复用 |
-| [17：第三方编译器适配与注册](17-第三方编译器适配与注册.md) | 独立适配器目录、显式注册、worker 路由、融合回调与通用 CUDA v2 契约 |
-| [18：FugaTensor 接入示例](18-FugaTensor接入示例.md) | 独立 Fuga IR、fun/backward/JIT、Python 图中断、CPU/CUDA 与 Triton external |
-| [19：自有 GPU 降级](19-自有GPU降级.md) | none 构建从高层图生成 GPU LLVM、端口 ABI、缓存和多精度数值验证 |
+| 文档 | 核心内容 | 对应代码入口 |
+| --- | --- | --- |
+| [核心思想](核心思想.md) | ASK 的定位、双层 IR 分工、端到端编译执行流水线 | 全局架构总览 |
+| [01. ASK IR 与数值语义](01-ASK-IR与数值语义.md) | `ask` dialect 结构、6 种标量/张量类型、单步 RNE 常量、`ask.cast` 转换规则、形状推导与 `ask.mark` / `ask.external` | `include/ask/IR/`、`lib/IR/`、`lib/Frontend/Prepare.cpp` |
+| [02. 前端接入与构建配置](02-前端接入与构建配置.md) | 依赖拉取、零参数 CMake Preset、可选适配器白名单、Python `nanobind` 进程内 SDK、C++ `ASK::Core` 与 `ask-opt` CLI | `tools/fetch_deps.py`、`CMakeLists.txt`、`python/ask/`、`bindings/` |
+| [03. 图优化与自有代码生成](03-图优化与自有代码生成.md) | 常量/类型折叠、死代码消除、多输出逐元素融合组、Host 共享循环降级、自有 CUDA 降级与 LLVM IR 清理 | `lib/Transforms/`、`lib/Lowering/`、`lib/LLIR/Optimize.cpp` |
+| [04. 外部编译器适配与边界内联](04-外部编译器适配与边界内联.md) | `adapters/<id>/` 插件机制、导出协议与 ABI v2、通用 LLVM 值边界内联器、Triton `P → F → Q` 融合与 FMA 隔离 | `adapters/`、`lib/Adapters/`、`lib/LLIR/Inline.cpp`、`lib/LLIR/Fuse.cpp` |
+| [05. 常驻运行时与多级缓存](05-常驻运行时与多级缓存.md) | 动态加载 CUDA Driver、`ExecutionSession`、设备张量与 `__cuda_array_interface__` 零拷贝、异步事件、IR / `cubin` 双层持久缓存 | `lib/Runtime/CUDA.cpp`、`bindings/runtime.cpp`、`python/ask/gpu.py` |
+| [06. 工程结构与测试体系](06-工程结构与测试体系.md) | 仓库目录职责、5 个 CTest 测试集、共享多精度测试矩阵与独立数值参考实现 | `tests/`、`adapters/triton/tests/` |
+| [07. FugaTensor 协同与演进路线](07-FugaTensor协同与演进路线.md) | 与上层框架 [FugaTensor](../../fugatensor/docs/README.md) 的职责边界、当前已落地能力清单与后续演进方向 | 跨仓协同（`ask` ↔ `fugatensor`） |
 
-顶层决定在《核心思想》中维护：静态控制流图、公开扩展点、保留外部 F 的既有执行策略、当前不设 D 层。工程文档各自维护算法和字段，并双向链接到顶层对应章节。
+## 关联仓库文档
+
+- [FugaTensor 文档首页](../../fugatensor/docs/README.md)
+- [FugaTensor 架构总览](../../fugatensor/docs/architecture/README.md)
+- [Fuga IR 降级到 ASK](../../fugatensor/docs/ir/03-降级到ASK.md)

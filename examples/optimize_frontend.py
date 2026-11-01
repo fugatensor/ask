@@ -1,6 +1,7 @@
 """Construct a graph with foldable constants, dead work, and shared outputs."""
 import argparse
 import json
+import os
 from pathlib import Path
 
 from ask import Compiler, Module, TensorType
@@ -23,7 +24,8 @@ def build_module():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ask-opt", default="ask-opt")
+    parser.add_argument("--ask-opt", default=os.environ.get("ASK_OPT"),
+                        help="optional ask-opt path (defaults to in-process native bindings)")
     parser.add_argument("--output", type=Path, help="write optimized ASK IR to this file")
     parser.add_argument("--emit-only", action="store_true", help="print input ASK IR without optimizing")
     args = parser.parse_args()

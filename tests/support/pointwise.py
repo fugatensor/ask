@@ -376,3 +376,62 @@ GRAPH_CASES = (
                                  "pre_factor": 2.0, "post_factor": 0.5, "offset": -0.0,
                                  "compute_dtype": "f32"}, extended=True, floating=True),
 )
+
+
+@dataclass(frozen=True)
+class MatrixCase:
+    graph: GraphCase
+    dtype: str
+    options: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class MatrixPlan:
+    dtypes: tuple[str, ...]
+    cases: tuple[GraphCase, ...]
+    eligible: tuple[MatrixCase, ...]
+    skipped: tuple[dict[str, Any], ...]
+
+    @property
+    def gpu_executions(self) -> int:
+        return 2 * len(self.eligible)
+
+    @property
+    def cache_counters(self) -> dict[str, int]:
+        pairs = len(self.eligible)
+        return {"requests": 2 * pairs, "hits": pairs, "misses": pairs,
+                "invalid": 0, "builds": pairs}
+
+
+def plan_matrix(dtypes, case_names=None, *, extended: bool = False) -> MatrixPlan:
+    """Select unique eligible dtype/graph combinations before touching tools or caches."""
+    dtypes = tuple(dict.fromkeys("f16" if dtype == "fp16" else dtype for dtype in dtypes))
+    if not dtypes or any(dtype not in DTYPES for dtype in dtypes):
+        raise ValueError("select at least one supported dtype")
+    if case_names is not None:
+        unknown = set(case_names) - {case.name for case in GRAPH_CASES}
+        if unknown:
+            raise ValueError("unknown graph cases: " + ", ".join(sorted(unknown)))
+    cases = tuple(case for case in GRAPH_CASES if
+                  (case_names is not None and case.name in case_names) or
+                  (case_names is None and (extended or not case.extended)))
+    eligible, skipped, seen_graphs = [], [], {}
+    for case in cases:
+        for dtype in dtypes:
+            options = case.for_dtype(dtype)
+            if options is None:
+                skipped.append({"case": case.name, "dtype": dtype,
+                                "reason": ("case requires one of " + ", ".join(case.storage_types)
+                                           if case.storage_types else "case requires a floating-point dtype")})
+            else:
+                source = build_module(dtype=dtype, **options).to_mlir()
+                if source in seen_graphs:
+                    skipped.append({"case": case.name, "dtype": dtype,
+                                    "reason": "identical typed graph already covered by " + seen_graphs[source]})
+                    continue
+                seen_graphs[source] = case.name
+                eligible.append(MatrixCase(case, dtype, options))
+    if not eligible:
+        raise ValueError("no eligible dtype/graph combinations; floating-point cases cannot run as integer/bool")
+    return MatrixPlan(dtypes, cases, tuple(eligible), tuple(skipped))
+

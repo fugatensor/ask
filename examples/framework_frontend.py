@@ -58,7 +58,8 @@ def build_module() -> Module:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ask-opt", default=os.environ.get("ASK_OPT", "ask-opt"))
+    parser.add_argument("--ask-opt", default=os.environ.get("ASK_OPT"),
+                        help="optional ask-opt path (defaults to in-process native bindings)")
     parser.add_argument("--emit-only", action="store_true", help="print input MLIR without preparing it")
     arguments = parser.parse_args()
     module = build_module()

@@ -7,6 +7,14 @@
     {"name": "triton", "inherits": "base", "binaryDir": "${sourceDir}/build/triton", "cacheVariables": {"ASK_THIRD_PARTY_COMPILERS": "triton"}},
     {"name": "all", "inherits": "base", "binaryDir": "${sourceDir}/build/all", "cacheVariables": {"ASK_THIRD_PARTY_COMPILERS": "all"}}
   ],
-  "buildPresets": [{"name": "core", "configurePreset": "core"}, {"name": "triton", "configurePreset": "triton"}, {"name": "all", "configurePreset": "all"}],
-  "testPresets": [{"name": "core", "configurePreset": "core", "output": {"outputOnFailure": true}}, {"name": "triton", "configurePreset": "triton", "output": {"outputOnFailure": true}}]
+  "buildPresets": [
+    {"name": "core", "configurePreset": "core"},
+    {"name": "triton", "configurePreset": "triton"},
+    {"name": "all", "configurePreset": "all"}
+  ],
+  "testPresets": [
+    {"name": "core", "configurePreset": "core", "output": {"outputOnFailure": true}},
+    {"name": "triton", "configurePreset": "triton", "output": {"outputOnFailure": true}},
+    {"name": "all", "configurePreset": "all", "output": {"outputOnFailure": true}}
+  ]
 }

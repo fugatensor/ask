@@ -1,106 +1,119 @@
 # ASK
 
-ASK 用 MLIR 的 `ask` dialect 接收上层框架生成的计算图，以原生 LLVM IR 承接低层产物。这个仓库已开始实现编译器初稿；当前入口是 Python SDK 和原生 `ask-opt`。
+ASK 是一个面向张量框架的底层编译与常驻运行时引擎：上层框架通过 MLIR `ask` dialect 提交静态计算图和可选的外部 DSL（如 Triton），ASK 负责语义与形状检查、基础图优化、原生 LLVM IR 降级、跨编译器值边界内联融合，并生成 CPU 目标代码或 CUDA `cubin` 交由常驻会话执行。
 
-目前可以构建、检查和准备单基本块的 bool / i32 / i64 / f32 / f16 / bf16 图，推导具体形状，并在导出追踪记录后删除 `ask.mark`。显式 `ask.cast` 支持六种类型互转及混合精度表达式。基础优化包括常量折叠、死代码消除和逐元素计算合并。
+当前已落地的核心能力：
 
-无 external 的基础图直接降到 CPU 代码或自有 CUDA kernel。`none` 构建也能编译并执行 GPU 图，不需要 Triton；支持多输入、多输出、不同输出类型、零维和空张量，详见[自有 GPU 降级](docs/19-自有GPU降级.md)。Python 通过 nanobind 调用 C++ 前端，设备张量、常驻 Session 和异步事件用于重复执行。
+- **显式 6 精度与确定性数值语义**：支持 `bool`、`i32`、`i64`、`f32`、`f16`、`bf16` 单基本块静态图、单步最近偶数舍入（RNE）常量、6×6 显式 `ask.cast` 与 `f32` 中间累加混合精度，拒绝隐式类型提升与隐式广播。
+- **自有 CPU 与自有 CUDA 代码生成**：默认 `core` 构建（`ASK_THIRD_PARTY_COMPILERS=none`）不依赖 Triton、NumPy 或 PyTorch，即可执行常量/类型折叠、死代码消除、多输出逐元素融合，并直接生成 Host 目标代码或自有 CUDA kernel（支持异构多输入输出、0-D 标量与空张量）。
+- **跨编译器 LLVM 值边界融合**：当图中包含可证明的逐元素 Triton 算子（`P → F → Q`）时，通过插件化的 [Triton 适配器](adapters/triton/README.md) 导出原生 LLVM IR，利用通用值边界内联器把前后 ASK 计算合入同一条 GPU kernel，并精确隔离两边的浮点收缩（FMA）与转换规则。
+- **进程内 SDK、常驻会话与双层缓存**：`nanobind` 进程内编译器入口、`ExecutionSession` 常驻设备内存与 `__cuda_array_interface__` 零拷贝接入、异步事件同步，以及磁盘级 LLVM IR / `cubin` 双层持久缓存。
 
-图中明确提交 Triton DSL 时，还可以使用六类型静态逐元素 ASK→Triton→ASK 融合：链接并内联原生 LLVM IR，再生成 cubin。自有图和融合图都提供持久 IR / 可执行产物缓存及独立命中统计。外部融合范围见[GPU 融合与 IR 缓存](docs/12-GPU融合与IR缓存.md)，显式 f32 中间计算见[类型转换与混合精度](docs/15-类型转换与混合精度.md)。完整混合图调度仍待实现。
+完整的架构脉络与工程细节请从 [文档目录](docs/README.md) 和 [核心思想](docs/核心思想.md) 开始阅读。
 
-## 构建
+## 快速构建与验证
 
-需要 C++17、CMake 3.28 或更新版本、Ninja、Python 3.10+ 及其扩展模块开发文件、锁定 nanobind，以及配套的 LLVM/MLIR 开发安装。当前使用 LLVM/MLIR `23.0.0git`，修订和 SDK 校验值锁定在 [cmake/llvm.lock.json](cmake/llvm.lock.json)；不要只按版本号混用别的构建。Triton 导出与 reader 的兼容性记录见 [dependencies.lock.json](adapters/triton/dependencies.lock.json)。
+环境要求：C++17 编译器、CMake 3.28+、Ninja、Python 3.10+（含开发头文件）。LLVM/MLIR（`23.0.0git`）与 `nanobind` 的版本和 SHA256 锁定在 [cmake/llvm.lock.json](cmake/llvm.lock.json) 与 [cmake/nanobind.lock.json](cmake/nanobind.lock.json) 中，使用统一脚本拉取到 `.deps/` 后，CMake 会自动识别，无需手填长路径：
 
 ```bash
-python3 tools/fetch_llvm.py
-python3 tools/fetch_nanobind.py
-cmake --preset core \
-  -DLLVM_DIR="$PWD/.deps/llvm-1f126a6d-ubuntu-x64-1/lib/cmake/llvm" \
-  -DMLIR_DIR="$PWD/.deps/llvm-1f126a6d-ubuntu-x64-1/lib/cmake/mlir"
+# 1. 拉取锁定版 LLVM/MLIR SDK 与 nanobind 源码
+python3 tools/fetch_deps.py
+
+# 2. 构建并测试核心编译器与自有 CPU/CUDA 后端（无需 Triton）
+cmake --preset core
 cmake --build --preset core
-ctest --preset core
+ctest --preset core --output-on-failure
+```
+
+启用全部已注册的第三方编译器适配器（当前为 Triton 3.7.1，依赖锁定见 [adapters/triton/dependencies.lock.json](adapters/triton/dependencies.lock.json)）：
+
+```bash
+cmake --preset all -DPython_EXECUTABLE=/path/to/triton-env/bin/python
+cmake --build --preset all
+ctest --preset all --output-on-failure
+```
+
+将包含原生扩展的 `ask-compiler` 安装进当前 Python 环境：
+
+```bash
+python3 -m pip install .
+```
+
+> 若使用外部自备的同修订 LLVM/MLIR，可通过 `-DLLVM_DIR=... -DMLIR_DIR=...`（或 `pip install` 时的 `-Ccmake.define.LLVM_DIR=...`）显式覆盖，详见 [前端接入与构建配置](docs/02-前端接入与构建配置.md#build-workflow)。
+
+## 示例与接入方式
+
+### 1. Python 进程内构建、准备与优化计算图
+
+`Compiler()` 默认直接走进程内 `nanobind` 原生扩展，也可传入 `--ask-opt` 切换 CLI 子进程模式：
+
+```bash
+# 构造 P -> F(Triton) -> Q 图并执行语义/形状检查与外部请求导出
+PYTHONPATH=build/core/python:python python3 examples/framework_frontend.py
+
+# 演示常量折叠、冗余 cast 消除、多输出逐元素融合及 LLVM IR 导出
+PYTHONPATH=build/core/python:python python3 examples/optimize_frontend.py
+```
+
+直接使用原生命令行工具 `ask-opt`：
+
+```bash
 build/core/bin/ask-opt --capabilities
+build/core/bin/ask-opt tests/ir/pipeline.mlir --prepare -o build/prepared.mlir --report-json build/report.json
 ```
 
-下载脚本取锁定的 Ubuntu x64 SDK。其他平台需要准备同一修订的 LLVM/MLIR，并将两个路径指向对应安装。
+### 2. 常驻 GPU 会话与 `ASK → Triton → ASK` 硬件融合
 
-`core` 使用 `ASK_THIRD_PARTY_COMPILERS=none`，不需要 Triton、NumPy 或 PyTorch。Python API 和 nanobind 绑定是基础组成，三种模式全部构建，不提供独立关闭选项。它仍能检查包含 `ask.external` 的图；真正请求编译外部 DSL 时才检查该编译器是否启用。第三方编译器可选择 `none`、`all` 或明确的名称。历史选项 `ASK_TARGET_BACKENDS=none|host` 只控制 host 目标文件生成；自有 CUDA LLVM 降级和运行时在三种编译器模式中都属于基础核心。见[构建说明](docs/09-构建与可选编译器.md)。
-
-第三方适配按 `adapters/<id>/` 集中存放：构建规则、worker、Python 策略、原生边界检查和专属测试都在该目录。公共核心通过显式注册接口调用它们，CUDA 运行时只读取标准化的参数与启动契约。新增编译器的文件和接口见[适配与注册](docs/17-第三方编译器适配与注册.md)；当前真实适配器仍只有 Triton。
-
-## 从上层框架提交图
-
-构建完成后，使用匹配构建解释器的原生扩展。`Compiler()` 默认进程内调用 C++；显式传入 `ask-opt` 路径则使用 CLI 兼容入口：
+在配有 NVIDIA GPU、`ptxas` 及 Triton 3.7.1 环境的机器上运行端到端硬件融合与多精度数值校验（脚本会自动探测 `.deps/` 中的 `llc` 与系统/环境中的 `ptxas`）：
 
 ```bash
-PYTHONPATH=build/core/python:python python3 examples/framework_frontend.py --emit-only
-PYTHONPATH=build/core/python:python python3 examples/framework_frontend.py \
-  --ask-opt build/core/bin/ask-opt
+PYTHONPATH=build/all/python:python /path/to/triton-env/bin/python examples/triton_fused_gpu.py
 ```
 
-[完整示例](examples/framework_frontend.py) 生成 `P: t=x+1 → F: u=t*2 → Q: y=u+3`。F 的 Triton 源码作为字符串写入实现声明；示例进程不会导入或执行 Triton。第二条命令调用真实 MLIR 编译器，输出准备后的 IR、形状快照、追踪记录和外部编译请求。
-
-也可以直接提交 MLIR 文件：
-
-```bash
-build/core/bin/ask-opt tests/ir/pipeline.mlir \
-  --prepare -o /tmp/ask-prepared.mlir --report-json /tmp/ask-report.json
-```
-
-SDK 用法、当前支持范围和诊断处理见[上层框架接入](docs/10-上层框架接入.md)。架构设计从[核心思想](docs/核心思想.md)开始，分阶段说明见[文档目录](docs/README.md)。设计文档中的完整接口不等于当前版本已经实现的 API。
-
-低层还提供[通用 LLVM 值边界内联接口](docs/13-通用LLVM值边界内联.md)：接收已确认的边界和 typed helper，支持多参数、多站点、整数、浮点和定长向量，失败时保留输入模块。Triton 的源码、布局和启动检查放在适配器中。六种类型由 ASK IR 决定，设备张量通过 `kernel.prepare(session).submit_many(inputs, outputs)` 提交。`kernel.run(values)` 保留为单输入单输出、相同 shape/dtype 的同步列表接口，见[类型传递](docs/10-上层框架接入.md#dtype-path)。bf16 会检查实际硬件支持，包括只在中间值使用 bf16 的图，不支持就报错。类型转换、CPU/GPU 检查与显式 f32 计算见[类型转换与混合精度](docs/15-类型转换与混合精度.md)。
-
-GPU 示例改为共用测试矩阵：`--dtypes bool i32 i64 f32 f16 bf16` 用同一组图验证六种类型和 6×6 转换方向，`--cases` 选图，`--extended` 增加形状与启动配置。host 和原生融合测试也复用该图构造器，规则和命令见[多精度测试](docs/14-多精度测试.md)。
-
-C++ 框架也可以通过安装后的 `ASK::Core` 直接构造和准备 MLIR，运行时无需初始化 Python。[C++ 示例](examples/cpp/frontend.cpp)及其 [CMake 项目](examples/cpp/CMakeLists.txt)演示独立消费已安装的 SDK，构建命令见接入文档第 8 节。
-
-## 设备张量与重复执行
-
-`kernel.run(values)` 保留为同步验证入口。框架循环中使用常驻资源：
+上层框架在循环中执行 GPU kernel 时，应复用常驻 `ExecutionSession` 与设备张量，避免反复初始化上下文或来回拷贝主机列表：
 
 ```python
 from ask import ExecutionSession
 
 with ExecutionSession(device=0) as session:
-    executable = kernel.prepare(session)  # kernel 来自 compile_cuda
+    executable = kernel.prepare(session)  # kernel 来自 Compiler().compile_cuda(...)
     x = session.from_host(values, shape=executable.shape, dtype=executable.dtype)
     y = session.tensor(executable.shape, executable.dtype)
-    done = executable.submit(x, y)        # 入队，不下载结果
+    done = executable.submit(x, y)        # 异步入队，不隐式同步主机
     done.wait()
     result = y.to_host()
 ```
 
-重复 `submit` 复用上下文、模块和缓冲区。已有连续 CUDA 张量可通过 `session.from_cuda_array(tensor)` 零拷贝接入；外部 bf16 的 DLPack 接入尚未实现。可执行缓存命中后跳过 `llc/ptxas`，查询 `kernel.codegen["executable_cache"]`；IR 统计仍在 `kernel.cache`。生命周期、异步顺序和支持边界见[常驻运行时](docs/16-Python绑定与常驻运行时.md)。
+### 3. 独立 C++ 接入（`ASK::Core`）
 
-Python 安装包使用 scikit-build-core 构建，并包含原生扩展；不再生成只有 Python 客户端的包。准备好上述依赖后，在使用同一 LLVM SDK 的环境中安装：
+纯 C++ 宿主无需初始化 Python 即可通过 `find_package(ASK CONFIG REQUIRED)` 构造与准备 `ask` IR，完整独立工程示例见 [examples/cpp/frontend.cpp](examples/cpp/frontend.cpp) 与 [examples/cpp/CMakeLists.txt](examples/cpp/CMakeLists.txt)。
 
-```bash
-python3 -m pip install . \
-  -Ccmake.define.LLVM_DIR="$PWD/.deps/llvm-1f126a6d-ubuntu-x64-1/lib/cmake/llvm" \
-  -Ccmake.define.MLIR_DIR="$PWD/.deps/llvm-1f126a6d-ubuntu-x64-1/lib/cmake/mlir"
-```
+## 测试分层
 
-## 基础优化
+`ctest --preset all` 统一调度 5 个测试集（`core` 运行前 4 个）：
 
-框架调用 `compiler.optimize(module)` 可取得优化后的 ASK IR 和报告；默认的 `prepare` 保持原有行为。也可以通过 CLI 运行：
+- `ask-compiler-adapter` / `ask-boundary-inline`：C++ 适配器注册隔离与通用 LLVM 值边界内联单测。
+- `ask-unit`：`tests/test_*.py` 共 7 个纯 CPU 快速单测模块（SDK、IR 正反例与优化、Host 执行、自有 CUDA 离线契约、缓存/运行时校验、6 精度极限参考值、工程工具测试）。
+- `ask-gpu`：`tests/gpu/test_gpu_{native,triton}.py` 真实 NVIDIA GPU 硬件执行、零拷贝会话与双层持久缓存验证。
+- `ask-triton`：`adapters/triton/tests/test_*.py` Triton 导出协议、AST 静态融合判定与 LLVM 边界融合测试。
 
-```bash
-PYTHONPATH=python python3 examples/optimize_frontend.py --emit-only > build/optimization-input.mlir
-build/core/bin/ask-opt build/optimization-input.mlir --optimize --emit-llvm \
-  -o build/optimized.ll --report-json build/optimization.json
-build/core/bin/ask-opt build/optimized.ll --optimize-llir -o build/cleaned.ll
-```
-
-此处的融合计划由 host 后端落实为共享循环。`Compiler.compile_cuda` 根据图是否含 external 选择自有 GPU 降级或外部融合；纯图不会加载适配器。跨 Triton 边界的 LLVM 融合也可以通过 `--fuse-external` 入口启用。开关、形状和标记更新规则见[基础优化与逐元素融合](docs/11-基础优化与逐元素融合.md)，GPU 数值验证见[可运行示例](examples/triton_fused_gpu.py)。
-
-## 测试
-
-`ctest --preset core` 会运行原生绑定、Python API 和真实 `ask-opt` 集成测试。只检查 Python 部分时：
+日常单独快速运行 CPU Python 单测：
 
 ```bash
-PYTHONPATH=build/core/python:python python3 -m unittest discover -s tests/python -v
+PYTHONPATH=build/core/python:python:tests ASK_OPT=build/core/bin/ask-opt \
+  ASK_BOUNDARY_INLINE_BIN=build/core/ask-boundary-inline-test \
+  python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
 
-未设置 `ASK_OPT` 时，真实编译器测试会显示 skipped。要单独运行它们，设置 `ASK_OPT` 为编译出的 `ask-opt` 路径；不能把跳过当成 native 验证通过。
+## 文档导航
+
+| 文档 | 说明 |
+| --- | --- |
+| [文档目录](docs/README.md) / [核心思想](docs/核心思想.md) | 全局设计脉络与双向互链总入口 |
+| [01. ASK IR 与数值语义](docs/01-ASK-IR与数值语义.md) | 6 种类型、单步 RNE、饱和 `ask.cast`、形状推导与外部算子声明 |
+| [02. 前端接入与构建配置](docs/02-前端接入与构建配置.md) | 依赖锁、CMake Preset、可选适配器注册、Python / C++ / CLI 三套入口 |
+| [03. 图优化与自有代码生成](docs/03-图优化与自有代码生成.md) | 折叠/DCE/融合组规划、Host 共享循环降级与自有 CUDA 降级 |
+| [04. 外部编译器适配与边界内联](docs/04-外部编译器适配与边界内联.md) | `adapters/<id>/` 隔离、导出协议与 ABI v2、通用内联核心与 FMA 隔离 |
+| [05. 常驻运行时与多级缓存](docs/05-常驻运行时与多级缓存.md) | `ExecutionSession`、零拷贝设备张量、异步事件与 IR / `cubin` 双层缓存 |
+| [06. 工程结构与测试体系](docs/06-工程结构与测试体系.md) | 目录职责、5 个 CTest 测试集与独立任意精度数值参考矩阵 |
+| [07. FugaTensor 协同与演进路线](docs/07-FugaTensor协同与演进路线.md) | 与上层框架 FugaTensor 的职责边界、当前能力清单与后续演进方向 |
