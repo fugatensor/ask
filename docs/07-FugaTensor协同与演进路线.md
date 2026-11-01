@@ -2,7 +2,7 @@
 
 返回核心思想：[与上层框架分工](核心思想.md#ask-positioning) · [验证与支持边界](核心思想.md#ask-testing-roadmap) · 相关细节：[ASK IR 与数值语义](01-ASK-IR与数值语义.md) · [外部编译器适配与边界内联](04-外部编译器适配与边界内联.md) · [FugaTensor 架构总览](../../fugatensor/docs/architecture/README.md)
 
-ASK 是上层张量框架 [FugaTensor](../../fugatensor/docs/README.md) 使用的编译与算术执行后端。Python 追踪、控制流切分和自动微分属于 FugaTensor；ASK 接收这些步骤产出的静态图。本文记录当前接入方式与支持边界，保留原文件名和 `roadmap` 锚点供已有链接使用。
+ASK 是上层张量框架 [FugaTensor](../../fugatensor/docs/README.md) 使用的编译与算术执行后端。Tensor 自动组图、Python 标量条件的执行边界和自动微分属于 FugaTensor；读取结果、条件判断、反向传播或显式求值时，FugaTensor 将所需依赖合并为静态图交给 ASK。本文记录当前接入方式与支持边界，保留原文件名和 `roadmap` 锚点供已有链接使用。
 
 <a id="division-of-labor"></a>
 
@@ -12,9 +12,9 @@ ASK 是上层张量框架 [FugaTensor](../../fugatensor/docs/README.md) 使用�
 
 | 关注点 | FugaTensor（上层张量框架） | ASK（底层编译与运行时引擎） |
 | --- | --- | --- |
-| **用户 API** | 提供 `ft.tensor`、`@ft.jit`、`ft.fun`、`ft.triton.kernel`、`requires_grad` / `.backward()` / `.grad`。 | 接收静态计算图并编译执行，不涉及自动微分或模型层 API。 |
+| **用户 API** | 提供 `ft.tensor`、`ft.evaluate`、`ft.fun`、`ft.triton.kernel`、`requires_grad` / `.backward()` / `.grad`。 | 接收静态计算图并编译执行，不涉及自动微分或模型层 API。 |
 | **中间表示（IR）** | 使用独立于 MLIR/ASK 的 [Fuga IR](../../fugatensor/docs/ir/README.md)，表达结构化区域（`if`/`for`/`while`）、自定义函数边界（`fuga.call`）与前向/反向微分变换。 | 使用 MLIR `ask` dialect（高层静态图）与原生 `llvm::Module`（低层代码生成与跨编译器内联）。 |
-| **控制流** | 静态 `if`/`for` 在 Fuga IR 层化简展开；依赖运行时标量 `bool` 的 `if`/`while` 通过 [Graph Break](../../fugatensor/docs/architecture/01-张量模型与追踪机制.md#graph-break) 切分为多个静态片段。 | 每次接收已展开、形状具体的单基本块静态计算图，通过双层缓存复用已编译片段。 |
+| **控制流** | 静态 `if`/`for` 在 Fuga IR 层化简展开；普通 Python 的 `if`/`while` 在读取 0-D Tensor 真值时触发[按需执行](../../fugatensor/docs/architecture/01-张量模型与追踪机制.md#graph-break)，再按实际分支继续组图；用户无需 JIT 装饰器。 | 每次接收已展开、形状具体的单基本块静态计算图，通过双层缓存复用已编译片段。 |
 | **跨层溯源与外部 DSL** | 保存用户 `@triton.jit` 源码快照，降级时输出 `fuga-to-ask.json` 映射表（见 [降级到 ASK](../../fugatensor/docs/ir/03-降级到ASK.md)），在实际 GPU 编译前绑定物理显卡 `sm_xx` 架构号。 | 校验 `ask.external` 语义与形状，调用 Triton worker 导出原生 LLVM IR，执行 `P → F → Q` 值边界融合或自有 CPU/CUDA 降级。 |
 | **算术执行** | Python 层与 C++ `_native` 图分析层不执行张量元素算术。 | 执行全部 CPU 目标代码与常驻 CUDA `ExecutionSession` kernel。 |
 
