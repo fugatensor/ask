@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ASK CUDA execution plan v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "inputs",
+    "outputs",
+    "buffers",
+    "steps",
+    "scheduling"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "ask.cuda.execution_plan"
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/buffer_id"
+      },
+      "uniqueItems": true
+    },
+    "outputs": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/buffer_id"
+      },
+      "minItems": 1
+    },
+    "buffers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/buffer"
+      }
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "scheduling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policy",
+        "stream"
+      ],
+      "properties": {
+        "policy": {
+          "const": "sequential"
+        },
+        "stream": {
+          "const": "session"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "id": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_.-]*$"
+    },
+    "buffer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "shape",
+        "element_type"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/buffer_id"
+        },
+        "shape": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "element_type": {
+          "enum": [
+            "bool",
+            "i32",
+            "i64",
+            "f32",
+            "f16",
+            "bf16"
+          ]
+        }
+      }
+    },
+    "step": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "function",
+        "inputs",
+        "outputs",
+        "depends_on"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "kind": {
+          "enum": [
+            "owned",
+            "fused",
+            "external"
+          ]
+        },
+        "function": {
+          "$ref": "#/$defs/id"
+        },
+        "inputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/buffer_id"
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/buffer_id"
+          },
+          "minItems": 1,
+          "uniqueItems": true
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/id"
+          },
+          "uniqueItems": true
+        },
+        "external_id": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "owned"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "external_id"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "external_id"
+            ]
+          }
+        }
+      ]
+    },
+    "buffer_id": {
+      "type": "string",
+      "minLength": 1
+    }
+  },
+  "$comment": "The Python validator additionally enforces globally unique IDs, SSA definitions, topological order, exact producer dependencies, defined output references, and signed-int64 byte counts. Kernel ABI agreement is validated against compiled artifacts."
+}

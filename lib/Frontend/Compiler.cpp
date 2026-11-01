@@ -17,10 +17,16 @@ llvm::json::Value attrJSON(mlir::Attribute attr) {
   using namespace llvm;
   if (auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr)) {
     json::Object value;
-    for (auto item : dict) value[item.getName().strref()] = attrJSON(item.getValue());
+    for (auto item : dict) {
+      // Dictionary keys borrow the context-owned identifier storage. Keep an
+      // owned copy so a report can outlive the parsed module.
+      value[item.getName().str()] = attrJSON(item.getValue());
+    }
     return value;
   }
-  if (auto str = mlir::dyn_cast<mlir::StringAttr>(attr)) return str.getValue();
+  // json::Value(StringRef) borrows the bytes. MLIR attributes die with their
+  // context, so own the string before the report outlives the parsed module.
+  if (auto str = mlir::dyn_cast<mlir::StringAttr>(attr)) return str.getValue().str();
   if (auto boolean = mlir::dyn_cast<mlir::BoolAttr>(attr)) return boolean.getValue();
   if (auto number = mlir::dyn_cast<mlir::IntegerAttr>(attr)) return number.getInt();
   if (auto array = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(attr)) {
@@ -54,6 +60,20 @@ llvm::json::Array externalRequests(mlir::ModuleOp module, bool fusion) {
     request["op_id"] = attrJSON(op->getAttr("ask.id"));
     request["function"] = op->getParentOfType<mlir::func::FuncOp>().getSymName();
     request["implementation"] = attrJSON(impl->getAttr("sym_name"));
+    json::Object shapes;
+    for (auto [index, value] : llvm::enumerate(op->getOperands())) {
+      json::Array shape;
+      if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType()))
+        for (int64_t dimension : tensor.getShape()) shape.push_back(dimension);
+      shapes["input:" + std::to_string(index)] = std::move(shape);
+    }
+    for (auto [index, value] : llvm::enumerate(op->getResults())) {
+      json::Array shape;
+      if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType()))
+        for (int64_t dimension : tensor.getShape()) shape.push_back(dimension);
+      shapes["output:" + std::to_string(index)] = std::move(shape);
+    }
+    request["port_shapes"] = std::move(shapes);
     requests.push_back(std::move(request));
   });
   return requests;
@@ -75,7 +95,8 @@ llvm::json::Object compilerCapabilities() {
       {"schema_version", 1}, {"build_id", ASK_BUILD_ID}, {"ask_version", ASK_VERSION}, {"llvm_version", ASK_LLVM_VERSION},
       {"llvm_revision", ASK_LLVM_REVISION}, {"third_party_compilers", std::move(compilers)},
       {"compiler_adapters", std::move(adapterDescriptions)},
-      {"prepare", true}, {"native_llvm_import", true}, {"host_codegen", bool(ASK_WITH_HOST)},
+      {"prepare", true}, {"partition", true}, {"cuda_execution_plan", true},
+      {"native_llvm_import", true}, {"host_codegen", bool(ASK_WITH_HOST)},
       {"ir_optimization", true}, {"elementwise_fusion", true}, {"llvm_optimization", true},
       {"external_export", hasCompilers}, {"gpu_execution", true},
       {"cuda_lowering", true}, {"cuda_graph_codegen", true},

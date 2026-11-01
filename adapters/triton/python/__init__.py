@@ -18,6 +18,16 @@ def _sha(data):
 def _numerics(request):
     """Bind cache identity to the dtype and ASK's arithmetic semantics."""
     signature = request.get("signature", {})
+    if "port_shapes" in request and not request.get("fusion", {}).get("enabled", False):
+        if not isinstance(signature, dict) or not signature:
+            raise CompilerError("standalone CUDA requires explicitly typed data pointers")
+        # Source/fixed options retain Triton's numerical choices; do not impose
+        # ASK's pointwise arithmetic policy on an opaque dot/softmax kernel.
+        supported = {"*i1", "*i32", "*i64", "*fp32", "*fp16", "*bf16"}
+        if any(value not in supported for value in signature.values()):
+            raise CompilerError("standalone CUDA has an unsupported data-pointer type")
+        return {"kind": "external-kernel", "pointer_types": dict(signature),
+                "arithmetic": "producer-source-and-fixed-options"}
     if not isinstance(signature, dict) or len(signature) != 2:
         raise CompilerError("CUDA fusion requires two explicitly typed data pointers")
     types = list(signature.values())

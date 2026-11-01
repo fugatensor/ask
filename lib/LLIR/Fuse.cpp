@@ -31,7 +31,7 @@ llvm::Expected<llvm::Value *> emit(mlir::Value value, mlir::Value leaf,
   if (value == leaf) return argument;
   if (auto it = memo.find(value); it != memo.end()) return it->second;
   auto *op = value.getDefiningOp();
-  if (!op) return error("fusion expression depends on a different graph input");
+  if (!op) return error("UnsupportedFusion: fusion expression depends on a different graph input");
   llvm::Value *result;
   if (auto constant = mlir::dyn_cast<ConstantOp>(op)) {
     auto attr = constant->getAttr("value");
@@ -59,7 +59,7 @@ llvm::Expected<llvm::Value *> emit(mlir::Value value, mlir::Value leaf,
     else
       result = mlir::isa<AddOp>(op) ? b.CreateAdd(*lhs, *rhs) : b.CreateMul(*lhs, *rhs);
   } else {
-    return error("fusion supports only constant/splat/add/mul/cast around one external operation");
+    return error("UnsupportedFusion: fusion supports only constant/splat/add/mul/cast around one external operation");
   }
   memo[value] = result;
   return result;
@@ -87,10 +87,10 @@ llvm::Expected<std::unique_ptr<llvm::Module>>
 fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
              const adapters::CompilerAdapter &adapter, llvm::LLVMContext &context, llvm::json::Object &report, std::string &helperIR) {
   llvm::SmallVector<mlir::func::FuncOp> functions(graph.getOps<mlir::func::FuncOp>());
-  if (functions.size() != 1) return error("fusion requires exactly one graph function");
+  if (functions.size() != 1) return error("UnsupportedFusion: fusion requires exactly one graph function");
   auto func = functions[0];
   if (func.getNumArguments() != 1 || func.getNumResults() != 1 || !func.getBody().hasOneBlock())
-    return error("fusion requires one static tensor input and one output in one block");
+    return error("UnsupportedFusion: fusion requires one static tensor input and one output in one block");
   auto type = mlir::dyn_cast<mlir::RankedTensorType>(func.getArgument(0).getType());
   if (!type || !type.hasStaticShape() || !isSupportedElementType(type.getElementType()))
     return error("ASK graph lowering requires a static supported tensor");
@@ -99,38 +99,38 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
   int64_t n = 1;
   for (int64_t dim : type.getShape()) {
     if (dim == 0 || dim > INT64_MAX / n)
-      return error("fusion requires a nonempty tensor with a representable element count");
+      return error("UnsupportedFusion: fusion requires a nonempty tensor with a representable element count");
     n *= dim;
   }
   if (func.getResultTypes()[0] != type)
-    return error("fusion requires matching pointwise input/output shapes and storage types");
+    return error("UnsupportedFusion: fusion requires matching pointwise input/output shapes and storage types");
   ExternalOp external;
   for (auto &op : func.front()) {
     if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, ExternalOp, mlir::func::ReturnOp>(op))
-      return error("unsupported operation in fusion graph");
+      return error("UnsupportedFusion: unsupported operation in fusion graph");
     for (auto result : op.getResults()) {
       requiredTypes.insert(elementTypeName(result.getType()).str());
       if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(result.getType()))
         if (tensor.getShape() != type.getShape())
-          return error("fusion requires matching pointwise tensor shapes");
+          return error("UnsupportedFusion: fusion requires matching pointwise tensor shapes");
     }
     if (auto f = mlir::dyn_cast<ExternalOp>(op)) {
-      if (external) return error("fusion requires exactly one external operation");
+      if (external) return error("UnsupportedFusion: fusion requires exactly one external operation");
       external = f;
     }
   }
   if (!external || external->getNumOperands() != 1 || external->getNumResults() != 1)
-    return error("fusion requires one external operation with one input and one output");
+    return error("UnsupportedFusion: fusion requires one external operation with one input and one output");
   if (external->getOperand(0).getType() != type || external->getResult(0).getType() != type)
-    return error("fusion external boundaries must preserve graph storage types and shapes");
+    return error("UnsupportedFusion: fusion external boundaries must preserve graph storage types and shapes");
   if (external.resolveSemantics()->getAttrOfType<mlir::StringAttr>("effects").getValue() != "none")
-    return error("fusion requires a pure external semantic contract");
+    return error("UnsupportedFusion: fusion requires a pure external semantic contract");
   auto impl = external.resolveImplementation();
   auto compiler = impl->getAttrOfType<mlir::StringAttr>("compiler").getValue();
   if (compiler != adapter.id)
     return error("selected adapter does not match the graph implementation compiler");
   if (!adapter.prepareFusion)
-    return error("selected compiler adapter does not support value-boundary fusion");
+    return error("UnsupportedFusion: selected compiler adapter does not support value-boundary fusion");
   auto payload = artifact.getString("payload");
   auto entryName = artifact.getString("entry");
   if (!payload || payload->empty() || !entryName || entryName->empty() ||

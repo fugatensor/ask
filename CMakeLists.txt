@@ -95,7 +95,7 @@ llvm_map_components_to_libnames(ASK_LLVM_LIBS
   native nativecodegen Passes InstCombine ScalarOpts TransformUtils Linker)
 
 add_library(ask_core STATIC
-  lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp lib/Frontend/Compiler.cpp
+  lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp lib/Frontend/Compiler.cpp lib/Frontend/Partition.cpp
   lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/LLIR/Inline.cpp
   lib/Lowering/Host.cpp lib/Lowering/CUDA.cpp
   lib/Transforms/Optimize.cpp)

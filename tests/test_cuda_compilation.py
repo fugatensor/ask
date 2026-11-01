@@ -252,7 +252,7 @@ class PreparedExecutableContractTests(unittest.TestCase):
         src.write_text(val["payload"], encoding="utf-8")
         cubin.write_bytes(b"synthetic cubin")
         receipt = {
-            "entry": val["entry"], "arch": 80, "invocation": copy.deepcopy(val["invocation"]),
+            "schema_version": 1, "entry": val["entry"], "arch": 80, "invocation": copy.deepcopy(val["invocation"]),
             "element_type": "i32", "fp_contract": "fast", "artifact_sha256": _artifact_digest(val),
             "llvm_sha256": _digest(src.read_bytes()), "llvm_ir": str(src),
             "cubin_sha256": _digest(cubin.read_bytes()), "cubin": str(cubin),

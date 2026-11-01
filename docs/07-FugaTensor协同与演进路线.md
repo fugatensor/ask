@@ -26,6 +26,7 @@ ASK 是上层张量框架 [FugaTensor](../../fugatensor/docs/README.md) 使用�
 - **前端与高层优化**：进程内 `nanobind` `ask.Compiler()`、C++ `ASK::Core` 与 `ask-opt` CLI；形状推导与 `ask.mark` 提取擦除；常量/类型折叠、死代码消除与多输出逐元素融合组规划。
 - **自有代码生成**：Host CPU 共享循环 LLVM IR / `.o` 代码生成；自有 CUDA `nvptx64` 多输入多输出异构端口代码生成（支持 0-D 标量、空张量与 64 位 grid-stride 循环，包含在 `core` 构建中）。
 - **外部编译器融合**：`adapters/<id>/` 注册机制；Triton 3.7.1 导出协议 v1 与执行契约 ABI v2；通用 C++ LLVM 值边界内联核心（支持多参数、多站点、定长向量与失败回滚）；单输入单输出静态逐元素 `ASK → Triton → ASK` 融合及指令级 FMA `contract` 隔离。
+- **图切分与复杂外部算子**：[MLIR 分区和 JSON 执行计划](08-图切分与多Kernel执行计划.md)，保留可融合区域，不能融合时使用独立外部 kernel 与设备中间缓冲区。Flash Attention 2 示例先验证前向，不提供完整训练接口。
 - **运行时与缓存**：动态加载 `libcuda.so.1` 的常驻 `ExecutionSession`、非阻塞 stream、异步 `Event`、五种非 `bf16` 类型的 `__cuda_array_interface__` v2/v3 零拷贝接入（含生产者流依赖与宿主对象保活），以及跨进程持久化的 IR / `cubin` 双层缓存。
 
 <a id="roadmap"></a>
@@ -34,7 +35,7 @@ ASK 是上层张量框架 [FugaTensor](../../fugatensor/docs/README.md) 使用�
 
 | 边界 | 当前行为 |
 | --- | --- |
-| 多外部节点或不可融合混合图 | CUDA 图编译要求纯自有图，或一个外部节点构成的受支持单输入单输出融合图。其它混合图返回错误，不生成多 kernel 执行计划，也不自动分配跨 kernel 中间缓冲区。 |
+| 动态执行计划与并发调度 | [执行计划 v1](08-图切分与多Kernel执行计划.md#plan-v1)只处理静态张量图，在同一会话 stream 顺序提交；没有多 stream 并发、运行时图内条件或循环。 |
 | 归约、轴广播与矩阵乘 | `ask` 操作集中没有 `sum`、`max`、轴广播或矩阵乘。`ask.splat` 只将标量填充成给定静态形状，不是通用广播。 |
 | 符号形状与图内动态控制流 | 函数输入须提供具体形状；输出的未定维度只能由现有规则细化为静态值。ASK 不执行运行时张量条件分支、循环或跨函数调用，上层须先静态展开或分段。 |
 | 外部算子副作用 | 语义声明仅接受 `effects = "none"`，没有状态 token 或有副作用节点的调度语义。 |

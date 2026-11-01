@@ -15,3 +15,19 @@ std::pair<std::string, std::string> prepareJSON(const std::string &source,
   return {std::move(result->ir),
           llvm::formatv("{0}", llvm::json::Value(std::move(result->report))).str()};
 }
+
+std::pair<std::string, std::string> partitionJSON(const std::string &source,
+    bool optimize, bool foldConstants, bool eliminateDeadCode,
+    bool fuseElementwise, bool fuseExternal,
+    const std::vector<std::string> &unfusedExternals) {
+  ask::PartitionOptions options;
+  options.optimize = optimize;
+  options.optimization = {foldConstants, eliminateDeadCode, fuseElementwise};
+  options.fuseExternal = fuseExternal;
+  for (const auto &id : unfusedExternals)
+    options.unfusedExternals.insert(id);
+  auto result = ask::partitionSource(source, options);
+  if (!result) throw std::runtime_error(llvm::toString(result.takeError()));
+  return {std::move(result->ir),
+          llvm::formatv("{0}", llvm::json::Value(std::move(result->report))).str()};
+}

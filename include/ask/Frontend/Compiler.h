@@ -3,6 +3,7 @@
 #include "ask/Transforms/Optimize.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
+#include <set>
 
 namespace ask {
 struct PreparedSource {
@@ -17,4 +18,16 @@ llvm::json::Array externalRequests(mlir::ModuleOp module, bool fusion = false);
 llvm::Expected<PreparedSource> prepareSource(
     llvm::StringRef source, bool optimize = false,
     const OptimizationOptions &options = {});
+
+struct PartitionOptions {
+  bool optimize = true;
+  OptimizationOptions optimization;
+  bool fuseExternal = true;
+  std::set<std::string> unfusedExternals;
+};
+
+// Partition one static tensor graph into explicit kernel functions. This only
+// constructs the execution contract; it does not invoke external compilers.
+llvm::Expected<PreparedSource> partitionSource(
+    llvm::StringRef source, const PartitionOptions &options = {});
 } // namespace ask

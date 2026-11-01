@@ -32,6 +32,10 @@ cl::opt<std::string> input(cl::Positional, cl::desc("input ASK MLIR (or LLVM IR 
 cl::opt<std::string> output("o", cl::desc("output path"), cl::init("-"));
 cl::opt<bool> prepare("prepare", cl::desc("verify, infer shapes and extract identity markers"));
 cl::opt<bool> optimize("optimize", cl::desc("prepare ASK IR, fold constants, eliminate dead code and plan elementwise fusion"));
+cl::opt<bool> partitionGraph("partition", cl::desc("partition a CUDA graph into explicit kernel functions and an execution plan"));
+cl::opt<bool> partitionNoOptimize("no-optimize", cl::desc("disable graph optimization in --partition"));
+cl::opt<bool> noExternalFusion("no-external-fusion", cl::desc("keep all external kernels separate in --partition"));
+cl::list<std::string> unfusedExternals("unfused-external", cl::desc("stable external ID to keep separate in --partition"), cl::ZeroOrMore);
 cl::opt<bool> noConstantFold("no-constant-fold", cl::desc("disable constant folding in --optimize"));
 cl::opt<bool> noDCE("no-dce", cl::desc("disable dead code elimination in --optimize"));
 cl::opt<bool> noFusion("no-fusion", cl::desc("disable elementwise fusion in --optimize"));
@@ -254,7 +258,7 @@ Error runExports(json::Array &requests, json::Object &report, StringRef executab
       return createStringError(inconvertibleErrorCode(), "export destination already contains %s artifacts; use a fresh directory", stem.c_str());
     json::Object workerRequest;
     for (StringRef key : {"protocol_version", "source", "entry", "signature",
-                          "source_bindings", "constants", "fixed_options", "target", "grid", "fusion"})
+                          "source_bindings", "constants", "fixed_options", "target", "grid", "fusion", "port_shapes"})
       if (auto *value = requests[index].getAsObject()->get(key))
         workerRequest[key] = *value;
     if (auto error = writeJSON(requestPath, json::Value(std::move(workerRequest)))) return error;
@@ -293,16 +297,33 @@ int main(int argc, char **argv) {
     outs() << formatv("{0:2}\n", result);
     return 0;
   }
-  if (int(emitLLVM) + int(emitObject) + int(emitCUDALLVM) + int(checkLLIR) + int(optimizeLLIR) + int(exportExternal) + int(fuseExternal) > 1)
+  if (int(partitionGraph) + int(emitLLVM) + int(emitObject) + int(emitCUDALLVM) + int(checkLLIR) + int(optimizeLLIR) + int(exportExternal) + int(fuseExternal) > 1)
     return fail("select only one of --emit-llvm, --emit-object, --emit-cuda-llvm, --check-llir, --optimize-llir, --export-external, --fuse-external");
   if (!emitCUDALLVM && (cudaArch.getNumOccurrences() || cudaBlockSize.getNumOccurrences() || cudaPTXVersion.getNumOccurrences()))
     return fail("--cuda-arch, --cuda-block-size and --cuda-ptx-version require --emit-cuda-llvm");
-  if ((noConstantFold || noDCE || noFusion) && !optimize)
+  if ((noConstantFold || noDCE || noFusion) && !optimize && !partitionGraph)
     return fail("--no-constant-fold, --no-dce and --no-fusion require --optimize");
+  if ((partitionNoOptimize || noExternalFusion || !unfusedExternals.empty()) && !partitionGraph)
+    return fail("--no-optimize, --no-external-fusion and --unfused-external require --partition");
+  if (partitionGraph && (prepare || optimize))
+    return fail("--partition cannot be combined with --prepare or --optimize; it prepares or optimizes the input itself");
   if ((checkLLIR || optimizeLLIR) && (prepare || optimize))
     return fail("native LLVM input modes cannot be combined with ASK IR preparation or optimization");
   auto buffer = MemoryBuffer::getFileOrSTDIN(input);
   if (!buffer) return fail(buffer.getError().message());
+  if (partitionGraph) {
+    ask::PartitionOptions options;
+    options.optimize = !partitionNoOptimize;
+    options.optimization = {!noConstantFold, !noDCE, !noFusion};
+    options.fuseExternal = !noExternalFusion;
+    options.unfusedExternals.insert(unfusedExternals.begin(), unfusedExternals.end());
+    auto result = ask::partitionSource((*buffer)->getBuffer(), options);
+    if (!result) return fail(toString(result.takeError()));
+    if (auto error = writeText(output, result->ir)) return fail(toString(std::move(error)));
+    if (!reportPath.empty())
+      if (auto error = writeJSON(reportPath, json::Value(std::move(result->report)))) return fail(toString(std::move(error)));
+    return 0;
+  }
   if (checkLLIR || optimizeLLIR) {
     LLVMContext context;
     auto module = ask::llir::importLLVMIR((*buffer)->getBuffer(), context, input);

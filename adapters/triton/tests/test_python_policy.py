@@ -121,6 +121,17 @@ class PolicyTests(unittest.TestCase):
             with self.assertRaises(CompilerError):
                 _numerics({"signature": signature})
 
+    def test_standalone_cache_identity_carries_each_pointer_type(self):
+        request = {'signature': {'q': '*fp16', 'k': '*bf16', 'out': '*fp32'},
+                   'port_shapes': {'input:0': [2, 32], 'input:1': [7, 32], 'output:0': [2, 7]}}
+        numerics = _numerics(request)
+        self.assertEqual(numerics['kind'], 'external-kernel')
+        self.assertEqual(numerics['pointer_types'], request['signature'])
+        self.assertEqual(numerics['arithmetic'], 'producer-source-and-fixed-options')
+        request['signature']['out'] = '*fp64'
+        with self.assertRaisesRegex(CompilerError, 'unsupported data-pointer'):
+            _numerics(request)
+
     def test_allowed_cache_location_and_false_override(self):
         with patch.dict(os.environ, {"TRITON_CACHE_DIR": "/tmp/custom-cache",
                                      "TRITON_KERNEL_OVERRIDE": ""}, clear=True):

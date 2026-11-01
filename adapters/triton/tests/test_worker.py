@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 import os
@@ -170,6 +171,71 @@ class RequestTests(unittest.TestCase):
                 worker.read_request(path)
 
 
+class StandalonePointerTests(unittest.TestCase):
+    @staticmethod
+    def generic_request():
+        value = request()
+        value['source'] = ('import triton\nimport triton.language as tl\n@triton.jit\n'
+                           'def scale2(a, b, out, stat, N: tl.constexpr, BLOCK: tl.constexpr):\n'
+                           '    pass\n')
+        value['signature'] = {'a': '*fp16', 'b': '*bf16', 'out': '*fp16', 'stat': '*fp32'}
+        value['source_bindings'] = {'a': 'input:0', 'b': 'input:1',
+                                    'out': 'output:0', 'stat': 'output:1'}
+        value['port_shapes'] = {'input:0': [2, 3, 32], 'input:1': [2, 7, 32],
+                                'output:0': [2, 3, 64], 'output:1': [2, 3]}
+        value['fixed_options']['num_stages'] = 2
+        return value
+
+    def test_dense_mixed_ports_require_complete_explicit_shapes(self):
+        value = self.generic_request()
+        self.assertEqual(worker.validate_request(value), value)
+        for mutate in (lambda v: v.pop('port_shapes'),
+                       lambda v: v['port_shapes'].pop('output:1'),
+                       lambda v: v['port_shapes'].update({'output:2': [2]}),
+                       lambda v: v['port_shapes'].update({'input:0': [True]}),
+                       lambda v: v['port_shapes'].update({'input:0': [-1]}),
+                       lambda v: v['port_shapes'].update({'input:0': [2**62, 4]}),
+                       lambda v: v['source_bindings'].update({'b': 'input:2'}),
+                       lambda v: v['source_bindings'].update({'b': 'input:0'}),
+                       lambda v: v['source_bindings'].update({'b': 'input:01'})):
+            bad = copy.deepcopy(value)
+            mutate(bad)
+            with self.subTest(request=bad), self.assertRaises(worker.WorkerError):
+                worker.validate_request(bad)
+        for stages in (0, 6, True, 2.0):
+            bad = copy.deepcopy(value)
+            bad['fixed_options']['num_stages'] = stages
+            with self.assertRaisesRegex(worker.WorkerError, 'num_stages'):
+                worker.validate_request(bad)
+
+    def test_shared_memory_and_source_order_do_not_change_logical_bindings(self):
+        value = self.generic_request()
+        llvm_ir = (FIXTURES / 'scale2.ll').read_text().replace(
+            'ptr addrspace(1) %1,',
+            'ptr addrspace(1) %1, ptr addrspace(1) %extra0, ptr addrspace(1) %extra1,')
+        # Out-of-order inputs and outputs must stay bound by logical name.
+        order = ['stat', 'b', 'out', 'a']
+        code = compiled({'shared': 8192, 'num_stages': 2}, llvm_ir=llvm_ir)
+        artifact = worker.build_artifact(value, code, '3.7.1', order)
+        self.assertEqual(artifact['invocation']['shared_bytes'], 8192)
+        self.assertEqual([port['logical_port'] for port in artifact['port_map']],
+                         ['output:1', 'input:1', 'output:0', 'input:0'])
+        for port in artifact['port_map']:
+            self.assertEqual(port['shape'], value['port_shapes'][port['logical_port']])
+        self.assertEqual([arg['argument'] for arg in artifact['invocation']['arguments']], list(range(6)))
+        self.assertEqual([arg['binding'] for arg in artifact['invocation']['arguments'][-2:]], ['null', 'null'])
+        self.assertEqual(artifact['specializations']['port_shapes'], value['port_shapes'])
+        value['fusion'] = {'enabled': True}
+        with self.assertRaisesRegex(worker.WorkerError, 'value-boundary fusion') as error:
+            worker.export(value)
+        self.assertEqual(error.exception.code, 'UnsupportedFusion')
+        value.pop('fusion')
+        for field in ('global_scratch_size', 'profile_scratch_size', 'tmem_size'):
+            with self.assertRaisesRegex(worker.WorkerError, 'zero ' + field):
+                worker.build_artifact(value, compiled({field: 8, 'num_stages': 2}, llvm_ir=llvm_ir),
+                                      '3.7.1', order)
+
+
 class ArtifactTests(unittest.TestCase):
     def test_compiled_type_inventory_ignores_names_comments_and_strings(self):
         spelling = '''
@@ -237,7 +303,7 @@ class ArtifactTests(unittest.TestCase):
                                   "3.7.1", ["t", "u"])
 
     def test_missing_resource_metadata_is_unknown_not_zero(self):
-        with self.assertRaisesRegex(worker.WorkerError, "zero shared"):
+        with self.assertRaisesRegex(worker.WorkerError, "shared memory size"):
             worker.build_artifact(request(), compiled({"shared": None}), "3.7.1", ["t", "u"])
 
     def test_changed_target_is_rejected(self):

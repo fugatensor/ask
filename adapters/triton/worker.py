@@ -2,8 +2,9 @@
 """ASK protocol-1 Triton exporter. No Triton import occurs before a request/probe.
 
 This adapter deliberately accepts only the locked Triton CUDA
-pointer ABI: two equally typed data pointers, integer constexprs and two unused scratch
-pointers. It exports code and descriptions, never Python/kernel handles.
+pointer ABI: named data pointers, integer constexprs and two unused scratch
+pointers. Standalone kernels declare each port shape and may use shared memory.
+Pointwise value-boundary fusion keeps its narrower proof requirements.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import dataclasses
 import hashlib
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -64,9 +66,9 @@ def validate_request(request):
     require(isinstance(request, dict), "request must be a JSON object")
     fields = {"protocol_version", "source", "entry", "signature",
               "source_bindings", "constants", "fixed_options", "target", "grid"}
-    require(fields <= set(request) and set(request) <= fields | {"fusion"},
+    require(fields <= set(request) and set(request) <= fields | {"fusion", "port_shapes"},
             f"request fields differ: missing={sorted(fields - set(request))}, "
-            f"unknown={sorted(set(request) - fields - {'fusion'})}")
+            f"unknown={sorted(set(request) - fields - {'fusion', 'port_shapes'})}")
     if "fusion" in request:
         require(isinstance(request["fusion"], dict) and set(request["fusion"]) == {"enabled"}
                 and type(request["fusion"]["enabled"]) is bool,
@@ -83,14 +85,12 @@ def validate_request(request):
     for field in ("signature", "source_bindings", "constants", "fixed_options", "target"):
         require(isinstance(request[field], dict), f"{field} must be an object")
     signature = request["signature"]
-    require(len(signature) == 2 and all(isinstance(k, str) and k.isidentifier()
+    require(len(signature) >= 2 and all(isinstance(k, str) and k.isidentifier()
                                       for k in signature),
-            "initial adapter requires exactly two named data-pointer parameters",
+            "adapter requires named input and output data-pointer parameters",
             "UnsupportedSignature")
     require(all(isinstance(v, str) and v in ELEMENT_TYPES for v in signature.values()),
             "adapter supports *i1, *i32, *i64, *fp32, *fp16 or *bf16 data pointers", "UnsupportedSignature")
-    require(len(set(signature.values())) == 1,
-            "input and output data pointers must have the same element type", "UnsupportedSignature")
     if "*bf16" in signature.values():
         target = request["target"]
         require(target.get("backend") == "cuda" and type(target.get("arch")) is int
@@ -100,21 +100,46 @@ def validate_request(request):
     bindings = request["source_bindings"]
     require(set(bindings) == set(signature),
             "source_bindings must cover exactly the data-pointer signature")
-    require(all(isinstance(value, str) for value in bindings.values()) and
-            set(bindings.values()) == {"input:0", "output:0"},
-            "initial adapter requires one input:0 and one output:0 binding")
+    require(all(isinstance(value, str) and re.fullmatch(r"(input|output):(0|[1-9][0-9]*)", value)
+                for value in bindings.values()) and len(set(bindings.values())) == len(bindings),
+            "source_bindings must map each pointer to one unique input/output port")
+    for role in ("input", "output"):
+        indices = sorted(int(binding.split(":")[1]) for binding in bindings.values()
+                         if binding.startswith(role + ":"))
+        require(indices and indices == list(range(len(indices))),
+                f"{role} bindings must be nonempty and densely numbered from zero")
+    if "port_shapes" in request:
+        shapes = request["port_shapes"]
+        require(isinstance(shapes, dict) and set(shapes) == set(bindings.values()),
+                "port_shapes must describe exactly every logical input/output port")
+        for name, binding in bindings.items():
+            shape = shapes[binding]
+            require(isinstance(shape, list) and all(type(n) is int and 0 <= n < 2**63 for n in shape),
+                    "port_shapes dimensions must be nonnegative signed 64-bit integers")
+            require(math.prod(shape) * STORAGE_BYTES[ELEMENT_TYPES[signature[name]]] < 2**63,
+                    "port shape byte size exceeds signed 64-bit range")
+    else:
+        # Protocol-1 legacy pointwise requests flatten all ports to [N].
+        require(len(signature) == 2 and set(bindings.values()) == {"input:0", "output:0"},
+                "multiple data pointers require explicit port_shapes", "UnsupportedSignature")
+        require(len(set(signature.values())) == 1,
+                "input and output data pointers must have the same element type without port_shapes",
+                "UnsupportedSignature")
     constants = request["constants"]
     require(all(isinstance(k, str) and k.isidentifier() and type(v) is int
                 and -(2**63) <= v < 2**63 for k, v in constants.items()),
             "constexpr values must be named signed 64-bit integers")
     require(not set(constants).intersection(signature),
             "data parameters cannot also be constexprs")
-    require({"num_warps"} <= set(request["fixed_options"]) <= {"num_warps", "enable_fp_fusion"} and
+    require({"num_warps"} <= set(request["fixed_options"]) <= {"num_warps", "enable_fp_fusion", "num_stages"} and
             type(request["fixed_options"].get("num_warps")) is int and
             request["fixed_options"]["num_warps"] in (4, 8) and
             ("enable_fp_fusion" not in request["fixed_options"] or
-             type(request["fixed_options"]["enable_fp_fusion"]) is bool),
-            "adapter requires fixed_options num_warps=4|8 and optional boolean enable_fp_fusion",
+             type(request["fixed_options"]["enable_fp_fusion"]) is bool) and
+            ("num_stages" not in request["fixed_options"] or
+             type(request["fixed_options"]["num_stages"]) is int and
+             1 <= request["fixed_options"]["num_stages"] <= 5),
+            "adapter requires fixed_options num_warps=4|8, optional boolean enable_fp_fusion and num_stages=1..5",
             "UnsupportedOptions")
     target = request["target"]
     require(set(target) == {"backend", "arch", "warp_size"} and target["backend"] == "cuda" and
@@ -384,7 +409,16 @@ def build_artifact(request, compiled, triton_version, source_order):
                 "compiled floating contraction policy differs from request", "ArtifactMismatch", "artifact")
     require(type(metadata.get("enable_fp_fusion")) is bool,
             "compiled floating contraction policy is missing", "ArtifactMismatch", "artifact")
-    for name in ("shared", "global_scratch_size", "profile_scratch_size", "tmem_size"):
+    if "num_stages" in request["fixed_options"]:
+        require(metadata.get("num_stages") == request["fixed_options"]["num_stages"],
+                "compiled pipeline stages differ from request", "ArtifactMismatch", "artifact")
+    shared = metadata.get("shared")
+    require(type(shared) is int and 0 <= shared < 2**31,
+            "shared memory size must be an explicit nonnegative signed 32-bit integer",
+            "UnsupportedResources", "artifact")
+    require(not request.get("fusion", {}).get("enabled", False) or shared == 0,
+            "value-boundary fusion requires zero shared memory", "UnsupportedFusion", "fusion")
+    for name in ("global_scratch_size", "profile_scratch_size", "tmem_size"):
         require(type(metadata.get(name)) is int and metadata[name] == 0,
                 f"initial ABI requires zero {name}; found {metadata.get(name)!r}",
                 "UnsupportedResources", "artifact")
@@ -402,25 +436,29 @@ def build_artifact(request, compiled, triton_version, source_order):
     require(len(parameters) == len(source_order) + 2,
             f"Triton {SUPPORTED_TRITON_VERSION} ABI must contain data pointers followed by two scratch pointers",
             "UnsupportedEntryABI", "artifact")
-    require(all(not p["unused_scratch_attributes"] for p in parameters[:2]) and
-            all(p["unused_scratch_attributes"] for p in parameters[2:]),
+    pointer_count = len(source_order)
+    require(all(not p["unused_scratch_attributes"] for p in parameters[:pointer_count]) and
+            all(p["unused_scratch_attributes"] for p in parameters[pointer_count:]),
             "unexpected data/scratch parameter attributes", "UnsupportedEntryABI", "artifact")
     port_map, arguments = [], []
-    count = request["constants"].get("N")
-    require(type(count) is int and count >= 0,
-            "Triton pointwise exporter requires an explicit nonnegative N logical shape",
-            "UnsupportedShape", "artifact")
+    shapes = request.get("port_shapes")
+    if shapes is None:
+        count = request["constants"].get("N")
+        require(type(count) is int and count >= 0,
+                "Triton pointwise exporter requires an explicit nonnegative N logical shape",
+                "UnsupportedShape", "artifact")
+        shapes = {binding: [count] for binding in request["source_bindings"].values()}
     for ordinal, name in enumerate(source_order):
         binding = request["source_bindings"][name]
         element_type = ELEMENT_TYPES[request["signature"][name]]
         port_map.append({"source_parameter": name, "logical_port": binding,
                          "argument": ordinal, "element_type": element_type,
                          "storage_bytes": STORAGE_BYTES[element_type],
-                         "shape": [count], "layout": "contiguous_row_major"})
+                         "shape": list(shapes[binding]), "layout": "contiguous_row_major"})
         arguments.append({"argument": ordinal, "binding": binding,
                           "llvm_type": parameters[ordinal]["llvm_type"]})
     resources = {}
-    for ordinal, resource in enumerate(("global_scratch", "profile_scratch"), start=2):
+    for ordinal, resource in enumerate(("global_scratch", "profile_scratch"), start=pointer_count):
         resources[resource] = {"size_bytes": 0, "alignment": metadata[resource + "_align"]}
         arguments.append({"argument": ordinal, "resource": resource, "binding": "null",
                           "llvm_type": parameters[ordinal]["llvm_type"]})
@@ -447,10 +485,11 @@ def build_artifact(request, compiled, triton_version, source_order):
                                   "resources": resources, "compiler_metadata": metadata},
             "invocation": {"kind": "cuda-kernel", "version": 2,
                            "grid": request["grid"], "block": [metadata["num_warps"] * metadata["warp_size"], 1, 1],
-                           "shared_bytes": 0, "arguments": arguments,
+                           "shared_bytes": shared, "arguments": arguments,
                            "completion": "device-event"},
             "dependencies": dependencies,
-            "specializations": {"constants": request["constants"],
+            "specializations": {**({"port_shapes": request["port_shapes"]} if "port_shapes" in request else {}),
+                                "constants": request["constants"],
                                 "fixed_options": request["fixed_options"],
                                 "source_bindings": request["source_bindings"],
                                 "source_sha256": hashlib.sha256(request["source"].encode()).hexdigest()},
@@ -465,6 +504,13 @@ def export(request):
     instrumented_source = None
     contract = None
     if request.get("fusion", {}).get("enabled", False):
+        require(len(request["signature"]) == 2 and len(set(request["signature"].values())) == 1,
+                "value-boundary fusion requires one input and one equally typed output",
+                "UnsupportedFusion", "fusion")
+        if "port_shapes" in request:
+            shapes = list(request["port_shapes"].values())
+            require(shapes[0] == shapes[1] and math.prod(shapes[0]) == request["constants"].get("N"),
+                    "pointwise fusion shapes must match each other and N", "UnsupportedFusion", "fusion")
         fusion_spec = importlib.util.spec_from_file_location(
             "ask_triton_fusion", Path(__file__).with_name("fusion.py"))
         fusion = importlib.util.module_from_spec(fusion_spec)

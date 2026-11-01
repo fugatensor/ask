@@ -4,7 +4,7 @@ ASK 是面向张量框架的底层编译与运行时引擎。上层通过 MLIR `
 
 - **6 种显式类型与确定性数值**：支持 `bool`、`i32`、`i64`、`f32`、`f16`、`bf16` 单基本块静态图、单步最近偶数舍入（RNE）常量与 6×6 显式 `ask.cast`，不做隐式类型提升或隐式广播。
 - **自有 CPU 与自有 CUDA 代码生成**：`core` 构建（`ASK_THIRD_PARTY_COMPILERS=none`）不依赖 Triton、NumPy 或 PyTorch，直接支持常量/类型折叠、死代码消除、多输出逐元素融合，并生成 Host 目标文件或自有 CUDA kernel（支持异构多输入输出、0-D 标量与空张量）。
-- **跨编译器 LLVM 值边界融合**：围绕单个逐元素 Triton 算子的非空、单输入单输出、同形状同存储类型图（`P → F → Q`），可通过 [Triton 适配器](adapters/triton/README.md) 和通用值边界内联器合入同一条 GPU kernel，并按指令级标志隔离浮点收缩（FMA）与转换规则。检查失败会报错，没有多 kernel 回退路径。
+- **跨编译器 LLVM 值边界融合**：围绕单个逐元素 Triton 算子的非空、单输入单输出、同形状同存储类型图（`P → F → Q`），可通过 [Triton 适配器](adapters/triton/README.md) 和通用值边界内联器合入同一条 GPU kernel，并按指令级标志隔离浮点收缩（FMA）与转换规则。融合结构或边界证明不满足时，图切分器生成多 kernel 执行计划，在同一 CUDA stream 上调度。非法图或损坏产物仍报错。
 - **进程内 SDK、常驻会话与双层缓存**：提供 `nanobind` 进程内编译器入口、`ExecutionSession` 常驻设备内存、`__cuda_array_interface__` 零拷贝接入、异步事件同步，以及磁盘级 LLVM IR / `cubin` 双层持久缓存。
 
 架构与实现说明见 [文档目录](docs/README.md) 和 [核心思想](docs/核心思想.md)。
@@ -118,3 +118,5 @@ PYTHONPATH=build/core/python:python:tests ASK_OPT=build/core/bin/ask-opt \
 | [05. 常驻运行时与多级缓存](docs/05-常驻运行时与多级缓存.md) | `ExecutionSession`、零拷贝设备张量、异步事件与 IR / `cubin` 缓存 |
 | [06. 工程结构与测试体系](docs/06-工程结构与测试体系.md) | 目录职责、5 个 CTest 测试集与共享多精度数值参考 |
 | [07. FugaTensor 协同与演进路线](docs/07-FugaTensor协同与演进路线.md) | 与 FugaTensor 的职责边界、已实现范围与当前限制 |
+
+图切分表示、执行计划 JSON v1 与独立外部 kernel 接入见[执行计划契约](docs/08-图切分与多Kernel执行计划.md)。

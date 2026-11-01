@@ -137,6 +137,9 @@ class TritonPipelineAndFusionTests(unittest.TestCase):
                 ("layout", lambda b: b["fusion_contract"]["proof"]["layout"].update(matched_uninstrumented_baseline=False),
                  "preserved the producer layout"),
                 ("shape", lambda b: b["fusion_contract"].update(shape=[11]), "shape/constexpr"),
+                ("port-shape", lambda b: b["port_map"][0].update(shape=[11]), "logical port shapes"),
+                ("port-type", lambda b: b["port_map"][0].update(element_type="f32"), "port element type"),
+                ("shape-receipt", lambda b: b["specializations"].update(port_shapes={}), "typed port shapes"),
             ):
                 bad = copy.deepcopy(artifact)
                 mutator(bad)

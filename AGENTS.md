@@ -17,6 +17,9 @@
 - **核心与第三方适配器隔离**：
   - `core` 构建（`ASK_THIRD_PARTY_COMPILERS=none`）不依赖 Triton、NumPy 或 PyTorch；自有 CPU 后端与自有 CUDA 后端属于基础核心。
   - 第三方编译器专属逻辑（导出 `worker`、AST/标记融合、Python 环境策略、C++ 边界校验与专属测试）收敛在 `adapters/<id>/` 下，经 `adapters/registry.json` 与 `registration.json` 显式注册。公共层（`lib/Adapters/`、`lib/LLIR/Inline.cpp`、`lib/Runtime/CUDA.cpp`）不硬编码特定外部编译器分支，也不扫描 Python `entrypoints`。
+- **图切分与执行计划**：
+  - 高层 MLIR 分区函数与 JSON v1 记录缓冲区、步骤依赖和单 stream 调度；保留可融合区域，融合能力不足时隔离外部节点执行。非法 IR、坏导出或工具失败不能泛化为成功回退。
+  - 第三方复杂 kernel 的独立导出和逐元素边界证明分开；核心调度不识别具体 DSL。
 - **数值语义**：
   - 6 种基础类型（`bool`、`i32`、`i64`、`f32`、`f16`、`bf16`）不做隐式类型提升或隐式广播。
   - `ask.constant` 按单步最近偶数舍入（RNE）编码浮点字面量，64 位整数保持完整精度。
@@ -41,7 +44,7 @@
 
 ## 文档与双向链接
 
-- 文档采用 `docs/核心思想.md` ↔ `docs/01..07-*.md` ↔ `../fugatensor/docs/` 双向链接结构：
+- 文档采用 `docs/核心思想.md` ↔ `docs/01..08-*.md` ↔ `../fugatensor/docs/` 双向链接结构：
   - 总览各节使用 `<a id="..."></a>` 定义锚点，节末以 `工程细节：...` 链向专题章节；
   - 专题首行以 `返回核心思想：... · 相关细节：...` 链回总览与关联专题，内部小节同样提供 `<a id="..."></a>` 锚点。
 - 修改章节标题、文件名或锚点时，同步检查仓内及同级 `../fugatensor/docs/` 的相对路径与 `#anchor` 引用。

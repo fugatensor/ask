@@ -1,6 +1,8 @@
 #include "ask/Adapters/TritonBoundary.h"
 #include "TritonVersion.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
@@ -334,6 +336,31 @@ llvm::Error validateTritonArtifact(const llvm::json::Object &artifact,
     if (!request.get(key) || !specializations->get(key) ||
         *request.get(key) != *specializations->get(key))
       return error("artifact specialization does not match implementation: " + key);
+  if (auto *shapes = request.getObject("port_shapes")) {
+    auto *recordedShapes = specializations->get("port_shapes");
+    auto *bindings = request.getObject("source_bindings");
+    auto *types = request.getObject("signature");
+    auto *ports = artifact.getArray("port_map");
+    if (!recordedShapes || *recordedShapes != *request.get("port_shapes") ||
+        !bindings || !types || !ports || ports->size() != bindings->size())
+      return error("artifact typed port shapes do not match the prepared request");
+    llvm::StringSet<> seen;
+    for (const auto &value : *ports) {
+      auto *port = value.getAsObject();
+      auto name = port ? port->getString("source_parameter") : std::nullopt;
+      auto logical = name ? bindings->getString(*name) : std::nullopt;
+      auto pointer = name ? types->getString(*name) : std::nullopt;
+      if (!port || !name || !logical || !pointer || !seen.insert(*name).second ||
+          port->getString("logical_port") != logical || !shapes->get(*logical) ||
+          !port->get("shape") || *port->get("shape") != *shapes->get(*logical))
+        return error("artifact port map differs from the prepared logical port shapes");
+      auto dtype = llvm::StringSwitch<llvm::StringRef>(*pointer)
+          .Case("*i1", "bool").Case("*i32", "i32").Case("*i64", "i64")
+          .Case("*fp32", "f32").Case("*fp16", "f16").Case("*bf16", "bf16").Default("");
+      if (dtype.empty() || port->getString("element_type") != dtype)
+        return error("artifact port element type differs from the implementation signature");
+    }
+  }
   for (const auto &field : *requestedTarget)
     if (!target->get(field.first) || *target->get(field.first) != field.second)
       return error("artifact target does not match implementation");
