@@ -78,6 +78,11 @@ is `1f126a6dea50d185c0781743a667390037ae88bd`, whose
 reports LLVM 23.0.0git. This is upstream release provenance, not an assertion that
 the installed wheel exposes or attests its own LLVM build revision.
 
-LLVM 18.1.8 rejects the real artifact's `captures(none)` parameter attribute.
-The worker does not delete that attribute or otherwise rewrite the export to
-make an older reader accept it; use a compatible LLVM/MLIR SDK for the core.
+The pinned LLVM 23.0.0git SDK has parsed and verified the original real export.
+Fetch it with `python3 tools/fetch_llvm.py`; its URL, archive SHA256, revision and
+version are recorded in `cmake/llvm.lock.json`. Export and LLVM verification have
+been tested; ASK target code generation and GPU execution have not been claimed.
+
+LLVM 18.1.8 rejected the same artifact's `captures(none)` parameter attribute.
+The worker did not delete that attribute or rewrite the export to accommodate
+the older reader.

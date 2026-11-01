@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "version": "23.0.0git",
+  "cmake_version": "23.0.0",
+  "revision": "1f126a6dea50d185c0781743a667390037ae88bd",
+  "platform": "linux-x86_64",
+  "directory": "llvm-1f126a6d-ubuntu-x64-1",
+  "url": "https://oaitriton.blob.core.windows.net/public/llvm-builds/llvm-1f126a6d-ubuntu-x64-1.tar.gz",
+  "sha256": "0f9d80678e969a7966da672e2648cda7bb475c246d3a36ff6a4986d09916b0eb",
+  "size_bytes": 356721745,
+  "unpacked_size_limit_bytes": 8589934592,
+  "provenance": {
+    "compiler": "triton",
+    "compiler_version": "3.7.1",
+    "revision_source": "https://github.com/triton-lang/triton/blob/v3.7.1/cmake/llvm-hash.txt",
+    "archive_url_source": "https://github.com/triton-lang/triton/blob/v3.7.1/setup.py#L197-L245",
+    "version_source": "https://github.com/llvm/llvm-project/blob/1f126a6dea50d185c0781743a667390037ae88bd/cmake/Modules/LLVMVersion.cmake"
+  },
+  "verified": {
+    "llvm_config_version": "23.0.0git",
+    "triton_3_7_1_original_llvm_ir": "parse-and-verify-passed",
+    "gpu_execution": "not-run"
+  }
+}

@@ -15,6 +15,9 @@
 #include "llvm/Support/Program.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/IR/Metadata.h"
+#include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/SHA256.h"
 
 using namespace llvm;
 namespace {
@@ -61,6 +64,7 @@ json::Value attrJSON(mlir::Attribute attr) {
     return value;
   }
   if (auto str = mlir::dyn_cast<mlir::StringAttr>(attr)) return str.getValue();
+  if (auto boolean = mlir::dyn_cast<mlir::BoolAttr>(attr)) return boolean.getValue();
   if (auto number = mlir::dyn_cast<mlir::IntegerAttr>(attr)) return number.getInt();
   if (auto array = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(attr)) {
     json::Array value;
@@ -97,6 +101,44 @@ json::Array externalRequests(mlir::ModuleOp module) {
   return requests;
 }
 
+Error validateExport(const json::Object &artifact, const json::Object &request) {
+  auto nonempty = [](const json::Object &object, StringRef key) {
+    auto value = object.getString(key);
+    return value && !value->empty();
+  };
+  auto *producer = artifact.getObject("producer");
+  auto *target = artifact.getObject("target");
+  auto *invocation = artifact.getObject("invocation");
+  auto *specializations = artifact.getObject("specializations");
+  if (artifact.get("error") || artifact.getInteger("protocol_version") != 1 ||
+      artifact.getString("format") != "llvm-ir" || !nonempty(artifact, "payload") ||
+      !nonempty(artifact, "entry") || !producer ||
+      producer->getString("name") != "triton" || !nonempty(*producer, "version") ||
+      !target || !invocation || !specializations || !artifact.getArray("port_map") ||
+      !artifact.getArray("dependencies"))
+    return createStringError(inconvertibleErrorCode(), "worker response does not match ASK artifact protocol 1");
+  auto matches = [](const json::Object &actual, const json::Object &expected, StringRef key) {
+    auto *a = actual.get(key);
+    auto *b = expected.get(key);
+    return a && b && *a == *b;
+  };
+  auto *requestedTarget = request.getObject("target");
+  if (!requestedTarget) return createStringError(inconvertibleErrorCode(), "missing requested target");
+  for (auto &item : *requestedTarget)
+    if (!matches(*target, *requestedTarget, item.first))
+      return createStringError(inconvertibleErrorCode(), "worker changed requested target");
+  if (!matches(*invocation, request, "grid"))
+    return createStringError(inconvertibleErrorCode(), "worker changed requested grid");
+  for (StringRef key : {"constants", "fixed_options", "source_bindings"})
+    if (!matches(*specializations, request, key))
+      return createStringError(inconvertibleErrorCode(), "worker changed requested %s", key.str().c_str());
+  SHA256 hash;
+  hash.update(*request.getString("source"));
+  if (specializations->getString("source_sha256") != toHex(hash.final(), true))
+    return createStringError(inconvertibleErrorCode(), "worker source digest does not match request");
+  return Error::success();
+}
+
 Error runExports(json::Array &requests, json::Object &report, StringRef executable) {
   // Check the entire allowlist before creating files or starting any worker.
   for (auto &item : requests) {
@@ -130,7 +172,12 @@ Error runExports(json::Array &requests, json::Object &report, StringRef executab
     // An old artifact must never be mistaken for this worker's response.
     if (sys::fs::exists(artifactPath) || sys::fs::exists(irPath) || sys::fs::exists(requestPath))
       return createStringError(inconvertibleErrorCode(), "export destination already contains %s artifacts; use a fresh directory", stem.c_str());
-    if (auto error = writeJSON(requestPath, requests[index])) return error;
+    json::Object workerRequest;
+    for (StringRef key : {"protocol_version", "source", "entry", "signature",
+                          "source_bindings", "constants", "fixed_options", "target", "grid"})
+      if (auto *value = requests[index].getAsObject()->get(key))
+        workerRequest[key] = *value;
+    if (auto error = writeJSON(requestPath, json::Value(std::move(workerRequest)))) return error;
     SmallVector<StringRef> args{tritonPython, worker, "--request", requestPath, "--output", artifactPath};
     std::string executionError;
     bool failed = false;
@@ -142,9 +189,8 @@ Error runExports(json::Array &requests, json::Object &report, StringRef executab
     auto artifact = json::parse((*buffer)->getBuffer());
     if (!artifact) return artifact.takeError();
     auto *object = artifact->getAsObject();
-    if (!object || object->getInteger("protocol_version") != 1 ||
-        object->getString("format") != "llvm-ir" || !object->getString("payload"))
-      return createStringError(inconvertibleErrorCode(), "worker response does not match ASK artifact protocol 1");
+    if (!object) return createStringError(inconvertibleErrorCode(), "worker response must be a JSON object");
+    if (auto error = validateExport(*object, *requests[index].getAsObject())) return error;
     if (auto error = writeText(irPath, *object->getString("payload"))) return error;
     artifacts.push_back(json::Object{{"artifact", artifactPath.str().str()},
                                     {"llvm_ir", irPath.str().str()},
@@ -212,6 +258,13 @@ int main(int argc, char **argv) {
     auto lowered = ask::lowerToHostLLVM(*module, llvmContext, abi);
     if (!lowered) return fail(toString(lowered.takeError()));
     report["abi"] = std::move(abi);
+    // Frozen high-level shape information travels with the LLVM artifact.
+    // Pointers are never used to reconstruct tensor shapes.
+    std::string snapshotText;
+    raw_string_ostream snapshotStream(snapshotText);
+    snapshotStream << formatv("{0}", *report.get("shape_snapshot"));
+    (*lowered)->getOrInsertNamedMetadata("ask.shape_snapshot")->addOperand(
+        MDNode::get(llvmContext, MDString::get(llvmContext, snapshotText)));
     report["phase"] = emitObject ? "host_object" : "host_llvm";
     if (emitObject) {
       if (output == "-") return fail("--emit-object requires -o FILE");
@@ -225,6 +278,11 @@ int main(int argc, char **argv) {
   }
   if (!emitObject)
     if (auto error = writeText(output, result)) return fail(toString(std::move(error)));
+  if (exportExternal) {
+    SmallString<256> manifest(exportDir);
+    sys::path::append(manifest, "manifest.json");
+    if (auto error = writeJSON(manifest, json::Value(json::Object(report)))) return fail(toString(std::move(error)));
+  }
   if (!reportPath.empty())
     if (auto error = writeJSON(reportPath, json::Value(std::move(report)))) return fail(toString(std::move(error)));
   return 0;

@@ -13,9 +13,14 @@
     "installed_wheel_revision_verified": false
   },
   "ask_reader": {
+    "version": "23.0.0git",
+    "revision": "1f126a6dea50d185c0781743a667390037ae88bd",
+    "observed_compatibility": "original LLVM text parsed and verified by opt",
+    "sdk_lock": "../../cmake/llvm.lock.json"
+  },
+  "previous_reader_result": {
     "version": "18.1.8",
-    "observed_compatibility": "rejected",
-    "first_diagnostic": "expected ')' at captures(none) in the entry parameter attributes"
+    "observed_compatibility": "rejected at captures(none); no compatibility rewrite performed"
   },
   "validation": {
     "public_api_export": "passed",

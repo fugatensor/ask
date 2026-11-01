@@ -1,4 +1,5 @@
 #include "ask/Lowering/Host.h"
+#include "ask/BuildConfig.h"
 #include "ask/IR/ASKOps.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -33,7 +34,7 @@ llvm::Expected<std::unique_ptr<llvm::TargetMachine>> makeHostMachine() {
   });
   if (unavailable)
     return error("LLVM was built without the native target or assembly printer");
-  std::string triple = llvm::sys::getDefaultTargetTriple();
+  llvm::Triple triple(llvm::sys::getDefaultTargetTriple());
   std::string reason;
   const llvm::Target *target = llvm::TargetRegistry::lookupTarget(triple, reason);
   if (!target)
@@ -64,13 +65,30 @@ llvm::Expected<uint64_t> elementCount(mlir::Type type) {
   return count;
 }
 
-llvm::json::Object describeArgument(mlir::Type type, unsigned argument) {
+std::string valueIdentity(mlir::Value value, mlir::func::FuncOp graph) {
+  if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
+    if (auto id = graph.getArgAttrOfType<mlir::StringAttr>(argument.getArgNumber(), "ask.value_id"))
+      return id.getValue().str();
+    return (graph.getSymName() + ".arg" + llvm::Twine(argument.getArgNumber())).str();
+  }
+  auto result = mlir::cast<mlir::OpResult>(value);
+  mlir::Operation *producer = result.getOwner();
+  if (auto id = producer->getAttrOfType<mlir::StringAttr>("ask.value_id"))
+    return id.getValue().str();
+  auto id = producer->getAttrOfType<mlir::StringAttr>("ask.id");
+  return (id.getValue() + ".result" + llvm::Twine(result.getResultNumber())).str();
+}
+
+llvm::json::Object describeArgument(mlir::Value value, mlir::func::FuncOp graph,
+                                   unsigned argument) {
+  mlir::Type type = value.getType();
   llvm::json::Array shape;
   auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
   if (tensor)
     for (int64_t dimension : tensor.getShape())
       shape.push_back(dimension);
   return llvm::json::Object{{"argument", int64_t(argument)},
+                            {"value_id", valueIdentity(value, graph)},
                             {"kind", tensor ? "tensor" : "scalar"},
                             {"dtype", "i32"}, {"shape", std::move(shape)}};
 }
@@ -93,6 +111,9 @@ llvm::Error validateFunction(mlir::func::FuncOp function) {
       if (!count)
         return count.takeError();
     }
+    if (op.getNumResults() && !op.getAttrOfType<mlir::StringAttr>("ask.value_id") &&
+        !op.getAttrOfType<mlir::StringAttr>("ask.id"))
+      return error("host lowering requires prepared result identities");
     if (mlir::isa<AddOp, MulOp>(op) &&
         (op.getOperand(0).getType() != op.getOperand(1).getType() ||
          op.getOperand(0).getType() != op.getResult(0).getType()))
@@ -107,13 +128,15 @@ llvm::Error validateFunction(mlir::func::FuncOp function) {
 llvm::Expected<std::unique_ptr<llvm::Module>>
 lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
                 llvm::json::Object &abiReport) {
+  if (!ASK_WITH_HOST)
+    return error("host code generation was disabled at build time");
   if (mlir::failed(mlir::verify(source)))
     return error("cannot lower invalid ASK IR");
   auto target = makeHostMachine();
   if (!target)
     return target.takeError();
   auto result = std::make_unique<llvm::Module>("ask.host", context);
-  result->setTargetTriple((*target)->getTargetTriple().str());
+  result->setTargetTriple((*target)->getTargetTriple());
   result->setDataLayout((*target)->createDataLayout());
   auto *i32 = llvm::Type::getInt32Ty(context);
   auto *pointer = llvm::PointerType::getUnqual(context);
@@ -148,18 +171,19 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       arguments[argument] = physical;
       if (physical->getType()->isPointerTy()) {
         physical->addAttr(llvm::Attribute::ReadOnly);
-        physical->addAttr(llvm::Attribute::NoCapture);
+        physical->addAttr(llvm::Attribute::getWithCaptureInfo(context, llvm::CaptureInfo::none()));
       }
-      inputs.push_back(describeArgument(argument.getType(), index));
+      inputs.push_back(describeArgument(argument, graph, index));
     }
     for (auto [index, type] : llvm::enumerate(graph.getResultTypes())) {
       unsigned physicalIndex = graph.getNumArguments() + index;
       auto *physical = function->getArg(physicalIndex);
       physical->setName("out" + std::to_string(index));
       physical->addAttr(llvm::Attribute::NoAlias);
-      physical->addAttr(llvm::Attribute::NoCapture);
+      physical->addAttr(llvm::Attribute::getWithCaptureInfo(context, llvm::CaptureInfo::none()));
       physical->addAttr(llvm::Attribute::WriteOnly);
-      outputs.push_back(describeArgument(type, physicalIndex));
+      auto returned = mlir::cast<mlir::func::ReturnOp>(graph.front().getTerminator());
+      outputs.push_back(describeArgument(returned.getOperand(index), graph, physicalIndex));
     }
 
     llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", function));
@@ -223,7 +247,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         {"name", graph.getSymName().str()}, {"calling_convention", "c"},
         {"inputs", std::move(inputs)}, {"outputs", std::move(outputs)},
         {"layout", "contiguous_row_major"}, {"minimum_alignment", 4},
-        {"requires_disjoint_outputs", true}});
+        {"requires_disjoint_outputs", true}, {"outputs_must_not_alias_inputs", true}});
   }
   if (functions.empty())
     return error("host lowering requires at least one graph function");
@@ -232,17 +256,24 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   if (llvm::verifyModule(*result, &stream))
     return error("host lowering produced invalid LLVM IR: " + stream.str());
   abiReport = llvm::json::Object{{"schema_version", 1},
-                                {"target_triple", result->getTargetTriple()},
+                                {"target_triple", result->getTargetTriple().str()},
                                 {"data_layout", result->getDataLayoutStr()},
                                 {"functions", std::move(functions)}};
+  std::string abiText;
+  llvm::raw_string_ostream abiStream(abiText);
+  abiStream << llvm::json::Value(llvm::json::Object(abiReport));
+  result->getOrInsertNamedMetadata("ask.abi")->addOperand(
+      llvm::MDNode::get(context, llvm::MDString::get(context, abiText)));
   return std::move(result);
 }
 
 llvm::Error emitHostObject(llvm::Module &module, llvm::StringRef path) {
+  if (!ASK_WITH_HOST)
+    return error("host code generation was disabled at build time");
   auto target = makeHostMachine();
   if (!target)
     return target.takeError();
-  if (module.getTargetTriple() != (*target)->getTargetTriple().str() ||
+  if (module.getTargetTriple() != (*target)->getTargetTriple() ||
       module.getDataLayout() != (*target)->createDataLayout())
     return error("host object emission requires the native triple and matching DataLayout; retargeting imported IR is not supported");
   std::string diagnostic;
