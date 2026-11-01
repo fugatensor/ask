@@ -19,6 +19,6 @@
   "verified": {
     "llvm_config_version": "23.0.0git",
     "triton_3_7_1_original_llvm_ir": "parse-and-verify-passed",
-    "gpu_execution": "not-run"
+    "gpu_execution": "passed: Triton/ASK fused LLIR -> llc -> ptxas -> RTX 3080, i32 numerical comparison"
   }
 }

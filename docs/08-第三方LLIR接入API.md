@@ -2,7 +2,7 @@
 
 [返回顶层设计：B 层](核心思想.md#ask-b) · [统一层的范围](核心思想.md#ask-architecture) · [文档索引](README.md)
 
-本篇定义拟实现的接口，代码是设计示例，目前没有可调用的 ASK SDK。LLIR 指原生 LLVM IR，允许包含目标 intrinsic 和 inline asm。第三方编译器使用 MLIR 时，由其导出路径生成原生 LLVM IR，再交给 ASK。
+本篇定义通用接入接口，其中代码是设计示例。已经实现的 SDK、Triton worker 和受限融合入口分别见[框架接入](10-上层框架接入.md)与[GPU 融合与缓存](12-GPU融合与IR缓存.md)。LLIR 指原生 LLVM IR，允许包含目标 intrinsic 和 inline asm。第三方编译器使用 MLIR 时，由其导出路径生成原生 LLVM IR，再交给 ASK。
 
 首期只实现 Triton 导出器。其他编译器先遵循同一个产物格式，不要求现在就解决所有工具链的导出问题。
 

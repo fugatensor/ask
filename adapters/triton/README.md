@@ -81,8 +81,26 @@ the installed wheel exposes or attests its own LLVM build revision.
 The pinned LLVM 23.0.0git SDK has parsed and verified the original real export.
 Fetch it with `python3 tools/fetch_llvm.py`; its URL, archive SHA256, revision and
 version are recorded in `cmake/llvm.lock.json`. Export and LLVM verification have
-been tested; ASK target code generation and GPU execution have not been claimed.
+been tested. The optional fusion path has also been recompiled through that SDK's
+`llc` and packaged `ptxas`, then executed on an RTX 3080 using the CUDA Driver API.
+See [GPU fusion and IR caching](../../docs/12-GPU融合与IR缓存.md) for the tested subset,
+numerical checks, and reproducible commands.
 
 LLVM 18.1.8 rejected the same artifact's `captures(none)` parameter attribute.
 The worker did not delete that attribute or rewrite the export to accommodate
 the older reader.
+
+## Optional boundary tracing
+
+An additional request field `"fusion": {"enabled": true}` asks the adapter to
+validate the canonical one-load/one-store pointwise i32 subset and insert two
+identity traces through public `tl.inline_asm_elementwise`. It compares the
+unmodified and traced kernels' blocked layouts and execution metadata. Ordinary
+export requests keep their existing behavior.
+
+The response includes `instrumented_source` and a versioned `fusion_contract`
+bound to original source, instrumented source and exact LLVM content hashes.
+The core checks typed boundary addresses/masks and inlines native ASK LLVM
+helpers. Original memory assembly is preserved; it is never decoded to guess
+access semantics. Traces are removed before final code generation. Unsupported
+DSL operations or compiler environment overrides fail explicitly.

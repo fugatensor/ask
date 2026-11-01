@@ -23,7 +23,7 @@ import sys
 import tempfile
 
 PROTOCOL_VERSION = 1
-ADAPTER_VERSION = "0.1.0"
+ADAPTER_VERSION = "0.2.0"
 SUPPORTED_TRITON_VERSION = "3.7.1"
 SUPPORTED_TARGET = {"backend": "cuda", "arch": 80, "warp_size": 32}
 
@@ -61,9 +61,13 @@ def validate_request(request):
     require(isinstance(request, dict), "request must be a JSON object")
     fields = {"protocol_version", "source", "entry", "signature",
               "source_bindings", "constants", "fixed_options", "target", "grid"}
-    require(set(request) == fields,
+    require(fields <= set(request) and set(request) <= fields | {"fusion"},
             f"request fields differ: missing={sorted(fields - set(request))}, "
-            f"unknown={sorted(set(request) - fields)}")
+            f"unknown={sorted(set(request) - fields - {'fusion'})}")
+    if "fusion" in request:
+        require(isinstance(request["fusion"], dict) and set(request["fusion"]) == {"enabled"}
+                and type(request["fusion"]["enabled"]) is bool,
+                "fusion must be exactly {enabled: true|false}")
     require(type(request["protocol_version"]) is int and
             request["protocol_version"] == PROTOCOL_VERSION,
             "only protocol_version=1 is supported", "ProtocolMismatch")
@@ -196,7 +200,8 @@ def probe():
     return {"protocol_version": PROTOCOL_VERSION, "compiler_id": "triton",
             "adapter_version": ADAPTER_VERSION, "triton_version": triton.__version__,
             "python_version": platform.python_version(), "formats": ["llvm-ir"],
-            "supported_target": SUPPORTED_TARGET, "device_execution_tested": False}
+            "supported_target": SUPPORTED_TARGET, "device_execution_tested": False,
+            "fusion_supported": True}
 
 
 def _header_tokens(header):
@@ -367,6 +372,18 @@ def build_artifact(request, compiled, triton_version, source_order):
 
 def export(request):
     request = validate_request(request)
+    fusion = None
+    instrumented_source = None
+    contract = None
+    if request.get("fusion", {}).get("enabled", False):
+        fusion_spec = importlib.util.spec_from_file_location(
+            "ask_triton_fusion", Path(__file__).with_name("fusion.py"))
+        fusion = importlib.util.module_from_spec(fusion_spec)
+        fusion_spec.loader.exec_module(fusion)
+        try:
+            instrumented_source, contract = fusion.instrument(request)
+        except fusion.FusionError as exc:
+            raise WorkerError("UnsupportedFusion", str(exc), "fusion") from exc
     triton, ASTSource, GPUTarget = load_triton()
     digest = hashlib.sha256(request["source"].encode("utf-8")).hexdigest()
     module_name = "ask_triton_" + digest
@@ -399,7 +416,31 @@ def export(request):
             require(compiled.src.signature == signature,
                     "compiled source signature differs from requested signature",
                     "ArtifactMismatch", "artifact")
-            return build_artifact(request, compiled, triton.__version__, runtime_names)
+            artifact = build_artifact(request, compiled, triton.__version__, runtime_names)
+            if fusion is None:
+                return artifact
+            trace_file = Path(directory) / "instrumented.py"
+            trace_file.write_text(instrumented_source, encoding="utf-8")
+            trace_name = module_name + "_trace"
+            trace_spec = importlib.util.spec_from_file_location(trace_name, trace_file)
+            trace_module = importlib.util.module_from_spec(trace_spec)
+            sys.modules[trace_name] = trace_module
+            try:
+                trace_spec.loader.exec_module(trace_module)
+                traced_function = getattr(trace_module, request["entry"])
+                traced = triton.compile(
+                    ASTSource(traced_function, signature, constexprs=request["constants"]),
+                    target=GPUTarget(**request["target"]), options=dict(request["fixed_options"]))
+                artifact = build_artifact(request, traced, triton.__version__, runtime_names)
+                try:
+                    artifact["fusion_contract"] = fusion.finalize_contract(
+                        contract, compiled, traced, artifact)
+                except fusion.FusionError as exc:
+                    raise WorkerError("UnsupportedFusion", str(exc), "fusion") from exc
+                artifact["instrumented_source"] = instrumented_source
+                return artifact
+            finally:
+                sys.modules.pop(trace_name, None)
         finally:
             sys.modules.pop(module_name, None)
 

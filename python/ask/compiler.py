@@ -75,6 +75,18 @@ class Compiler:
     def prepare(self, module: Module | str) -> PreparedModule:
         return self._process(module, ["--prepare"])
 
+    def compile_cuda(self, module: Module | str, *, cache_dir, output_dir,
+                     triton_python, triton_worker, llc, ptxas):
+        """Fuse the supported ASK→Triton→ASK graph and compile a fresh CUDA binary.
+
+        Explicit paths keep producer dependencies out of SDK import and builds
+        with no external compilers. See docs/12-GPU融合与IR缓存.md for the subset.
+        """
+        from .gpu import compile_graph
+        return compile_graph(self, module, cache_dir=cache_dir, output_dir=output_dir,
+                             triton_python=triton_python, triton_worker=triton_worker,
+                             llc=llc, ptxas=ptxas)
+
     def optimize(self, module: Module | str, *, fold_constants: bool = True,
                  eliminate_dead_code: bool = True,
                  fuse_elementwise: bool = True) -> PreparedModule:

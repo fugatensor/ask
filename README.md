@@ -2,7 +2,7 @@
 
 ASK 用 MLIR 的 `ask` dialect 接收上层框架生成的计算图，以原生 LLVM IR 承接低层产物。这个仓库已开始实现编译器初稿；当前入口是 Python SDK 和原生 `ask-opt`。
 
-目前可以构建、检查和准备单基本块的 i32 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。可选优化已支持常量折叠、死代码消除、自有逐元素多输出融合，以及原生 LLVM 基础清理。完整图运行时和跨编译器内核融合仍在设计中。
+目前可以构建、检查和准备单基本块的 i32 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。可选优化支持常量折叠、死代码消除、自有逐元素多输出融合，以及原生 LLVM 基础清理。另已跑通受限的一维 i32 ASK→Triton→ASK 融合：链接并内联原生 LLVM IR，重新生成 cubin，在 GPU 上执行；提供持久 IR 缓存和命中统计。支持范围及复现命令见[GPU 融合与 IR 缓存](docs/12-GPU融合与IR缓存.md)。完整混合图调度仍待实现。
 
 ## 构建
 
@@ -56,7 +56,7 @@ build/core/bin/ask-opt build/optimization-input.mlir --optimize --emit-llvm \
 build/core/bin/ask-opt build/optimized.ll --optimize-llir -o build/cleaned.ll
 ```
 
-融合计划由 host 后端落实为共享循环；外部算子仍保留边界。开关、形状和标记更新规则见[基础优化与逐元素融合](docs/11-基础优化与逐元素融合.md)。
+此处的融合计划由 host 后端落实为共享循环。跨 Triton 边界的 LLVM 融合通过独立的 `Compiler.compile_cuda` / `--fuse-external` 入口启用。开关、形状和标记更新规则见[基础优化与逐元素融合](docs/11-基础优化与逐元素融合.md)，GPU 数值验证见[可运行示例](examples/triton_fused_gpu.py)。
 
 ## 测试
 

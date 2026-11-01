@@ -3,6 +3,7 @@
 #include "ask/IR/ASKDialect.h"
 #include "ask/IR/ASKOps.h"
 #include "ask/LLIR/Import.h"
+#include "ask/LLIR/Fuse.h"
 #include "ask/LLIR/Optimize.h"
 #include "ask/Lowering/Host.h"
 #include "ask/Transforms/Optimize.h"
@@ -36,6 +37,7 @@ cl::opt<bool> checkLLIR("check-llir", cl::desc("parse and verify native LLVM ass
 cl::opt<bool> optimizeLLIR("optimize-llir", cl::desc("optimize native LLVM assembly with instcombine, simplifycfg and adce"));
 cl::opt<bool> capabilities("capabilities", cl::desc("print this build's capabilities as JSON"));
 cl::opt<bool> exportExternal("export-external", cl::desc("prepare and export external DSL to native LLVM IR artifacts"));
+cl::opt<bool> fuseExternal("fuse-external", cl::desc("export traced Triton LLIR and inline ASK pointwise LLVM helpers"));
 cl::opt<std::string> reportPath("report-json", cl::desc("write preparation/ABI report"));
 cl::opt<std::string> exportDir("export-dir", cl::desc("directory for external export artifacts"));
 cl::opt<std::string> tritonPython("triton-python", cl::desc("explicit Triton worker Python executable"));
@@ -99,6 +101,7 @@ json::Array externalRequests(mlir::ModuleOp module) {
       if (auto attr = impl->getAttr(key)) request[key] = attrJSON(attr);
     request["fixed_options"] = impl->getAttr("options")
         ? attrJSON(impl->getAttr("options")) : json::Value(json::Object{});
+    if (fuseExternal) request["fusion"] = json::Object{{"enabled", true}};
     request["compiler"] = attrJSON(impl->getAttr("compiler"));
     request["op_id"] = attrJSON(op->getAttr("ask.id"));
     request["function"] = op->getParentOfType<mlir::func::FuncOp>().getSymName();
@@ -121,7 +124,7 @@ Error validateExport(const json::Object &artifact, const json::Object &request) 
       artifact.getString("format") != "llvm-ir" || !nonempty(artifact, "payload") ||
       !nonempty(artifact, "entry") || !producer ||
       producer->getString("name") != "triton" || !nonempty(*producer, "version") ||
-      !target || !invocation || !specializations || !artifact.getArray("port_map") ||
+      !target || !invocation || !specializations || !artifact.getObject("validation") || !artifact.getArray("port_map") ||
       !artifact.getArray("dependencies"))
     return createStringError(inconvertibleErrorCode(), "worker response does not match ASK artifact protocol 1");
   auto matches = [](const json::Object &actual, const json::Object &expected, StringRef key) {
@@ -181,7 +184,7 @@ Error runExports(json::Array &requests, json::Object &report, StringRef executab
       return createStringError(inconvertibleErrorCode(), "export destination already contains %s artifacts; use a fresh directory", stem.c_str());
     json::Object workerRequest;
     for (StringRef key : {"protocol_version", "source", "entry", "signature",
-                          "source_bindings", "constants", "fixed_options", "target", "grid"})
+                          "source_bindings", "constants", "fixed_options", "target", "grid", "fusion"})
       if (auto *value = requests[index].getAsObject()->get(key))
         workerRequest[key] = *value;
     if (auto error = writeJSON(requestPath, json::Value(std::move(workerRequest)))) return error;
@@ -217,16 +220,18 @@ int main(int argc, char **argv) {
     if (ASK_WITH_TRITON) compilers.push_back("triton");
     json::Value result = json::Object{
         {"schema_version", 1}, {"ask_version", ASK_VERSION}, {"llvm_version", ASK_LLVM_VERSION},
+        {"llvm_revision", ASK_LLVM_REVISION},
         {"third_party_compilers", std::move(compilers)}, {"prepare", true},
         {"native_llvm_import", true}, {"host_codegen", bool(ASK_WITH_HOST)},
         {"ir_optimization", true}, {"elementwise_fusion", true}, {"llvm_optimization", true},
-        {"external_export", bool(ASK_WITH_TRITON)}, {"gpu_execution", false},
+        {"external_export", bool(ASK_WITH_TRITON)}, {"gpu_execution", bool(ASK_WITH_TRITON)},
+        {"triton_llir_fusion", bool(ASK_WITH_TRITON)}, {"cuda_execution_via_python", bool(ASK_WITH_TRITON)},
         {"supported_element_types", json::Array{"i32"}}};
     outs() << formatv("{0:2}\n", result);
     return 0;
   }
-  if (int(emitLLVM) + int(emitObject) + int(checkLLIR) + int(optimizeLLIR) + int(exportExternal) > 1)
-    return fail("select only one of --emit-llvm, --emit-object, --check-llir, --optimize-llir, --export-external");
+  if (int(emitLLVM) + int(emitObject) + int(checkLLIR) + int(optimizeLLIR) + int(exportExternal) + int(fuseExternal) > 1)
+    return fail("select only one of --emit-llvm, --emit-object, --check-llir, --optimize-llir, --export-external, --fuse-external");
   if ((noConstantFold || noDCE || noFusion) && !optimize)
     return fail("--no-constant-fold, --no-dce and --no-fusion require --optimize");
   if ((checkLLIR || optimizeLLIR) && (prepare || optimize))
@@ -259,7 +264,7 @@ int main(int argc, char **argv) {
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sources, &context);
   if (!module || mlir::failed(mlir::verify(*module))) return 1;
   json::Object report{{"schema_version", 1}, {"phase", "verified"}};
-  if (prepare || optimize || emitLLVM || emitObject || exportExternal) {
+  if (prepare || optimize || emitLLVM || emitObject || exportExternal || fuseExternal) {
     if (optimize) {
       ask::OptimizationOptions options;
       options.foldConstants = !noConstantFold;
@@ -272,14 +277,49 @@ int main(int argc, char **argv) {
     report["phase"] = optimize ? "optimized" : "prepared";
     report["external_requests"] = externalRequests(*module);
   }
-  if (exportExternal) {
+  if (exportExternal || fuseExternal) {
     std::string executable = sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main));
     if (auto error = runExports(*report.getArray("external_requests"), report, executable))
       return fail(toString(std::move(error)));
   }
   std::string result;
   raw_string_ostream stream(result);
-  if (emitLLVM || emitObject) {
+  if (fuseExternal) {
+    auto *artifacts = report.getArray("external_artifacts");
+    if (!artifacts || artifacts->size() != 1) return fail("fusion requires exactly one external artifact");
+    auto path = *(*artifacts)[0].getAsObject()->getString("artifact");
+    auto contents = MemoryBuffer::getFile(path);
+    if (!contents) return fail(contents.getError().message());
+    auto parsed = json::parse((*contents)->getBuffer());
+    if (!parsed) return fail(toString(parsed.takeError()));
+    LLVMContext llvmContext;
+    std::string helpers;
+    auto lowered = ask::llir::fuseExternal(*module, *parsed->getAsObject(), llvmContext, report, helpers);
+    if (!lowered) return fail(toString(lowered.takeError()));
+    std::string snapshot;
+    raw_string_ostream snapshotStream(snapshot);
+    snapshotStream << formatv("{0}", *report.get("shape_snapshot"));
+    (*lowered)->getOrInsertNamedMetadata("ask.shape_snapshot")->addOperand(
+        MDNode::get(llvmContext, MDString::get(llvmContext, snapshot)));
+    (*lowered)->print(stream, nullptr);
+    SmallString<256> helperPath(exportDir), fusedPath(exportDir);
+    sys::path::append(helperPath, "ask.helpers.ll");
+    sys::path::append(fusedPath, "fused.artifact.json");
+    if (auto e = writeText(helperPath, helpers)) return fail(toString(std::move(e)));
+    auto fused = *parsed->getAsObject();
+    fused["payload"] = result;
+    fused["fusion"] = *report.get("fusion");
+    fused["producer_validation"] = *fused.get("validation");
+    fused["validation"] = json::Object{{"llvm_module_verified", true},
+        {"device_execution_performed", false}, {"stage", "fused_llvm"}};
+    // Boundary attestation describes the original import. Keep it as provenance,
+    // never misrepresent it as an attestation for the transformed payload.
+    fused["source_fusion_contract"] = *fused.get("fusion_contract");
+    fused.erase("fusion_contract");
+    fused["shape_snapshot"] = *report.get("shape_snapshot");
+    if (auto e = writeJSON(fusedPath, json::Value(std::move(fused)))) return fail(toString(std::move(e)));
+    report["phase"] = "fused_llvm";
+  } else if (emitLLVM || emitObject) {
     if (!ASK_WITH_HOST) return fail("host code generation was disabled at build time");
     LLVMContext llvmContext;
     json::Object abi;
@@ -306,7 +346,7 @@ int main(int argc, char **argv) {
   }
   if (!emitObject)
     if (auto error = writeText(output, result)) return fail(toString(std::move(error)));
-  if (exportExternal) {
+  if (exportExternal || fuseExternal) {
     SmallString<256> manifest(exportDir);
     sys::path::append(manifest, "manifest.json");
     if (auto error = writeJSON(manifest, json::Value(json::Object(report)))) return fail(toString(std::move(error)));

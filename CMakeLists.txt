@@ -52,7 +52,7 @@ if("triton" IN_LIST ASK_ENABLED_COMPILERS)
   set(ASK_WITH_TRITON 1)
   file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/triton-environment.json" "${probe_output}")
   add_custom_target(ask_exporter_triton ALL SOURCES adapters/triton/worker.py)
-  install(FILES adapters/triton/worker.py DESTINATION ${CMAKE_INSTALL_DATADIR}/ask/adapters/triton COMPONENT CompilerTriton)
+  install(FILES adapters/triton/worker.py adapters/triton/fusion.py DESTINATION ${CMAKE_INSTALL_DATADIR}/ask/adapters/triton COMPONENT CompilerTriton)
 endif()
 
 set(ASK_WITH_HOST 0)
@@ -63,7 +63,7 @@ configure_file(cmake/BuildConfig.h.in generated/ask/BuildConfig.h @ONLY)
 
 add_library(ask_core STATIC
   lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp
-  lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/Lowering/Host.cpp
+  lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/Lowering/Host.cpp
   lib/Transforms/Optimize.cpp)
 add_library(ASK::Core ALIAS ask_core)
 target_compile_features(ask_core PUBLIC cxx_std_17)
@@ -80,7 +80,7 @@ target_compile_options(ask_core PUBLIC ${ASK_LLVM_DEFINITIONS})
 if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(ask_core PUBLIC $<$<CXX_COMPILER_ID:GNU,Clang>:-fno-rtti>)
 endif()
-llvm_map_components_to_libnames(ASK_LLVM_LIBS Core Support AsmParser BitReader BitWriter Analysis Target MC CodeGen native nativecodegen Passes InstCombine ScalarOpts TransformUtils)
+llvm_map_components_to_libnames(ASK_LLVM_LIBS Core Support AsmParser BitReader BitWriter Analysis Target MC CodeGen native nativecodegen Passes InstCombine ScalarOpts TransformUtils Linker)
 target_link_libraries(ask_core PUBLIC MLIRIR MLIRParser MLIRFuncDialect MLIRSideEffectInterfaces MLIRSupport ${ASK_LLVM_LIBS})
 
 add_executable(ask-opt tools/ask-opt.cpp)
@@ -115,6 +115,8 @@ if(BUILD_TESTING)
   if(ASK_WITH_TRITON)
     set_tests_properties(ask-triton-worker PROPERTIES ENVIRONMENT "ASK_TEST_TRITON_PYTHON=${ASK_TRITON_PYTHON_EXECUTABLE}")
     add_test(NAME ask-triton-pipeline COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_pipeline.py"
+      "$<TARGET_FILE:ask-opt>" "${ASK_TRITON_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/worker.py")
+    add_test(NAME ask-triton-fusion COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_fusion.py"
       "$<TARGET_FILE:ask-opt>" "${ASK_TRITON_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/worker.py")
   endif()
 endif()
