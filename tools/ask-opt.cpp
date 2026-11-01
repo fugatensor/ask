@@ -8,6 +8,7 @@
 #include "ask/LLIR/Fuse.h"
 #include "ask/LLIR/Optimize.h"
 #include "ask/Lowering/Host.h"
+#include "ask/Lowering/CUDA.h"
 #include "ask/Transforms/Optimize.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
@@ -36,6 +37,10 @@ cl::opt<bool> noDCE("no-dce", cl::desc("disable dead code elimination in --optim
 cl::opt<bool> noFusion("no-fusion", cl::desc("disable elementwise fusion in --optimize"));
 cl::opt<bool> emitLLVM("emit-llvm", cl::desc("prepare and lower self-owned graph to host LLVM IR"));
 cl::opt<bool> emitObject("emit-object", cl::desc("prepare and emit host object file"));
+cl::opt<bool> emitCUDALLVM("emit-cuda-llvm", cl::desc("prepare and lower self-owned graph to GPU LLVM IR"));
+cl::opt<unsigned> cudaArch("cuda-arch", cl::desc("explicit CUDA target architecture, e.g. 86 for sm86"), cl::init(0));
+cl::opt<unsigned> cudaBlockSize("cuda-block-size", cl::desc("threads per block for ASK-owned CUDA kernels"), cl::init(128));
+cl::opt<unsigned> cudaPTXVersion("cuda-ptx-version", cl::desc("PTX version for ASK-owned CUDA kernels"), cl::init(80));
 cl::opt<bool> checkLLIR("check-llir", cl::desc("parse and verify native LLVM assembly; write verified IR"));
 cl::opt<bool> optimizeLLIR("optimize-llir", cl::desc("optimize native LLVM assembly with instcombine, simplifycfg and adce"));
 cl::opt<bool> capabilities("capabilities", cl::desc("print this build's capabilities as JSON"));
@@ -288,8 +293,10 @@ int main(int argc, char **argv) {
     outs() << formatv("{0:2}\n", result);
     return 0;
   }
-  if (int(emitLLVM) + int(emitObject) + int(checkLLIR) + int(optimizeLLIR) + int(exportExternal) + int(fuseExternal) > 1)
-    return fail("select only one of --emit-llvm, --emit-object, --check-llir, --optimize-llir, --export-external, --fuse-external");
+  if (int(emitLLVM) + int(emitObject) + int(emitCUDALLVM) + int(checkLLIR) + int(optimizeLLIR) + int(exportExternal) + int(fuseExternal) > 1)
+    return fail("select only one of --emit-llvm, --emit-object, --emit-cuda-llvm, --check-llir, --optimize-llir, --export-external, --fuse-external");
+  if (!emitCUDALLVM && (cudaArch.getNumOccurrences() || cudaBlockSize.getNumOccurrences() || cudaPTXVersion.getNumOccurrences()))
+    return fail("--cuda-arch, --cuda-block-size and --cuda-ptx-version require --emit-cuda-llvm");
   if ((noConstantFold || noDCE || noFusion) && !optimize)
     return fail("--no-constant-fold, --no-dce and --no-fusion require --optimize");
   if ((checkLLIR || optimizeLLIR) && (prepare || optimize))
@@ -322,7 +329,7 @@ int main(int argc, char **argv) {
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sources, &context);
   if (!module || mlir::failed(mlir::verify(*module))) return 1;
   json::Object report{{"schema_version", 1}, {"phase", "verified"}};
-  if (prepare || optimize || emitLLVM || emitObject || exportExternal || fuseExternal) {
+  if (prepare || optimize || emitLLVM || emitObject || emitCUDALLVM || exportExternal || fuseExternal) {
     if (optimize) {
       ask::OptimizationOptions options;
       options.foldConstants = !noConstantFold;
@@ -401,6 +408,26 @@ int main(int argc, char **argv) {
     fused["shape_snapshot"] = *report.get("shape_snapshot");
     if (auto e = writeJSON(fusedPath, json::Value(std::move(fused)))) return fail(toString(std::move(e)));
     report["phase"] = "fused_llvm";
+  } else if (emitCUDALLVM) {
+    LLVMContext llvmContext;
+    json::Object artifact, lowering;
+    ask::CUDALoweringOptions options;
+    options.architecture = cudaArch;
+    options.blockSize = cudaBlockSize;
+    options.ptxVersion = cudaPTXVersion;
+    auto lowered = ask::lowerToCUDALLVM(*module, llvmContext, options, artifact, lowering);
+    if (!lowered) return fail(toString(lowered.takeError()));
+    std::string snapshotText;
+    raw_string_ostream snapshotStream(snapshotText);
+    snapshotStream << formatv("{0}", *report.get("shape_snapshot"));
+    (*lowered)->getOrInsertNamedMetadata("ask.shape_snapshot")->addOperand(
+        MDNode::get(llvmContext, MDString::get(llvmContext, snapshotText)));
+    (*lowered)->print(stream, nullptr);
+    artifact["payload"] = result;
+    artifact["shape_snapshot"] = *report.get("shape_snapshot");
+    report["cuda_artifact"] = std::move(artifact);
+    report["cuda_lowering"] = std::move(lowering);
+    report["phase"] = "cuda_llvm";
   } else if (emitLLVM || emitObject) {
     if (!ASK_WITH_HOST) return fail("host code generation was disabled at build time");
     LLVMContext llvmContext;

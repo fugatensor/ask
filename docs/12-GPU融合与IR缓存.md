@@ -64,7 +64,7 @@ Triton 3.7.1 适配器另外要求：
 
 这些条件由 `adapters/triton/` 检查。通用 CUDA 运行器不读取 N、BLOCK、warp 数或 scratch 名称，只读取规范执行契约：端口的 shape/dtype、参数绑定、三轴 grid/block、动态共享内存字节数和代码生成选项。它支持 64 位 `ptr` / `ptr addrspace(1)` 参数和显式 null，参数数目不固定为四个。静态共享内存来自 cubin，动态共享内存按加载后的函数限额检查；bf16 仍要求实际 GPU 的计算能力至少为 8.0。
 
-当前 `CUDAKernel` 高级入口仍只接受一个输入和一个输出，二者形状、dtype 相同，缓冲区连续且不重叠。它没有支持任意标量参数或多输入输出 ABI。设备张量可直接提交，也可用 Python 列表进行同步验证，详见[常驻运行时](16-Python绑定与常驻运行时.md)。
+本章融合图的单输入输出限制来自外部边界证明。公共 `CUDAKernel.prepare(...).submit_many(...)` 已支持多端口、不同 shape/dtype；[自有 GPU 图](19-自有GPU降级.md)直接使用这套 ABI。设备张量可直接提交，输入输出不得重叠。`kernel.run(values)` 仍是单输入单输出、相同 shape/dtype 的 Python 列表同步验证入口，详见[常驻运行时](16-Python绑定与常驻运行时.md)。
 
 ## 4. 框架怎样调用
 
@@ -88,13 +88,13 @@ print(execution["output"])
 print(kernel.cache["status"], kernel.cache["counters"])
 ```
 
-在源码树运行时设置 `PYTHONPATH=build/triton/python:python`，使 Python 能找到该构建的原生扩展和适配器注册表。Python SDK 本身不导入 Triton 或 CUDA。显式调用编译入口时先检查构建允许清单，`none` 构建在读缓存、启动 worker 前就拒绝请求。`run` 或创建 `ExecutionSession` 时才加载 CUDA driver；无需 PyTorch、NumPy 或 CUDA Python 包。
+在源码树运行时设置 `PYTHONPATH=build/triton/python:python`，使 Python 能找到该构建的原生扩展和适配器注册表。Python SDK 本身不导入 Triton 或 CUDA。显式调用外部编译入口时先检查构建允许清单，`none` 构建在读外部缓存、启动 worker 前就拒绝外部请求；无 external 的基础图走自有 GPU 路径，可以正常编译。`run` 或创建 `ExecutionSession` 时才加载 CUDA driver；无需 PyTorch、NumPy 或 CUDA Python 包。
 
 `kernel.run(values)` 从产物读取 dtype，选择对应的 1 / 2 / 4 / 8 字节编码。调用方无需挑选另一套执行函数。例如 `TensorType(shape, "bf16")` 配合 `graph.constant(value, dtype="bf16")`，Triton 签名写 `*bf16`；fp16 可写 `TensorType(shape, "fp16")`，会规范为 ASK `f16`，对应 Triton `*fp16`。完整类型规则见[框架接入](10-上层框架接入.md#dtype-path)。
 
 图中任何值使用 bf16，包括 f32 输入、bf16 中间值、f32 输出的情况，运行前都先读取实际设备的 compute capability；major 小于 8 就抛出带设备名称和能力版本的 `CUDAError`，同步 `run` 在创建 context 前检查；常驻 Session 在接收 bf16 张量或内核时检查，拒绝相应分配、加载或启动。缓存命中不能跳过这项检查。导出器和 ASK 代码生成也拒绝低于 sm80 的 bf16 编译目标。普通图按请求架构生成 PTX / cubin，不固定为 sm80。后端不认识目标、实际硬件缺少 bf16、cubin 不兼容分别报告，不静默改成 f32。
 
-`--capabilities` 中的 `gpu_execution` / `cuda_execution_via_python` 描述运行接口是否存在，不是 GPU 探测结果。基础运行时在 `none` 中也能加载独立产物；`external_export` / `external_llir_fusion` 表示构建是否包含相应入口；具体 compiler ID 及融合能力由 `compiler_adapters` 给出。`ask-opt` 本身没有 launch 命令，实际工具和设备是否可用由编译、运行时检查。
+`--capabilities` 中的 `gpu_execution` / `cuda_execution_via_python` 描述运行接口是否存在，不是 GPU 探测结果。基础运行时在 `none` 中也能加载独立产物，自有基础图还能直接编译到 CUDA，见[第 19 章](19-自有GPU降级.md)；`external_export` / `external_llir_fusion` 表示构建是否包含相应入口；具体 compiler ID 及融合能力由 `compiler_adapters` 给出。`ask-opt` 本身没有 launch 命令，实际工具和设备是否可用由编译、运行时检查。
 
 代码生成记录 LLVM / PTX / cubin 摘要。运行器核对输入 LLVM、调用产物和 cubin 的摘要，检查启动描述、设备能力，并查询加载后 kernel 的参数 ABI 和资源。兼容入口 `kernel.run(values)` 每次分配输入、输出，在独立 CUDA context 中启动并同步后读取结果。重复执行应使用 `kernel.prepare(session)` 和设备张量：模块、stream 与缓冲区常驻，`submit` 只入队，返回 Event；支持从 CUDA Array Interface 接入已有连续张量。提交失败不自动重放。资源所有权与跨 stream 顺序见[第 16 章](16-Python绑定与常驻运行时.md)。
 

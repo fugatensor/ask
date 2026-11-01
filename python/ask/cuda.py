@@ -12,6 +12,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import subprocess
 import tempfile
@@ -42,7 +43,7 @@ def _artifact_digest(artifact):
                               allow_nan=False).encode("utf-8"))
 
 
-def _contract(artifact):
+def _kernel_contract(artifact):
     """Validate the compiler-independent CUDA invocation schema (version 2).
 
     A producer adapter supplies concrete port shapes, pointer bindings, launch
@@ -79,14 +80,15 @@ def _contract(artifact):
                  and argument["argument"] == index and argument.get("llvm_type") in ("ptr", "ptr addrspace(1)"),
                  "invalid CUDA pointer argument mapping")
         binding = argument.get("binding")
-        _require(isinstance(binding, str) and binding in ("input:0", "output:0", "null"),
-                 "current CUDA runner accepts input:0/output:0 buffer bindings and explicit null pointers")
+        _require(isinstance(binding, str) and (binding == "null" or
+                 re.fullmatch(r"(?:input|output):(?:0|[1-9][0-9]*)", binding)),
+                 "CUDA bindings must name input:N/output:N buffers or explicit null pointers")
         if binding != "null":
             _require(binding not in bindings, "logical buffer is mapped to multiple kernel arguments")
             bindings[binding] = index
-    _require(set(bindings) == {"input:0", "output:0"}, "expected input:0 and output:0")
     ports = artifact.get("port_map")
-    _require(isinstance(ports, list) and len(ports) == 2, "two typed logical ports are required")
+    _require(isinstance(ports, list) and len(ports) == len(bindings),
+             "each non-null argument requires one typed logical port")
     logical_ports = {}
     for port in ports:
         _require(isinstance(port, dict), "logical ports must be objects")
@@ -105,11 +107,31 @@ def _contract(artifact):
                  (type(port["storage_bytes"]) is int and port["storage_bytes"] == width),
                  "port storage byte width disagrees with its element type")
         logical_ports[binding] = port
-    incoming, outgoing = logical_ports["input:0"], logical_ports["output:0"]
-    _require(incoming["element_type"] == outgoing["element_type"] and incoming["shape"] == outgoing["shape"],
-             "current CUDA runner requires matching input/output shapes and element types")
+    ordered = []
+    for kind in ("input", "output"):
+        group = [port for name, port in logical_ports.items() if name.startswith(kind + ":")]
+        _require(all(f"{kind}:{index}" in logical_ports for index in range(len(group))),
+                 f"CUDA {kind} port indices must be consecutive starting at zero")
+        ordered.append(tuple(logical_ports[f"{kind}:{index}"] for index in range(len(group))))
+    incoming, outgoing = ordered
+    _require(bool(outgoing), "CUDA graph requires at least one output")
     _fp_contract(artifact)
-    _required_types(artifact, incoming["element_type"])
+    _required_types(artifact)
+    return entry, invocation, incoming, outgoing
+
+
+def _contract(artifact):
+    """Compatibility contract for the one-input, same-type host-buffer runner.
+
+    Multi-port and mixed-storage kernels use PreparedCUDAKernel.submit_many.
+    Code generation itself accepts the complete normalized pointer ABI.
+    """
+    entry, invocation, inputs, outputs = _kernel_contract(artifact)
+    _require(len(inputs) == len(outputs) == 1,
+             "host-buffer execute requires one input and one output; use prepare().submit_many")
+    incoming, outgoing = inputs[0], outputs[0]
+    _require(incoming["element_type"] == outgoing["element_type"] and incoming["shape"] == outgoing["shape"],
+             "host-buffer execute requires matching input/output shapes and element types; use prepare().submit_many")
     return entry, invocation, math.prod(incoming["shape"]), incoming["element_type"]
 
 
@@ -163,12 +185,19 @@ def _check_device_dtype(dtype, major, minor, name):
                  f"selected device {name!r} has {major}.{minor}. No emulation fallback is enabled")
 
 
-def _required_types(artifact, dtype):
+def _required_types(artifact, dtype=None):
     required = artifact.get("required_element_types")
     _require(isinstance(required, list) and
              all(isinstance(value, str) and value in _STORAGE_TYPES for value in required),
              "normalized artifact requires explicit required_element_types")
-    return {dtype, *required}
+    return {*required, *(port["element_type"] for port in artifact["port_map"]),
+            *(() if dtype is None else (dtype,))}
+
+
+def _storage_dtype(inputs, outputs):
+    """Retain the old receipt field when every port uses one storage dtype."""
+    types = {port["element_type"] for port in (*inputs, *outputs)}
+    return next(iter(types)) if len(types) == 1 else None
 
 
 def _fp_contract(artifact, dtype=None):
@@ -202,7 +231,8 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=N
     artifact and materializes PTX, cubin and a receipt in the requested directory.
     No producer-supplied binary is reused. Cache counters describe this request.
     """
-    entry, invocation, _, dtype = _contract(artifact)
+    entry, invocation, inputs, outputs = _kernel_contract(artifact)
+    dtype = _storage_dtype(inputs, outputs)
     arch = artifact["target"]["arch"]
     required = _required_types(artifact, dtype)
     _require("bf16" not in required or arch >= 80, "bf16 compilation requires target sm80 or newer")

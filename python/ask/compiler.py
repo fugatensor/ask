@@ -112,19 +112,22 @@ class Compiler:
         return self._process(module, ["--prepare"])
 
     def compile_cuda(self, module: Module | str, *, cache_dir, output_dir,
-                     llc, ptxas, compilers=None, **legacy_environments):
-        """Compile an external graph using explicit registered compiler environments.
+                     llc, ptxas, compilers=None, target=None, block_size=128,
+                     ptx_version=80, **legacy_environments):
+        """Compile an ASK graph or a graph containing an external compiler node.
 
-        Explicit paths keep producer dependencies out of SDK import and builds
-        with no external compilers. See docs/12-GPU融合与IR缓存.md for the subset.
+        Pure ASK graphs need an explicit target (backend=cuda, arch=SM number)
+        and work in none builds. External nodes retain their compiler's target
+        and execution policy. No third-party compiler is loaded for a pure graph.
         """
         from .gpu import compile_graph
         # Check before cache lookup too: an IR hit must not mix the loaded
         # extension with another build's driver/toolchain fingerprint.
-        if self._native is not None and self.capabilities().get("third_party_compilers"):
+        if self._native is not None:
             self._check_companion()
         return compile_graph(self, module, cache_dir=cache_dir, output_dir=output_dir,
-                             compilers=compilers, llc=llc, ptxas=ptxas, **legacy_environments)
+                             compilers=compilers, llc=llc, ptxas=ptxas, target=target,
+                             block_size=block_size, ptx_version=ptx_version, **legacy_environments)
 
     def optimize(self, module: Module | str, *, fold_constants: bool = True,
                  eliminate_dead_code: bool = True,

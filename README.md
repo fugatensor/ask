@@ -2,7 +2,11 @@
 
 ASK 用 MLIR 的 `ask` dialect 接收上层框架生成的计算图，以原生 LLVM IR 承接低层产物。这个仓库已开始实现编译器初稿；当前入口是 Python SDK 和原生 `ask-opt`。
 
-目前可以构建、检查和准备单基本块的 bool / i32 / i64 / f32 / f16 / bf16 图，注册外部算子的语义与 Triton DSL，推导具体形状，并在导出追踪记录后删除 `ask.mark`。显式 `ask.cast` 支持六种类型互转及混合精度表达式。可选优化支持常量折叠、死代码消除、自有逐元素多输出融合，以及原生 LLVM 基础清理。这六种类型也已接通静态逐元素 ASK→Triton→ASK 融合：链接并内联原生 LLVM IR，重新生成 cubin，在 GPU 上执行；提供持久 IR / 可执行产物缓存及分别统计的命中次数。Python 通过 nanobind 调用 C++ 前端；设备张量、常驻 Session 和异步事件用于重复执行。支持范围及复现命令见[GPU 融合与 IR 缓存](docs/12-GPU融合与IR缓存.md)，显式 f32 中间计算见[类型转换与混合精度](docs/15-类型转换与混合精度.md)。完整混合图调度仍待实现。
+目前可以构建、检查和准备单基本块的 bool / i32 / i64 / f32 / f16 / bf16 图，推导具体形状，并在导出追踪记录后删除 `ask.mark`。显式 `ask.cast` 支持六种类型互转及混合精度表达式。基础优化包括常量折叠、死代码消除和逐元素计算合并。
+
+无 external 的基础图直接降到 CPU 代码或自有 CUDA kernel。`none` 构建也能编译并执行 GPU 图，不需要 Triton；支持多输入、多输出、不同输出类型、零维和空张量，详见[自有 GPU 降级](docs/19-自有GPU降级.md)。Python 通过 nanobind 调用 C++ 前端，设备张量、常驻 Session 和异步事件用于重复执行。
+
+图中明确提交 Triton DSL 时，还可以使用六类型静态逐元素 ASK→Triton→ASK 融合：链接并内联原生 LLVM IR，再生成 cubin。自有图和融合图都提供持久 IR / 可执行产物缓存及独立命中统计。外部融合范围见[GPU 融合与 IR 缓存](docs/12-GPU融合与IR缓存.md)，显式 f32 中间计算见[类型转换与混合精度](docs/15-类型转换与混合精度.md)。完整混合图调度仍待实现。
 
 ## 构建
 
@@ -21,7 +25,7 @@ build/core/bin/ask-opt --capabilities
 
 下载脚本取锁定的 Ubuntu x64 SDK。其他平台需要准备同一修订的 LLVM/MLIR，并将两个路径指向对应安装。
 
-`core` 使用 `ASK_THIRD_PARTY_COMPILERS=none`，不需要 Triton、NumPy 或 PyTorch。Python API 和 nanobind 绑定是基础组成，三种模式全部构建，不提供独立关闭选项。它仍能检查包含 `ask.external` 的图；真正请求编译外部 DSL 时才检查该编译器是否启用。第三方编译器可选择 `none`、`all` 或明确的名称，目标后端另外选择；当前后端选项只实现 `none` 和 `host`。见[构建说明](docs/09-构建与可选编译器.md)。
+`core` 使用 `ASK_THIRD_PARTY_COMPILERS=none`，不需要 Triton、NumPy 或 PyTorch。Python API 和 nanobind 绑定是基础组成，三种模式全部构建，不提供独立关闭选项。它仍能检查包含 `ask.external` 的图；真正请求编译外部 DSL 时才检查该编译器是否启用。第三方编译器可选择 `none`、`all` 或明确的名称。历史选项 `ASK_TARGET_BACKENDS=none|host` 只控制 host 目标文件生成；自有 CUDA LLVM 降级和运行时在三种编译器模式中都属于基础核心。见[构建说明](docs/09-构建与可选编译器.md)。
 
 第三方适配按 `adapters/<id>/` 集中存放：构建规则、worker、Python 策略、原生边界检查和专属测试都在该目录。公共核心通过显式注册接口调用它们，CUDA 运行时只读取标准化的参数与启动契约。新增编译器的文件和接口见[适配与注册](docs/17-第三方编译器适配与注册.md)；当前真实适配器仍只有 Triton。
 
@@ -46,7 +50,7 @@ build/core/bin/ask-opt tests/ir/pipeline.mlir \
 
 SDK 用法、当前支持范围和诊断处理见[上层框架接入](docs/10-上层框架接入.md)。架构设计从[核心思想](docs/核心思想.md)开始，分阶段说明见[文档目录](docs/README.md)。设计文档中的完整接口不等于当前版本已经实现的 API。
 
-低层还提供[通用 LLVM 值边界内联接口](docs/13-通用LLVM值边界内联.md)：接收已确认的边界和 typed helper，支持多参数、多站点、整数、浮点和定长向量，失败时保留输入模块。Triton 的源码、布局和启动检查放在适配器中。高层六种类型共用 `kernel.run(values)`，类型由 ASK IR 决定，见[类型传递](docs/10-上层框架接入.md#dtype-path)。bf16 会检查实际硬件支持，包括只在中间值使用 bf16 的图，不支持就报错。类型转换、CPU/GPU 检查与显式 f32 计算见[类型转换与混合精度](docs/15-类型转换与混合精度.md)。
+低层还提供[通用 LLVM 值边界内联接口](docs/13-通用LLVM值边界内联.md)：接收已确认的边界和 typed helper，支持多参数、多站点、整数、浮点和定长向量，失败时保留输入模块。Triton 的源码、布局和启动检查放在适配器中。六种类型由 ASK IR 决定，设备张量通过 `kernel.prepare(session).submit_many(inputs, outputs)` 提交。`kernel.run(values)` 保留为单输入单输出、相同 shape/dtype 的同步列表接口，见[类型传递](docs/10-上层框架接入.md#dtype-path)。bf16 会检查实际硬件支持，包括只在中间值使用 bf16 的图，不支持就报错。类型转换、CPU/GPU 检查与显式 f32 计算见[类型转换与混合精度](docs/15-类型转换与混合精度.md)。
 
 GPU 示例改为共用测试矩阵：`--dtypes bool i32 i64 f32 f16 bf16` 用同一组图验证六种类型和 6×6 转换方向，`--cases` 选图，`--extended` 增加形状与启动配置。host 和原生融合测试也复用该图构造器，规则和命令见[多精度测试](docs/14-多精度测试.md)。
 
@@ -89,7 +93,7 @@ build/core/bin/ask-opt build/optimization-input.mlir --optimize --emit-llvm \
 build/core/bin/ask-opt build/optimized.ll --optimize-llir -o build/cleaned.ll
 ```
 
-此处的融合计划由 host 后端落实为共享循环。跨 Triton 边界的 LLVM 融合通过独立的 `Compiler.compile_cuda` / `--fuse-external` 入口启用。开关、形状和标记更新规则见[基础优化与逐元素融合](docs/11-基础优化与逐元素融合.md)，GPU 数值验证见[可运行示例](examples/triton_fused_gpu.py)。
+此处的融合计划由 host 后端落实为共享循环。`Compiler.compile_cuda` 根据图是否含 external 选择自有 GPU 降级或外部融合；纯图不会加载适配器。跨 Triton 边界的 LLVM 融合也可以通过 `--fuse-external` 入口启用。开关、形状和标记更新规则见[基础优化与逐元素融合](docs/11-基础优化与逐元素融合.md)，GPU 数值验证见[可运行示例](examples/triton_fused_gpu.py)。
 
 ## 测试
 

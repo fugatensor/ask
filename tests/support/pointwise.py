@@ -35,11 +35,12 @@ def build_module(size: int | None = None, *, shape: tuple[int, ...] | None = Non
     types and ShapeSnapshot. BLOCK counts elements, not CUDA threads.
     """
     if shape is None:
-        if type(size) is not int or size < 1:
-            raise ValueError("provide a positive size or a concrete nonempty shape")
+        if type(size) is not int or size < 0 or (external and size == 0):
+            raise ValueError("provide a concrete size; external graphs require positive dimensions")
         shape = (size,)
-    if any(type(dimension) is not int or dimension < 1 for dimension in shape):
-        raise ValueError("shape dimensions must be positive integers")
+    if any(type(dimension) is not int or dimension < 0 or (external and dimension == 0)
+           for dimension in shape):
+        raise ValueError("shape dimensions must be nonnegative integers; external graphs require positive dimensions")
     elements = math.prod(shape)
     if size is not None and size != elements:
         raise ValueError("size must equal the product of shape dimensions")

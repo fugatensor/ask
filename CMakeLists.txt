@@ -74,7 +74,7 @@ configure_file(cmake/BuildConfig.h.in generated/ask/BuildConfig.h @ONLY)
 add_library(ask_core STATIC
   lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp lib/Frontend/Compiler.cpp
   lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/LLIR/Inline.cpp
-  lib/Lowering/Host.cpp
+  lib/Lowering/Host.cpp lib/Lowering/CUDA.cpp
   lib/Transforms/Optimize.cpp)
 add_library(ASK::Core ALIAS ask_core)
 target_compile_features(ask_core PUBLIC cxx_std_17)
@@ -183,6 +183,7 @@ if(BUILD_TESTING)
   add_test(NAME ask-python COMMAND "${Python_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/tests/python" -v)
   set_tests_properties(ask-python PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/python;ASK_OPT=$<TARGET_FILE:ask-opt>;ASK_NATIVE_REQUIRED=1")
   add_test(NAME ask-native COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native.py" "$<TARGET_FILE:ask-opt>")
+  add_test(NAME ask-cuda-lowering COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_cuda_lowering.py" "$<TARGET_FILE:ask-opt>")
   add_test(NAME ask-optimization COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_optimization.py" "$<TARGET_FILE:ask-opt>")
   add_test(NAME ask-fusion COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fusion.py" "$<TARGET_FILE:ask-opt>")
   add_test(NAME ask-llir-optimization COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_llir_optimization.py" "$<TARGET_FILE:ask-opt>")

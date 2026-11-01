@@ -2,7 +2,7 @@
 
 [返回顶层设计：执行流程](核心思想.md#ask-pipeline) · [构建选择](09-构建与可选编译器.md#core) · [框架接入](10-上层框架接入.md) · [GPU 编译](12-GPU融合与IR缓存.md) · [适配器注册](17-第三方编译器适配与注册.md)
 
-Python 负责构图和调用。`Compiler.prepare/optimize/capabilities` 以及 CUDA 资源管理通过 nanobind 调用 C++。冷编译的 GPU 融合流程由 Python 调用 `ask-opt`、外部 worker 和代码生成工具，仍包含这些子进程。Python 绑定属于 ASK 基础组成，`none/all/triton` 都包含它。编译外部 DSL 时，注册表按 compiler ID 选择 worker；当前真实适配器是 Triton，它仍使用独立 Python 环境。运行已经编译好的规范产物无需加载该适配器，`none` 构建也可执行。
+Python 负责构图和调用。`Compiler.prepare/optimize/capabilities` 以及 CUDA 资源管理通过 nanobind 调用 C++。冷编译的 GPU 流程由 Python 调用 `ask-opt` 和代码生成工具；只有图包含 external 时才调用外部 worker。纯 ASK 图在 `none` 构建中也能降级和执行，见[第 19 章](19-自有GPU降级.md)。Python 绑定属于 ASK 基础组成，`none/all/triton` 都包含它。编译外部 DSL 时，注册表按 compiler ID 选择 worker；当前真实适配器是 Triton，它仍使用独立 Python 环境。运行已经编译好的规范产物无需加载该适配器，`none` 构建也可执行。
 
 ## 1. 编译一次，加载一次，再重复提交
 
@@ -27,7 +27,7 @@ with ExecutionSession(device=0) as session:
 
 `prepare` 校验产物、LLVM 和 cubin 摘要，固定参数说明，再加载模块。之后 `submit` 检查张量的形状、类型、所属 Session 和读写条件，绑定设备地址并入队；不读取产物文件，不上传输入，不下载结果，也不创建上下文或重新分配 x/y。
 
-当前高级执行入口要求一个输入、一个同 shape/dtype 的输出，连续且不重叠。参数绑定来自产物，可以包含额外的 null 指针，不要求恰好四个参数，也不知道 scratch 名称。底层 Session 支持 1–64 个 64 位指针参数，类型为 LLVM `ptr` 或 `ptr addrspace(1)`；高级入口的输入、输出至少占两个参数。当前没有标量参数或任意多输入输出调度。`DeviceTensor` 支持多维形状；同样有 15 个元素的 `(15,)` 与 `(3, 5)` 不能混用。
+高级执行入口支持多个输入、多个输出，每个端口有独立 shape/dtype。使用 `executable.inputs/outputs` 读取端口说明，并通过 `submit_many(inputs, outputs)` 按逻辑顺序提交。端口采用连续布局，输出不能和任何输入或其他输出重叠；只有输入之间可以共享存储。单输入输出仍可调用 `submit(x, y)`。参数绑定来自产物，可以包含额外的 null 指针。底层 Session 支持 1–64 个 64 位指针参数，类型为 LLVM `ptr` 或 `ptr addrspace(1)`。自有图中的标量使用一个元素的缓冲区传递，当前没有按值标量参数或任意混合图调度。`DeviceTensor` 支持多维形状；同样有 15 个元素的 `(15,)` 与 `(3, 5)` 不能混用。
 
 运行器只读取规范执行字段：
 

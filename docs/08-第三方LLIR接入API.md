@@ -2,7 +2,7 @@
 
 [返回顶层设计：B 层](核心思想.md#ask-b) · [统一层的范围](核心思想.md#ask-architecture) · [文档索引](README.md)
 
-本篇说明产物契约。`LLIRArtifact`、`ImportResult` 和 `ask.llir.import_artifact` 是完整接口的设计示例，尚未成为 Python 类或方法；当前实现使用 JSON 产物、CLI worker 协议和 C++ 回调，代码接口及目录见[适配与注册](17-第三方编译器适配与注册.md)。已有 SDK 见[框架接入](10-上层框架接入.md)，GPU 入口见[融合与缓存](12-GPU融合与IR缓存.md)。LLIR 指原生 LLVM IR，允许包含目标 intrinsic 和 inline asm。第三方编译器使用 MLIR 时，由其导出路径生成原生 LLVM IR，再交给 ASK。
+本篇说明产物契约。`LLIRArtifact`、`ImportResult` 和 `ask.llir.import_artifact` 是完整接口的设计示例，尚未成为 Python 类或方法；当前实现使用 JSON 产物、CLI worker 协议和 C++ 回调，代码接口及目录见[适配与注册](17-第三方编译器适配与注册.md)。已有 SDK 见[框架接入](10-上层框架接入.md)，含 external 的 GPU 入口见[融合与缓存](12-GPU融合与IR缓存.md)，纯 ASK 图见[自有 GPU 降级](19-自有GPU降级.md)。LLIR 指原生 LLVM IR，允许包含目标 intrinsic 和 inline asm。第三方编译器使用 MLIR 时，由其导出路径生成原生 LLVM IR，再交给 ASK。
 
 首期只实现 Triton 导出器。其他编译器先遵循同一个产物格式，不要求现在就解决所有工具链的导出问题。
 

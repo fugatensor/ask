@@ -20,7 +20,19 @@ y = ft.tensor([10, 20, 30])
 print(calculate(x, y).tolist())  # [22.0, 44.0, 66.0]
 ```
 
-默认 dtype 为 f32、设备为 CPU。首次调用追踪 Python 函数，生成 `ask.add`、`ask.mul` 等操作，再用 ASK 生成本机目标文件并加载。相同形状、dtype 和静态参数的下一次调用直接执行已加载函数；换输入值不会重新追踪。CPU 支持多个张量输入与输出。
+默认 dtype 为 f32、设备为 CPU。首次调用追踪 Python 函数，生成 `ask.add`、`ask.mul` 等操作，再用 ASK 生成本机目标文件并加载。相同形状、dtype 和静态参数的下一次调用直接执行已加载函数；换输入值不会重新追踪。CPU 和自有 CUDA 图都支持多个张量输入与输出。
+
+## 同一张图在 GPU 上执行
+
+配置好 `llc`、`ptxas` 和 ASK 后，只需把输入放到 CUDA：
+
+```python
+x = ft.tensor([1, 2, 3], device="cuda")
+y = ft.tensor([10, 20, 30], device="cuda")
+print(calculate(x, y).tolist())  # [22.0, 44.0, 66.0]
+```
+
+这里仍是上面的 `calculate`，没有 Triton 代码或 external 节点。FugaTensor 提交相同的基础 ASK 图；ASK 为 GPU 生成索引、边界判断、访存和逐元素计算，再用自己的常驻 Session 执行。`ASK_THIRD_PARTY_COMPILERS=none` 即可使用。过程和依赖见[自有 GPU 降级](19-自有GPU降级.md)。
 
 ## 图中的 Triton 算子
 
@@ -50,11 +62,11 @@ print(mixed(x).tolist())  # [7.0, 9.0, 11.0]
 
 前后加法是 ASK 操作，`scale` 对应用户内核的 `ask.external`；换成用户写的其他合法算法，仍通过同一注册接口接入。FugaTensor 提交 DSL、语义、端口绑定和固定编译选项；ASK 的 Triton 适配器取得 LLVM IR 并证明值边界，通用内联 Pass 插入 ASK helper，然后重新生成 cubin。FugaTensor 复用 ASK 的常驻 Session 提交设备张量，`tolist()` 等待并下载结果。
 
-目前这条 CUDA 高层入口要求一个输入、一个同形状同存储类型输出和一个 external。纯 ASK CUDA 图的 lowering 尚未实现，超出范围会明确报错。fp16/bf16 存储可以在图中显式转为 f32 计算再转回；实际硬件检查沿用 ASK。
+目前 external 融合入口仍要求一个输入、一个同形状同存储类型输出和一个 external。这个限制只属于外部融合路径；自有 GPU 图可有多个输入和输出，各端口保留自己的形状与类型。fp16/bf16 存储可以在图中显式转为 f32 计算再转回；实际硬件检查沿用 ASK。
 
 ## 配置、测试和检查产物
 
-`ft.configure(device=..., ...)` 或环境变量负责设置 ASK CLI、worker、`llc` 和 `ptxas`；普通张量调用不重复传工具路径。无显式配置时，CPU 采用已安装 ASK 的配套工具。详细命令在 FugaTensor 的 `README.md`，直接可读的创建与计算用例在 `tests/test_quickstart.py`，完整演示为 `examples/jit_demo.py`。
+`ft.configure(device=..., ...)` 或环境变量负责设置 ASK CLI、`llc` 和 `ptxas`；只有使用外部编译器时才需要设置相应 worker。普通张量调用不重复传工具路径。无显式配置时，CPU 采用已安装 ASK 的配套工具。详细命令在 FugaTensor 的 `README.md`，直接可读的创建与计算用例在 `tests/test_quickstart.py`，完整演示为 `examples/jit_demo.py`。
 
 `function.last_ir` 显示提交给 ASK 的高层图；`last_report` 保留编译报告；`last_artifact_dir` 定位目标文件、LLVM 或 cubin。`cache_info()` 统计 FugaTensor 内存特化缓存，ASK 的 IR 与可执行磁盘缓存仍分别记在 GPU 报告里。CPU 当前没有跨进程持久代码缓存。
 

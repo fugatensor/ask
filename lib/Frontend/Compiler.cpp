@@ -78,6 +78,7 @@ llvm::json::Object compilerCapabilities() {
       {"prepare", true}, {"native_llvm_import", true}, {"host_codegen", bool(ASK_WITH_HOST)},
       {"ir_optimization", true}, {"elementwise_fusion", true}, {"llvm_optimization", true},
       {"external_export", hasCompilers}, {"gpu_execution", true},
+      {"cuda_lowering", true}, {"cuda_graph_codegen", true},
       {"external_llir_fusion", supportsFusion}, {"cuda_execution_via_python", true},
       {"supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
       {"explicit_cast", true}, {"mixed_precision", true},
