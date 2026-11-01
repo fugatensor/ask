@@ -113,6 +113,55 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     equivalent["fusion_contract"]["llir_sha256"] = hashlib.sha256(equivalent["payload"].encode()).hexdigest()
     replay("equivalent-predicate", equivalent, None)
 
+    # f32 uses typed pointer metadata and float LLVM marker values. The
+    # pointer-only CUDA entry ABI stays identical to the integer case.
+    float_graph = source.replace("i32", "f32").replace("*f32", "*fp32").replace(
+        "value = 1 : f32", "value = 1.0 : f32").replace(
+        "value = 3 : f32", "value = 3.0 : f32").replace(
+        ', overflow = "wrap"', "").replace("x * 2", "x * 1.25 + 0.1")
+    floating = fuse("float", float_graph)
+    float_ir = (floating / "fused.ll").read_text()
+    float_helpers = (floating / "exports/ask.helpers.ll").read_text()
+    float_artifact = json.loads((floating / "exports/external-0.artifact.json").read_text())
+    float_report = json.loads((floating / "report.json").read_text())
+    assert float_report["fusion"]["dtype"] == "f32"
+    assert "fadd float" in float_helpers and "contract" not in float_helpers
+    assert "fadd contract float" in float_ir and "fmul contract float" in float_ir
+    assert "ASK_BOUNDARY" not in float_ir
+    assert float_artifact["fusion_contract"]["dtype"] == "f32"
+    assert all(p["element_type"] == "f32" for p in float_artifact["port_map"])
+
+    bad = copy.deepcopy(float_artifact)
+    bad["fusion_contract"]["dtype"] = "i32"
+    replay("float-graph-dtype", bad, "dtype does not match", float_graph)
+    bad = copy.deepcopy(float_artifact)
+    bad["port_map"][0]["element_type"] = "i32"
+    replay("float-port-dtype", bad, "port element type", float_graph)
+    bad = copy.deepcopy(float_artifact)
+    bad["fusion_contract"]["input"]["arguments"]["value"] = 0
+    replay("float-marker-argument-map", bad, "argument mapping", float_graph)
+    bad = copy.deepcopy(float_artifact)
+    bad["payload"], changed = re.subn(r'("=f,r,f,l,r"\(i32 %[^,]+, )float %[^,]+',
+                                       r'\1i32 0', bad["payload"])
+    assert changed
+    bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
+    replay("float-marker-value-type", bad, "malformed ASK boundary marker", float_graph)
+    bad = copy.deepcopy(float_artifact)
+    bad["fusion_contract"]["numerics"]["enable_fp_fusion"] = False
+    replay("float-numerical-policy", bad, "numerical policy", float_graph)
+
+    no_contract_graph = float_graph.replace("options = {num_warps = 4 : i64}",
+                                           "options = {num_warps = 4 : i64, enable_fp_fusion = false}")
+    no_contract = fuse("float-no-contract", no_contract_graph)
+    no_contract_ir = (no_contract / "fused.ll").read_text()
+    assert "fmul float" in no_contract_ir and "fadd float" in no_contract_ir
+    assert "contract float" not in no_contract_ir
+    bad = json.loads((no_contract / "exports/external-0.artifact.json").read_text())
+    assert "fmul float" in bad["payload"]
+    bad["payload"] = bad["payload"].replace("fmul float", "fmul contract float", 1)
+    bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
+    replay("float-disabled-contraction-flag", bad, "despite enable_fp_fusion=false", no_contract_graph)
+
     # BLOCK > physical threads creates two value sites per logical boundary.
     # N=19 also makes one masked lane group normalize to a sign-bit expression.
     multiple = source.replace("tensor<10xi32>", "tensor<19xi32>").replace(
@@ -122,4 +171,4 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     multi_report = json.loads((multi / "report.json").read_text())
     assert multi_report["fusion"]["removed_boundary_markers"] == 4
     assert "ASK_BOUNDARY" not in (multi / "fused.ll").read_text()
-    print("Native LLVM fusion verified including equivalent masks and multiple sites; 12 inconsistent requests rejected")
+    print("Native LLVM fusion verified for i32/f32, producer contraction, equivalent masks and multiple sites; inconsistent requests rejected")

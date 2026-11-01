@@ -203,6 +203,55 @@ bool straightLine(const llvm::Function &function) {
       if (!straightLine(*call->getCalledFunction())) return false;
   return true;
 }
+
+bool usesFloatingPoint(const llvm::Function &function,
+                       llvm::SmallPtrSetImpl<const llvm::Function *> &visited) {
+  if (!visited.insert(&function).second) return false;
+  auto floating = [](llvm::Type *type) { return type->getScalarType()->isFloatingPointTy(); };
+  if (floating(function.getReturnType())) return true;
+  for (const auto &argument : function.args())
+    if (floating(argument.getType())) return true;
+  for (const auto &block : function)
+    for (const auto &instruction : block) {
+      if (floating(instruction.getType())) return true;
+      for (const auto &operand : instruction.operands())
+        if (floating(operand->getType())) return true;
+      if (const auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction))
+        if (usesFloatingPoint(*call->getCalledFunction(), visited)) return true;
+    }
+  return false;
+}
+
+llvm::Error checkConsumerNumerics(const llvm::Function &consumer,
+                                  const llvm::Function &helper) {
+  // The helper may return an integer after doing floating-point work. Checking
+  // only the marker's result type would miss conversions and nested helpers.
+  llvm::SmallPtrSet<const llvm::Function *, 16> visited;
+  if (!usesFloatingPoint(helper, visited)) return llvm::Error::success();
+  if (consumer.hasFnAttribute(llvm::Attribute::StrictFP))
+    return error("floating helper cannot inherit consumer strictfp semantics");
+  for (llvm::StringRef name : {"unsafe-fp-math", "no-nans-fp-math", "no-infs-fp-math",
+                               "no-signed-zeros-fp-math", "approx-func-fp-math",
+                               "less-precise-fpmad"}) {
+    auto attribute = consumer.getFnAttribute(name);
+    if (attribute.isValid() && attribute.getValueAsString() != "false")
+      return error("floating helper cannot inherit consumer numerical attribute: " + name);
+  }
+  for (llvm::StringRef name : {"denormal-fp-math", "denormal-fp-math-f32"}) {
+    auto attribute = consumer.getFnAttribute(name);
+    if (attribute.isValid() && attribute.getValueAsString() != "ieee" &&
+        attribute.getValueAsString() != "ieee,ieee")
+      return error("floating helper cannot inherit consumer numerical attribute: " + name);
+  }
+  auto trapping = consumer.getFnAttribute("no-trapping-math");
+  if (trapping.isValid() && trapping.getValueAsString() != "true")
+    return error("floating helper cannot inherit consumer numerical attribute: no-trapping-math");
+  auto contraction = consumer.getFnAttribute("fp-contract");
+  if (contraction.isValid() && contraction.getValueAsString() != "off" &&
+      contraction.getValueAsString() != "on")
+    return error("floating helper cannot inherit consumer numerical attribute: fp-contract");
+  return llvm::Error::success();
+}
 } // namespace
 
 llvm::Expected<std::unique_ptr<llvm::Module>>
@@ -229,6 +278,8 @@ inlineValueBoundaries(const llvm::Module &consumer, const llvm::Module &helpers,
       return error("boundary must identify a unique numeric identity call and a defined helper");
     if (site.helper->getReturnType() != site.marker->getType() ||
         site.helper->arg_size() != site.arguments.size()) return error("boundary/helper signature mismatch");
+    if (auto e = checkConsumerNumerics(*site.marker->getFunction(), *site.helper))
+      return std::move(e);
     llvm::DominatorTree dominators(*site.marker->getFunction());
     for (size_t i = 0; i < site.arguments.size(); ++i)
       if (!available(site.arguments[i], site.marker, dominators) ||

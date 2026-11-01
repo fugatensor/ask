@@ -1,6 +1,8 @@
 """CUDA contract and artifact checks; these tests never require a GPU or Triton."""
 import copy
+import ctypes
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
@@ -10,17 +12,20 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
-from ask.cuda import CUDAError, compile_cuda, execute_i32
+from ask.cuda import CUDAError, compile_cuda, execute, execute_i32, _host_buffers
 
 
-def artifact(size=10, *, block=128, num_warps=4):
+def artifact(size=10, *, block=128, num_warps=4, dtype="i32"):
     return {
         "format": "llvm-ir", "entry": "scale2", "payload": "define void @fixture() { ret void }\n",
         "target": {"backend": "cuda", "arch": 80, "warp_size": 32},
         "specializations": {"constants": {"N": size, "BLOCK": block}},
+        "port_map": [{"argument": 0, "logical_port": "input:0", "element_type": dtype},
+                     {"argument": 1, "logical_port": "output:0", "element_type": dtype}],
         "invocation": {"kind": "cuda-kernel", "version": 1,
                        "grid": [max(1, (size + block - 1) // block), 1, 1], "block": [num_warps * 32, 1, 1],
                        "num_warps": num_warps, "num_ctas": 1, "shared_bytes": 0,
+                       "compiler_metadata": {"enable_fp_fusion": True, "enable_reflect_ftz": True},
                        "arguments": [
                            {"argument": 0, "binding": "input:0", "llvm_type": "ptr addrspace(1)"},
                            {"argument": 1, "binding": "output:0", "llvm_type": "ptr addrspace(1)"},
@@ -54,7 +59,8 @@ class CUDAContractTests(unittest.TestCase):
             result = self.compile_fixture(directory, value)
             self.assertEqual(result["commands"][0][1:4],
                              ["-march=nvptx64", "-mcpu=sm_80", "-mattr=+ptx80"])
-            self.assertEqual(result["commands"][0][4], str(directory / "source.ll"))
+            self.assertEqual(result["commands"][0][4], "--fp-contract=on")
+            self.assertEqual(result["commands"][0][5], str(directory / "source.ll"))
             self.assertEqual(result["commands"][1][1], "--gpu-name=sm_80")
             self.assertFalse(result["original_triton_binary_used"])
             self.assertEqual(json.loads((directory / "codegen/codegen.json").read_text()), result)
@@ -109,6 +115,13 @@ class CUDAContractTests(unittest.TestCase):
             lambda a: a.update(specializations=None),
             lambda a: a["invocation"]["arguments"][0].update(binding={}),
             lambda a: a.pop("payload"),
+            lambda a: a.pop("port_map"),
+            lambda a: a["port_map"][0].update(element_type="f64"),
+            lambda a: a["port_map"][0].update(element_type=[]),
+            lambda a: a["port_map"][0].update(element_type="f32"),
+            lambda a: a["port_map"][0].update(argument=True),
+            lambda a: a["port_map"][0].update(logical_port="output:0"),
+            lambda a: a.update(source_fusion_contract={"dtype": "f32"}),
         ]
         for index, change in enumerate(changes):
             with self.subTest(case=index), patch("ask.cuda._Driver") as driver:
@@ -155,6 +168,74 @@ class CUDAContractTests(unittest.TestCase):
                 with self.assertRaises(CUDAError):
                     execute_i32(artifact(), {}, values)
                 driver.assert_not_called()
+
+    def test_float_buffers_round_once_and_preserve_special_values(self):
+        values = [1.0 + 2**-24, 1.0 + 3 * 2**-24, -0.0, 2**-149,
+                  float("inf"), float("-inf"), float("nan")]
+        source, destination = _host_buffers(values, len(values), "f32")
+        self.assertEqual(ctypes.sizeof(source), len(values) * 4)
+        self.assertEqual(list(source)[:2], [1.0, 1.0 + 2**-22])
+        self.assertEqual(math.copysign(1.0, source[2]), -1.0)
+        self.assertEqual(source[3], 2**-149)
+        self.assertEqual(list(source)[4:6], [float("inf"), float("-inf")])
+        self.assertTrue(math.isnan(source[6]))
+        self.assertEqual(list(destination), [0.0] * len(values))
+
+    def test_large_integer_input_does_not_round_through_binary64(self):
+        # This is just above an f32 midpoint. Converting it to Python float
+        # first would erase +1 and incorrectly round the midpoint down.
+        value = 2**100 + 2**76 + 1
+        source, _ = _host_buffers([value], 1, "f32")
+        self.assertEqual(source[0], float(2**100 + 2**77))
+
+    def test_invalid_float_input_and_integer_wrapper_reject_before_driver(self):
+        for values in ([True], ["1.0"], [1e100], [10**1000]):
+            with self.subTest(values=values), patch("ask.cuda._Driver") as driver:
+                with self.assertRaises(CUDAError):
+                    execute(artifact(1, dtype="f32"), {}, values)
+                driver.assert_not_called()
+        with patch("ask.cuda._Driver") as driver:
+            with self.assertRaisesRegex(CUDAError, "execute_i32 requires"):
+                execute_i32(artifact(1, dtype="f32"), {}, [1])
+            driver.assert_not_called()
+
+    def test_float_codegen_and_dtype_tampering(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            value = artifact(1, dtype="f32")
+            result = self.compile_fixture(Path(temporary), value)
+            self.assertEqual(result["element_type"], "f32")
+            result["element_type"] = "i32"
+            with patch("ask.cuda._Driver") as driver:
+                with self.assertRaisesRegex(CUDAError, "contracts disagree"):
+                    execute(value, result, [1.0])
+                driver.assert_not_called()
+
+    def test_float_codegen_preserves_raw_and_fused_contraction_policies(self):
+        for fused in (False, True):
+            for enabled in (False, True):
+                with self.subTest(fused=fused, enabled=enabled), tempfile.TemporaryDirectory() as temporary:
+                    value = artifact(1, dtype="f32")
+                    metadata = value["invocation"]["compiler_metadata"]
+                    metadata["enable_fp_fusion"] = enabled
+                    if fused:
+                        value["validation"] = {"stage": "fused_llvm", "llvm_module_verified": True}
+                        value["source_fusion_contract"] = {"dtype": "f32", "numerics": dict(metadata)}
+                        value["fusion"] = {
+                            "ask_numerics": "f32-rne-no-fast-math-no-contract",
+                            "producer_numerics": {
+                                "producer_enable_fp_fusion": enabled, "producer_enable_reflect_ftz": True,
+                                "representation": "original-F-instruction-contract-flags"}}
+                    result = self.compile_fixture(Path(temporary), value)
+                    expected = "on" if fused else "fast" if enabled else "off"
+                    self.assertEqual(result["fp_contract"], expected)
+                    self.assertIn("--fp-contract=" + expected, result["commands"][0])
+                    if fused:
+                        value["fusion"]["producer_numerics"]["producer_enable_fp_fusion"] = not enabled
+                        with patch("ask.cuda.subprocess.run") as compiler:
+                            with self.assertRaisesRegex(CUDAError, "normalization"):
+                                compile_cuda(Path(temporary) / "source.ll", value, Path(temporary) / "bad",
+                                             llc="/test/llc", ptxas="/test/ptxas")
+                            compiler.assert_not_called()
 
     def test_compiler_failure_has_no_success_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:

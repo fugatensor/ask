@@ -32,7 +32,7 @@ std::string printAttribute(Attribute attribute) {
 bool isConcrete(Type type) {
   if (auto tensor = dyn_cast<RankedTensorType>(type))
     return tensor.hasStaticShape();
-  return type.isSignlessInteger(32);
+  return isSupportedElementType(type);
 }
 
 LogicalResult checkSize(Operation *owner, Type type) {
@@ -221,7 +221,7 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
     for (auto [index, argument] : llvm::enumerate(function.getArguments())) {
       if (!isSupportedValueType(argument.getType()) || !isConcrete(argument.getType()))
         return function.emitOpError() << "input " << index
-             << " requires a concrete ranked i32 tensor or i32 scalar; result constraints cannot supply unknown input dimensions";
+             << " requires a concrete ranked i32/f32 tensor or scalar; result constraints cannot supply unknown input dimensions";
       if (failed(checkSize(function, argument.getType())))
         return failure();
       auto declaredId = function.getArgAttrOfType<StringAttr>(index, "ask.value_id");
@@ -369,7 +369,7 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
         bindings.push_back(llvm::json::Object{
             {"function", function.getSymName().str()}, {"value_id", identity},
             {"rank", tensor.getRank()}, {"shape", shapeArray(tensor)},
-            {"element_type", "i32"}, {"type", type}});
+            {"element_type", printType(tensor.getElementType())}, {"type", type}});
       }
       if (input)
         specializations.push_back(llvm::json::Object{

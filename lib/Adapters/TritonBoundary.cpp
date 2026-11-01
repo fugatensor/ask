@@ -42,9 +42,9 @@ llvm::Error proveMasks(llvm::Module &module, llvm::Function &entry,
     for (auto *site : *group) {
       auto *copy = llvm::cast<llvm::CallInst>(mapping.lookup(site));
       llvm::IRBuilder<> builder(copy);
-      auto *expected = builder.CreateZExt(builder.CreateICmpSLT(copy->getArgOperand(2),
+      auto *expected = builder.CreateZExt(builder.CreateICmpSLT(copy->getArgOperand(boundaries.indexArgument),
                                        builder.getInt32(n)), builder.getInt32Ty());
-      auto *equal = builder.CreateICmpEQ(copy->getArgOperand(3), expected);
+      auto *equal = builder.CreateICmpEQ(copy->getArgOperand(boundaries.maskArgument), expected);
       checks.emplace_back(builder.CreateCall(sink, {equal}));
     }
   }
@@ -88,8 +88,15 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
       contract->getString("protocol") != "ask.triton.boundary.v1" ||
       producer->getString("name") != "triton" || producer->getString("version") != "3.7.1" ||
       contract->getString("llir_sha256") != digest(*payload) ||
-      contract->getString("entry") != entryName || contract->getString("dtype") != "i32")
+      contract->getString("entry") != entryName)
     return error("missing or inconsistent Triton boundary contract / LLVM digest");
+  auto dtype = contract->getString("dtype");
+  if (dtype != "i32" && dtype != "f32")
+    return error("unsupported Triton boundary dtype");
+  llvm::Type *valueType = dtype == "f32" ? llvm::Type::getFloatTy(m.getContext())
+                                        : llvm::Type::getInt32Ty(m.getContext());
+  llvm::StringRef constraints = dtype == "f32" ? "=f,r,f,l,r" : "=r,r,l,r,r";
+  uint64_t elementBytes = m.getDataLayout().getTypeStoreSize(valueType).getFixedValue();
   auto *proof = contract->getObject("proof");
   if (!proof || proof->getInteger("input_loads") != 1 || proof->getInteger("output_stores") != 1)
     return error("boundary contract lacks complete input/output coverage");
@@ -141,21 +148,27 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   m.setTargetTriple(llvm::Triple("nvptx64-nvidia-cuda"));
 
   TritonBoundaries result;
+  if (dtype == "f32") {
+    result.valueArgument = 1;
+    result.addressArgument = 2;
+    result.indexArgument = 0;
+  }
   llvm::SmallVector<llvm::CallInst *> *sites[] = {&result.inputs, &result.outputs};
-  const char *asmText[] = {"// ASK_BOUNDARY_INPUT_V1\nmov.b32 $0, $1;",
-                          "// ASK_BOUNDARY_OUTPUT_V1\nmov.b32 $0, $1;"};
+  std::string asmText[] = {"// ASK_BOUNDARY_INPUT_V1\nmov.b32 $0, $",
+                           "// ASK_BOUNDARY_OUTPUT_V1\nmov.b32 $0, $"};
+  for (auto &text : asmText) text += std::to_string(result.valueArgument + 1) + ";";
   for (auto &bb : *entry) for (auto &instruction : bb) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
     if (!call || !call->isInlineAsm()) continue;
     auto *assembly = llvm::cast<llvm::InlineAsm>(call->getCalledOperand());
     for (unsigned i = 0; i < 2; ++i) {
       if (assembly->getAsmString() != asmText[i]) continue;
-      if (assembly->getConstraintString() != "=r,r,l,r,r" || !assembly->hasSideEffects() ||
-          call->arg_size() != 4 || !call->getType()->isIntegerTy(32) ||
-          !call->getArgOperand(0)->getType()->isIntegerTy(32) ||
-          !call->getArgOperand(1)->getType()->isPointerTy() ||
-          !call->getArgOperand(2)->getType()->isIntegerTy(32) ||
-          !call->getArgOperand(3)->getType()->isIntegerTy(32))
+      if (assembly->getConstraintString() != constraints || !assembly->hasSideEffects() ||
+          call->arg_size() != 4 || call->getType() != valueType ||
+          call->getArgOperand(result.valueArgument)->getType() != valueType ||
+          !call->getArgOperand(result.addressArgument)->getType()->isPointerTy() ||
+          !call->getArgOperand(result.indexArgument)->getType()->isIntegerTy(32) ||
+          !call->getArgOperand(result.maskArgument)->getType()->isIntegerTy(32))
         return error("malformed ASK boundary marker");
       sites[i]->push_back(call);
     }
@@ -176,14 +189,22 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
     llvm::StringRef binding = i == 0 ? "input:0" : "output:0";
     auto *boundary = contract->getObject(i == 0 ? "input" : "output");
     if (!boundary || boundary->getString("marker_asm") != asmText[i] ||
-        boundary->getString("constraints") != "=r,r,l,r,r" ||
+        boundary->getString("constraints") != constraints ||
         boundary->getString("source_binding") != binding ||
         boundary->getInteger("marker_count") != static_cast<int64_t>(sites[i]->size()))
       return error("boundary marker definition/count differs from the exported evidence");
+    auto *arguments = boundary->getObject("arguments");
+    if (!arguments || arguments->getInteger("value") != result.valueArgument ||
+        arguments->getInteger("address") != result.addressArgument ||
+        arguments->getInteger("index") != result.indexArgument ||
+        arguments->getInteger("mask") != result.maskArgument)
+      return error("boundary marker argument mapping differs from its dtype");
     llvm::Argument *arg = nullptr;
     for (auto &port : *ports) {
       auto *p = port.getAsObject();
       if (p && p->getString("logical_port") == binding) {
+        if (p->getString("element_type") != dtype)
+          return error("boundary dtype does not match data port element type");
         auto index = p->getInteger("argument");
         if (!index || *index < 0 || *index > 1) return error("invalid data argument mapping");
         arg = entry->getArg(*index);
@@ -191,13 +212,13 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
     }
     if (!arg) return error("missing data argument mapping");
     for (auto *site : *sites[i]) {
-      auto *index = site->getArgOperand(2);
-      auto *address = site->getArgOperand(1);
+      auto *index = site->getArgOperand(result.indexArgument);
+      auto *address = site->getArgOperand(result.addressArgument);
       if (llvm::getUnderlyingObject(address) != arg)
         return error("boundary address is not rooted at the declared data port");
       // Compare LLVM address expressions, not one textual GEP/sext pattern.
       auto *offset = evolution.getSignExtendExpr(evolution.getSCEV(index), indexType);
-      auto *bytes = evolution.getMulExpr(offset, evolution.getConstant(indexType, 4));
+      auto *bytes = evolution.getMulExpr(offset, evolution.getConstant(indexType, elementBytes));
       auto *expected = evolution.getAddExpr(evolution.getSCEV(arg), bytes);
       if (evolution.getSCEV(address) != expected)
         return error("boundary address does not match its signed i32 element index");
@@ -205,5 +226,44 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   }
   if (auto e = proveMasks(m, *entry, result, *n)) return std::move(e);
   return result;
+}
+
+llvm::Expected<llvm::json::Object>
+normalizeTritonNumerics(llvm::Module &module, const llvm::json::Object &artifact) {
+  auto *contract = artifact.getObject("fusion_contract");
+  auto *specializations = artifact.getObject("specializations");
+  auto *invocation = artifact.getObject("invocation");
+  auto *numerics = contract ? contract->getObject("numerics") : nullptr;
+  auto *options = specializations ? specializations->getObject("fixed_options") : nullptr;
+  auto *metadata = invocation ? invocation->getObject("compiler_metadata") : nullptr;
+  auto entryName = artifact.getString("entry");
+  auto *entry = entryName ? module.getFunction(*entryName) : nullptr;
+  if (!numerics || !options || !metadata || !entry)
+    return error("missing Triton floating numerical policy");
+  auto enabled = numerics->getBoolean("enable_fp_fusion");
+  auto reflectFTZ = numerics->getBoolean("enable_reflect_ftz");
+  if (!enabled || !reflectFTZ || metadata->getBoolean("enable_fp_fusion") != enabled ||
+      metadata->getBoolean("enable_reflect_ftz") != reflectFTZ ||
+      *enabled != options->getBoolean("enable_fp_fusion").value_or(true))
+    return error("Triton floating numerical policy does not match compiler metadata/options");
+  // Public Triton export returns unflagged fmul/fadd and applies its global
+  // enable_fp_fusion option in LLVM-to-PTX codegen. Encode that permission on
+  // original F instructions before strict ASK instructions enter this module.
+  llvm::SmallVector<llvm::BinaryOperator *> candidates;
+  for (auto &block : *entry) for (auto &instruction : block) {
+    auto *binary = llvm::dyn_cast<llvm::BinaryOperator>(&instruction);
+    if (!binary || (binary->getOpcode() != llvm::Instruction::FMul &&
+                    binary->getOpcode() != llvm::Instruction::FAdd &&
+                    binary->getOpcode() != llvm::Instruction::FSub)) continue;
+    if (!*enabled && binary->hasAllowContract())
+      return error("Triton LLVM permits contraction despite enable_fp_fusion=false");
+    candidates.push_back(binary);
+  }
+  if (*enabled)
+    for (auto *binary : candidates) binary->setHasAllowContract(true);
+  return llvm::json::Object{
+      {"producer_enable_fp_fusion", *enabled}, {"producer_enable_reflect_ftz", *reflectFTZ},
+      {"representation", "original-F-instruction-contract-flags"},
+      {"tagged_instructions", static_cast<int64_t>(*enabled ? candidates.size() : 0)}};
 }
 } // namespace ask::adapters

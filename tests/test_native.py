@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -130,6 +131,87 @@ define void @f() {
                 if count == 0:
                     self.assertEqual(out[0], 123)
                     self.assertEqual(copy[0], 456)
+
+    def test_float_host_abi_preserves_rounding_and_special_values(self):
+        if not json.loads(run("--capabilities").stdout)["host_codegen"]:
+            self.skipTest("host backend disabled")
+        cc = shutil.which("cc")
+        self.assertIsNotNone(cc)
+        module = Module()
+        tensor, scalar_type = TensorType((2, 4), "f32"), ScalarType("f32")
+        graph = module.graph("calculate", inputs={"x": tensor, "a": scalar_type},
+                             results=[tensor, tensor, scalar_type])
+        product = graph.mul(graph.inputs["x"], graph.splat(graph.inputs["a"], (2, 4)))
+        adjusted = graph.add(product, graph.splat(graph.constant(-1.0, dtype="f32"), (2, 4)))
+        scalar = graph.add(graph.inputs["a"], graph.constant(-1.0, dtype="f32"))
+        graph.return_(product, adjusted, scalar)
+        source = module.to_mlir()
+        llvm_result = run("-", "--emit-llvm", source=source)
+        self.assertEqual(llvm_result.returncode, 0, llvm_result.stderr)
+        self.assertIn("fadd float", llvm_result.stdout)
+        self.assertIn("fmul float", llvm_result.stdout)
+        self.assertNotIn("fadd fast", llvm_result.stdout)
+        self.assertNotIn("fmul contract", llvm_result.stdout)
+        data = [1.0 + 2 ** -23, -0.0, float("inf"), float("-inf"),
+                float("nan"), 2 ** -149, -2 ** -149, 0.0]
+        coefficient = 1.0 - 2 ** -23
+        expected_products = [ctypes.c_float(value * coefficient).value for value in data]
+        expected_outputs = [ctypes.c_float(value - 1.0).value for value in expected_products]
+        self.assertEqual(expected_outputs[0], 0.0)  # Contracted FMA would differ.
+        with tempfile.TemporaryDirectory() as directory:
+            for optimized in (False, True):
+                path = Path(directory)
+                obj = path / f"float{optimized}.o"
+                shared = path / f"float{optimized}.so"
+                report = path / f"float{optimized}.json"
+                args = ["-", "--emit-object", "-o", obj, "--report-json", report]
+                if optimized:
+                    args.append("--optimize")
+                result = run(*args, source=source)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                metadata = json.loads(report.read_text())
+                abi = metadata["abi"]["functions"][0]
+                self.assertTrue(all(item["dtype"] == "f32" for item in abi["inputs"] + abi["outputs"]))
+                self.assertEqual(abi["lowering"]["loop_count"], 2 if optimized else 3)
+                linked = subprocess.run([cc, "-shared", str(obj), "-o", str(shared)],
+                                        text=True, capture_output=True)
+                self.assertEqual(linked.returncode, 0, linked.stderr)
+                function = ctypes.CDLL(str(shared)).calculate
+                pointer = ctypes.POINTER(ctypes.c_float)
+                function.argtypes = [pointer, ctypes.c_float, pointer, pointer, pointer]
+                function.restype = None
+                storage = ctypes.c_float * 8
+                x, product_out, result_out, scalar_out = storage(*data), storage(), storage(), ctypes.c_float()
+                function(x, coefficient, product_out, result_out, ctypes.byref(scalar_out))
+                for actual, expected in zip(list(product_out) + list(result_out),
+                                            expected_products + expected_outputs):
+                    if math.isnan(expected):
+                        self.assertTrue(math.isnan(actual))
+                    else:
+                        self.assertEqual(struct.pack("f", actual), struct.pack("f", expected))
+                self.assertEqual(scalar_out.value, -2 ** -23)
+
+    def test_float_type_mismatch_and_integer_only_options_are_rejected(self):
+        source = '''module {
+  func.func @f(%x: f32, %y: f32) -> f32 {
+    %z = "ask.add"(%x, %y) : (f32, f32) -> f32
+    return %z : f32
+  }
+}'''
+        for attribute in ('overflow = "wrap"', 'fastmath = "fast"', 'fastmathFlags = "contract"'):
+            invalid = source.replace('"ask.add"(%x, %y)', f'"ask.add"(%x, %y) {{{attribute}}}')
+            with self.subTest(attribute=attribute):
+                result = run("-", "--prepare", source=invalid)
+                self.assertGreater(result.returncode, 0)
+        splat = '''module {
+  func.func @f(%x: f32) -> tensor<2xi32> {
+    %z = "ask.splat"(%x) {shape = array<i64: 2>} : (f32) -> tensor<2xi32>
+    return %z : tensor<2xi32>
+  }
+}'''
+        result = run("-", "--prepare", source=splat)
+        self.assertGreater(result.returncode, 0)
+        self.assertIn("element types must match", result.stderr)
 
 
 if __name__ == "__main__":

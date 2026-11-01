@@ -107,6 +107,7 @@ public:
   ASK_NO_MEMORY_EFFECTS
 };
 
+bool isSupportedElementType(mlir::Type type);
 bool isSupportedValueType(mlir::Type type);
 bool haveCompatibleShapes(mlir::Type lhs, mlir::Type rhs);
 

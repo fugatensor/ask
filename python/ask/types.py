@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_DTYPES = frozenset({"i32"})
+_DTYPES = frozenset({"i32", "f32"})
 
 
 def _dtype(value: str) -> str:
     if not isinstance(value, str) or value not in _DTYPES:
-        raise ValueError(f"the initial ASK frontend supports only i32, got {value!r}")
+        raise ValueError(f"ASK supports i32 and f32, got {value!r}")
     return value
 
 

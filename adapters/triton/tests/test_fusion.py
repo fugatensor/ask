@@ -34,7 +34,36 @@ def request():
     return value
 
 
+def float_request():
+    value = request()
+    value["signature"] = {"t": "*fp32", "u": "*fp32"}
+    value["source"] = value["source"].replace("value * 2", "value * 1.25 + 0.1").replace(
+        "other=0", "other=0.0")
+    return value
+
+
 class BoundarySourceTests(unittest.TestCase):
+    def test_float_trace_preserves_values_and_store_conversion(self):
+        value = float_request()
+        source, contract = fusion.instrument(worker.validate_request(value))
+        self.assertEqual(contract["dtype"], "f32")
+        self.assertIn("tl.cast(value * 1.25 + 0.1, tl.float32)", source)
+        traces = [node for node in ast.walk(ast.parse(source))
+                  if fusion._call(node, "inline_asm_elementwise")]
+        self.assertEqual(len(traces), 2)
+        for role, trace in zip(("input", "output"), traces):
+            boundary = contract[role]
+            attributes = {item.arg: item.value for item in trace.keywords}
+            self.assertEqual(attributes["constraints"].value, "=f,r,f,l,r")
+            self.assertEqual(attributes["asm"].value, boundary["marker_asm"])
+            self.assertIn("mov.b32 $0, $2", boundary["marker_asm"])
+            self.assertEqual(ast.unparse(attributes["dtype"]), "tl.float32")
+            self.assertEqual(boundary["arguments"], {"index": 0, "value": 1, "address": 2, "mask": 3})
+        # Float arithmetic belongs to values, never to the index/address proof.
+        value["source"] = value["source"].replace("t + i", "t + (i + 0.0)")
+        with self.assertRaises(fusion.FusionError):
+            fusion.instrument(worker.validate_request(value))
+
     def test_environment_cannot_override_code_after_boundary_proof(self):
         rejected = ("TRITON_KERNEL_OVERRIDE", "TRITON_OVERRIDE_DIR", "TRITON_LIBDEVICE_PATH",
                     "TRITON_PTXAS_PATH", "TRITON_CACHE_MANAGER", "TRITON_NEW_UNKNOWN_SWITCH",
@@ -119,7 +148,7 @@ def scale2(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
         source, contract = fusion.instrument(worker.validate_request(value))
         self.assertIn("read_at", source)
         self.assertIn("value * 2", source)
-        self.assertEqual(contract["proof"]["source_subset"], "affine-pointwise-i32-v2")
+        self.assertEqual(contract["proof"]["source_subset"], "affine-pointwise-typed-v3")
         self.assertEqual(contract["shape"], [10])
 
     def test_index_need_not_have_a_specific_local_variable(self):
@@ -221,6 +250,40 @@ def scale2(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
 
 @unittest.skipUnless(PYTHON, "set ASK_TEST_TRITON_PYTHON for real trace exports")
 class RealBoundaryExportTests(unittest.TestCase):
+    def test_f32_trace_keeps_float_registers_layout_and_producer_numerics(self):
+        with tempfile.TemporaryDirectory(prefix="ask-float-boundary-export-") as directory:
+            directory = Path(directory)
+            for block, warps, fp_fusion in ((128, 4, True), (512, 8, False)):
+                with self.subTest(block=block, warps=warps, fp_fusion=fp_fusion):
+                    value = float_request()
+                    value["constants"] = {"N": 257, "BLOCK": block}
+                    value["grid"] = [(257 + block - 1) // block, 1, 1]
+                    value["fixed_options"]["num_warps"] = warps
+                    value["fixed_options"]["enable_fp_fusion"] = fp_fusion
+                    artifacts = []
+                    for enabled in (False, True):
+                        value["fusion"]["enabled"] = enabled
+                        source = directory / "request.json"
+                        output = directory / "artifact.json"
+                        source.write_text(json.dumps(value))
+                        result = subprocess.run([PYTHON, str(ROOT / "worker.py"), "--request", str(source),
+                                                 "--output", str(output)], text=True, capture_output=True, timeout=180)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        artifacts.append(json.loads(output.read_text()))
+                    baseline, traced = artifacts
+                    contract = traced["fusion_contract"]
+                    self.assertEqual(contract["dtype"], "f32")
+                    self.assertEqual(contract["numerics"]["enable_fp_fusion"], fp_fusion)
+                    self.assertTrue(contract["proof"]["layout"]["matched_uninstrumented_baseline"])
+                    self.assertEqual([p["element_type"] for p in traced["port_map"]], ["f32", "f32"])
+                    self.assertIn("call float asm sideeffect", traced["payload"])
+                    self.assertIn('"=f,r,f,l,r"', traced["payload"])
+                    self.assertIn("fmul float", traced["payload"])
+                    self.assertIn("fadd float", traced["payload"])
+                    for name in ("enable_fp_fusion", "enable_reflect_ftz"):
+                        self.assertEqual(baseline["invocation"]["compiler_metadata"][name],
+                                         traced["invocation"]["compiler_metadata"][name])
+
     def test_real_trace_exports_bind_source_ir_layout_and_partial_final_block(self):
         with tempfile.TemporaryDirectory(prefix="ask-boundary-export-test-") as directory:
             directory = Path(directory)

@@ -198,6 +198,45 @@ void rejection(LLVMContext &context, StringRef helper, StringRef expected) {
   require(report.size() == 1 && report.getInteger("sentinel") == 42,
           "failed transaction must not publish a success report");
 }
+
+void consumerNumerics(LLVMContext &context, StringRef attributes,
+                      bool floating, bool accept) {
+  // Both signatures are integer-only; the floating helper hides its operations
+  // in a nested function. Numerical checks must inspect the whole call graph.
+  auto consumer = parse(context, "declare i64 @identity(i64)\n"
+      "define i64 @f(i64 %x) " + attributes.str() +
+      " { %r=call i64 @identity(i64 %x) ret i64 %r }");
+  auto helpers = parse(context, floating ? R"(
+      define i64 @inner(i64 %x) {
+        %f = sitofp i64 %x to double
+        %a = fadd double %f, 1.0
+        %r = fptosi double %a to i64
+        ret i64 %r
+      }
+      define i64 @h(i64 %x) { %r=call i64 @inner(i64 %x) ret i64 %r }
+      )" : "define i64 @h(i64 %x) { %r=add i64 %x, 1 ret i64 %r }");
+  auto *call = marker(*consumer, "f");
+  BoundaryInlineSite site{call, helpers->getFunction("h"), {call->getArgOperand(0)}};
+  auto before = print(*consumer), helperBefore = print(*helpers);
+  json::Object report{{"sentinel", 42}};
+  auto result = ask::llir::inlineValueBoundaries(*consumer, *helpers, {site}, report);
+  require(print(*consumer) == before && print(*helpers) == helperBefore,
+          "numerical policy validation must preserve input modules");
+  if (accept) {
+    if (!result) errs() << toString(result.takeError()) << '\n';
+    require(bool(result), "compatible consumer numerical attributes must be accepted");
+    for (auto attribute : consumer->getFunction("f")->getAttributes().getFnAttrs())
+      if (attribute.isStringAttribute())
+        require((*result)->getFunction("f")->getFnAttribute(attribute.getKindAsString()) == attribute,
+                "consumer target and numerical attributes must not be erased or rewritten");
+  } else {
+    require(!result, "incompatible consumer numerical attributes must be rejected");
+    auto diagnostic = toString(result.takeError());
+    require(diagnostic.find("floating helper cannot inherit consumer") != std::string::npos, diagnostic);
+    require(report.size() == 1 && report.getInteger("sentinel") == 42,
+            "numerical rejection must not modify the report");
+  }
+}
 } // namespace
 
 int main(int argc, char **argv) {
@@ -224,6 +263,23 @@ int main(int argc, char **argv) {
   rejection(context, R"(define i64 @inner(i64 %x) { ret i64 %x }
                         define i64 @h(i64 %x) { %v=call i64 @inner(i64 noundef %x) ret i64 %v })", "call parameter");
   rejection(context, R"(define float @h(i64 %x) { ret float 0.0 })", "signature mismatch");
+
+  for (StringRef attributes : {R"("unsafe-fp-math"="true")", R"("no-nans-fp-math"="true")",
+       R"("no-infs-fp-math"="true")", R"("no-signed-zeros-fp-math"="true")",
+       R"("approx-func-fp-math"="true")", R"("less-precise-fpmad"="true")",
+       R"("no-trapping-math"="false")", R"("denormal-fp-math"="preserve-sign,preserve-sign")",
+       R"("denormal-fp-math-f32"="positive-zero,positive-zero")", R"("fp-contract"="fast")",
+       "strictfp"}) {
+    consumerNumerics(context, attributes, true, false);
+    consumerNumerics(context, attributes, false, true);
+  }
+  consumerNumerics(context, R"("unsafe-fp-math"="false" "no-nans-fp-math"="false"
+      "no-infs-fp-math"="false" "no-signed-zeros-fp-math"="false"
+      "approx-func-fp-math"="false" "less-precise-fpmad"="false"
+      "no-trapping-math"="true" "denormal-fp-math"="ieee,ieee"
+      "denormal-fp-math-f32"="ieee" "fp-contract"="off"
+      "nvvm.reqntid"="128" "target-cpu"="generic")", true, true);
+  consumerNumerics(context, R"("fp-contract"="on")", true, true);
 
   // A value produced after the marker is not available at the rewrite site.
   auto consumer = parse(context, "declare i64 @identity(i64)\n"

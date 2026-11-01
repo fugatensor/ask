@@ -12,7 +12,7 @@ import tempfile
 
 from .cache import IRCache
 from .compiler import CompilerError
-from .cuda import compile_cuda, execute_i32
+from .cuda import compile_cuda, execute
 from .ir import Module
 
 
@@ -22,6 +22,20 @@ def _json(value):
 
 def _sha(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def _numerics(request):
+    """Bind cache identity to the dtype and ASK's arithmetic semantics."""
+    signature = request.get("signature", {})
+    if not isinstance(signature, dict) or len(signature) != 2:
+        raise CompilerError("CUDA fusion requires two explicitly typed data pointers")
+    types = list(signature.values())
+    if any(value not in ("*i32", "*fp32") for value in types) or types[0] != types[1]:
+        raise CompilerError("CUDA fusion requires matching i32 or f32 data-pointer types")
+    if types[0] == "*i32":
+        return {"element_type": "i32", "arithmetic": "wrap-modulo-2^32"}
+    return {"element_type": "f32", "arithmetic": "ieee754-binary32",
+            "rounding": "roundTiesToEven", "fast_math": False, "contraction": False}
 
 
 def _validate_environment():
@@ -76,9 +90,9 @@ class CUDAKernel:
     cache: dict
 
     def run(self, values, *, device_ordinal=0, driver_library=None):
-        """Allocate disjoint buffers and execute the newly generated fused cubin."""
-        return execute_i32(self.artifact, self.codegen, values,
-                           device_ordinal=device_ordinal, driver_library=driver_library)
+        """Execute the fused cubin using the artifact's dtype for both buffers."""
+        return execute(self.artifact, self.codegen, values,
+                       device_ordinal=device_ordinal, driver_library=driver_library)
 
 
 def compile_graph(compiler, module, *, cache_dir, output_dir, triton_python,
@@ -113,13 +127,13 @@ def compile_graph(compiler, module, *, cache_dir, output_dir, triton_python,
         raise CompilerError(f"cannot fingerprint the selected Triton installation: {exc}") from exc
     request = requests[0]
     key = {
-        "schema_version": 1, "pipeline_version": "ask.triton.scalar-boundary.v1",
+        "schema_version": 1, "pipeline_version": "ask.triton.typed-boundary.v2",
         "graph": _sha(source.encode()), "dsl": _sha(request["source"].encode()),
         "config": {"request": {k: v for k, v in request.items() if k != "source"},
                    "environment_sha256": _sha(_json(dict(os.environ)))},
         "llvm_revision": caps["llvm_revision"], "producer": producer, "adapter": adapter,
         "tools": tools, "target": request["target"],
-        "shape": prepared.report["shape_snapshot"], "numerics": "i32-wrap-no-fast-math",
+        "shape": prepared.report["shape_snapshot"], "numerics": _numerics(request),
     }
     destination = Path(output_dir).resolve()
     if destination.exists() and any(destination.iterdir()):

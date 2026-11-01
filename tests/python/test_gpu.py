@@ -6,10 +6,30 @@ import unittest
 from unittest.mock import Mock, patch
 
 from ask import CompilerError
-from ask.gpu import compile_graph, _tool, _validate_environment
+from ask.gpu import CUDAKernel, compile_graph, _numerics, _tool, _validate_environment
 
 
 class GPUEntryTests(unittest.TestCase):
+    def test_runtime_uses_artifact_types_without_a_parallel_float_entry(self):
+        kernel = CUDAKernel({"port_map": [{"element_type": "f32"}]}, {}, {}, {})
+        with patch("ask.gpu.execute", return_value={"output": [1.5]}) as execute:
+            self.assertEqual(kernel.run([1.5]), {"output": [1.5]})
+        execute.assert_called_once_with(kernel.artifact, kernel.codegen, [1.5],
+                                        device_ordinal=0, driver_library=None)
+
+    def test_cache_numerics_distinguish_dtype_and_float_rounding(self):
+        integer = _numerics({"signature": {"a": "*i32", "b": "*i32"}})
+        floating = _numerics({"signature": {"a": "*fp32", "b": "*fp32"}})
+        self.assertNotEqual(integer, floating)
+        self.assertEqual(integer["element_type"], "i32")
+        self.assertEqual(floating["element_type"], "f32")
+        self.assertEqual(floating["rounding"], "roundTiesToEven")
+        self.assertFalse(floating["fast_math"])
+        self.assertFalse(floating["contraction"])
+        for signature in ({"a": "*i32", "b": "*fp32"}, {"a": "*fp64", "b": "*fp64"}):
+            with self.assertRaises(CompilerError):
+                _numerics({"signature": signature})
+
     def test_none_build_never_looks_up_cache_or_starts_worker(self):
         compiler = Mock()
         compiler.capabilities.return_value = {"third_party_compilers": []}

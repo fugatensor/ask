@@ -10,6 +10,10 @@ namespace ask::adapters {
 struct TritonBoundaries {
   llvm::SmallVector<llvm::CallInst *> inputs;
   llvm::SmallVector<llvm::CallInst *> outputs;
+  unsigned valueArgument = 0;
+  unsigned addressArgument = 1;
+  unsigned indexArgument = 2;
+  unsigned maskArgument = 3;
 };
 
 // Producer-specific evidence is checked here. The native LLVM inliner knows
@@ -18,4 +22,10 @@ struct TritonBoundaries {
 // pointers remain valid only while that module and those instructions survive.
 llvm::Expected<TritonBoundaries>
 bindTritonBoundaries(llvm::Module &module, const llvm::json::Object &artifact);
+
+// After binding succeeds, represent the producer's permitted multiply-add
+// contraction on its own instructions. Call before inserting ASK helpers:
+// their strict arithmetic must not inherit Triton's global codegen option.
+llvm::Expected<llvm::json::Object>
+normalizeTritonNumerics(llvm::Module &module, const llvm::json::Object &artifact);
 }

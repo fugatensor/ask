@@ -1,7 +1,7 @@
-"""Explicit CUDA execution for the first pointer-only i32 LLVM kernel subset.
+"""Explicit CUDA execution with host buffers typed by the artifact's logical ports.
 
 Importing this module needs only the standard library. The driver is loaded only
-by execute_i32; neither a Triton module nor a Triton compiled kernel is imported.
+by execute; neither a Triton module nor a Triton compiled kernel is imported.
 Code generation consumes the supplied LLVM file, including ASK's transformations.
 """
 from __future__ import annotations
@@ -13,9 +13,14 @@ import json
 from pathlib import Path
 import subprocess
 
+from .numerics import round_f32
+
 
 class CUDAError(RuntimeError):
     pass
+
+
+_STORAGE_TYPES = {"i32": ctypes.c_int32, "f32": ctypes.c_float}
 
 
 def _require(condition, message):
@@ -79,6 +84,29 @@ def _contract(artifact):
                      and isinstance(description, dict) and description.get("size_bytes") == 0,
                      "scratch must be explicitly unused")
     _require(set(data_bindings) == {"input:0", "output:0"}, "expected input:0 and output:0")
+    ports = artifact.get("port_map")
+    _require(isinstance(ports, list) and len(ports) == 2,
+             "typed input/output port_map is required")
+    port_types = {}
+    for port in ports:
+        _require(isinstance(port, dict), "logical ports must be objects")
+        index, binding, dtype = port.get("argument"), port.get("logical_port"), port.get("element_type")
+        _require(type(index) is int and 0 <= index < 2 and binding == data_bindings[index]
+                 and binding not in port_types, "logical port and invocation argument mappings disagree")
+        _require(isinstance(dtype, str) and dtype in _STORAGE_TYPES,
+                 "CUDA buffers currently support i32 and f32 element types")
+        port_types[binding] = dtype
+    dtype = port_types["input:0"]
+    _require(port_types["output:0"] == dtype,
+             "current CUDA runner requires matching input/output element types")
+    # A fused artifact keeps the removed markers' contract only as provenance.
+    # The active storage description is port_map; cross-check any provenance
+    # rather than interpreting opaque LLVM pointers as typed data pointers.
+    for name in ("fusion_contract", "source_fusion_contract"):
+        if name in artifact:
+            contract = artifact[name]
+            _require(isinstance(contract, dict) and contract.get("dtype") == dtype,
+                     "fusion provenance and logical port element types disagree")
     specializations = artifact.get("specializations", {})
     _require(isinstance(specializations, dict) and isinstance(specializations.get("constants"), dict),
              "explicit constants specialization is required")
@@ -92,7 +120,67 @@ def _contract(artifact):
              "constexpr BLOCK must be a positive power of two within the signed-index range")
     _require(grid == [max(1, (size + elements_per_program - 1) // elements_per_program), 1, 1],
              "launch grid must match the producer's declared N/BLOCK element partition")
-    return entry, invocation, size
+    return entry, invocation, size, dtype
+
+
+def _host_buffers(values, size, dtype):
+    """Convert Python scalars once at the boundary, using the IR element type.
+
+    f32 inputs round to binary32 here, before any graph operation runs. Explicit
+    infinities, NaNs and signed zero are accepted. A finite value outside the
+    representable f32 range is rejected instead of silently becoming infinity.
+    """
+    _require(isinstance(values, (list, tuple)) and len(values) == size,
+             "input length must equal the artifact's explicit N specialization")
+    if dtype == "i32":
+        _require(all(type(value) is int and -(2**31) <= value < 2**31 for value in values),
+                 "input values must be signed i32 integers")
+    else:
+        _require(all(type(value) in (int, float) for value in values),
+                 "f32 input values must be Python int or float scalars")
+        rounded = []
+        for value in values:
+            try:
+                rounded.append(round_f32(value))
+            except (ValueError, TypeError, OverflowError) as exc:
+                raise CUDAError(f"invalid f32 input value: {exc}") from exc
+        values = rounded
+    storage = _STORAGE_TYPES[dtype] * max(size, 1)
+    return storage(*values), storage()
+
+
+def _fp_contract(artifact, dtype):
+    """Keep F's backend contraction setting without applying it to ASK ops."""
+    if dtype != "f32":
+        return "on"
+    metadata = artifact["invocation"].get("compiler_metadata")
+    _require(isinstance(metadata, dict)
+             and type(metadata.get("enable_fp_fusion")) is bool
+             and type(metadata.get("enable_reflect_ftz")) is bool,
+             "f32 code generation requires the producer's explicit numerical settings")
+    enabled = metadata["enable_fp_fusion"]
+    if "fusion" not in artifact and "source_fusion_contract" not in artifact:
+        # Triton's raw LLIR leaves this setting to its LLVM backend. There are
+        # no ASK operations in this artifact, so the original global policy is
+        # appropriate. After fusion that permission must be local to F instead.
+        return "fast" if enabled else "off"
+    fusion = artifact.get("fusion")
+    validation = artifact.get("validation")
+    _require(isinstance(fusion, dict) and isinstance(validation, dict)
+             and validation.get("stage") == "fused_llvm"
+             and validation.get("llvm_module_verified") is True,
+             "f32 fused code generation requires a verified fusion receipt")
+    normalized = fusion.get("producer_numerics")
+    provenance = artifact.get("source_fusion_contract", {}).get("numerics")
+    _require(isinstance(normalized, dict) and isinstance(provenance, dict)
+             and normalized.get("representation") == "original-F-instruction-contract-flags"
+             and normalized.get("producer_enable_fp_fusion") is enabled
+             and normalized.get("producer_enable_reflect_ftz") is metadata["enable_reflect_ftz"]
+             and provenance.get("enable_fp_fusion") is enabled
+             and provenance.get("enable_reflect_ftz") is metadata["enable_reflect_ftz"]
+             and fusion.get("ask_numerics") == "f32-rne-no-fast-math-no-contract",
+             "f32 fusion numerical normalization does not match the producer settings")
+    return "on"
 
 
 def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
@@ -102,7 +190,8 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
     selected here. The current target is sm_80; launch dimensions come from the
     producer artifact rather than a runtime-selected scheduling policy.
     """
-    entry, invocation, _ = _contract(artifact)
+    entry, invocation, _, dtype = _contract(artifact)
+    fp_contract = _fp_contract(artifact, dtype)
     llvm_ir, output_directory = Path(llvm_ir).resolve(), Path(output_directory).resolve()
     llc, ptxas = Path(llc).resolve(), Path(ptxas).resolve()
     source = llvm_ir.read_bytes()
@@ -115,7 +204,7 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
     _require(not any(path.exists() for path in (ptx, cubin, receipt)),
              "codegen destination already contains artifacts; use a fresh directory")
     commands = [
-        [str(llc), "-march=nvptx64", "-mcpu=sm_80", "-mattr=+ptx80",
+        [str(llc), "-march=nvptx64", "-mcpu=sm_80", "-mattr=+ptx80", "--fp-contract=" + fp_contract,
          str(llvm_ir), "-o", str(ptx)],
         [str(ptxas), "--gpu-name=sm_80", "-v", str(ptx), "-o", str(cubin)],
     ]
@@ -130,7 +219,8 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
                             + result.stdout + result.stderr)
         logs.append(result.stdout + result.stderr)
     _require(llvm_ir.read_bytes() == source, "LLVM input changed during compilation")
-    result = {"schema_version": 1, "entry": entry, "arch": 80,
+    result = {"schema_version": 1, "entry": entry, "arch": 80, "element_type": dtype,
+              "fp_contract": fp_contract,
               "artifact_sha256": _artifact_digest(artifact),
               "llvm_ir": str(llvm_ir), "llvm_sha256": _digest(source),
               "ptx": str(ptx), "ptx_sha256": _digest(ptx.read_bytes()),
@@ -208,21 +298,20 @@ class _Driver:
         return value.value
 
 
-def execute_i32(artifact, codegen, values, *, device_ordinal=0, driver_library=None):
+def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None):
     """Synchronously execute one explicit invocation, then release its resources.
 
     This is an experimental runner for a trusted, verified N-element kernel, not
     a GPU memory-safety sandbox. The caller owns the kernel's logical contract.
     Failed launches are never replayed or silently replaced by another kernel.
     """
-    entry, invocation, size = _contract(artifact)
+    entry, invocation, size, dtype = _contract(artifact)
     _require(isinstance(codegen, dict), "codegen receipt must be an object")
-    _require(isinstance(values, (list, tuple)) and len(values) == size,
-             "input length must equal the artifact's explicit N specialization")
-    _require(all(type(value) is int and -(2**31) <= value < 2**31 for value in values),
-             "input values must be signed i32 integers")
+    host_input, host_output = _host_buffers(values, size, dtype)
     _require(codegen.get("entry") == entry and codegen.get("arch") == 80
-             and codegen.get("invocation") == invocation, "codegen and execution contracts disagree")
+             and codegen.get("invocation") == invocation and codegen.get("element_type") == dtype
+             and codegen.get("fp_contract") == _fp_contract(artifact, dtype),
+             "codegen and execution contracts disagree")
     _require(codegen.get("artifact_sha256") == _artifact_digest(artifact),
              "artifact digest differs from the compiled artifact")
     llvm_digest = _digest(artifact["payload"].encode("utf-8"))
@@ -276,8 +365,6 @@ def execute_i32(artifact, codegen, values, *, device_ordinal=0, driver_library=N
         _require(driver.function_attribute(function, 0) >= block[0],
                  "compiled kernel resource use cannot support the producer's block dimensions")
         registers = driver.function_attribute(function, 4)
-        storage = ctypes.c_int32 * max(size, 1)
-        host_input, host_output = storage(*values), storage()
         for _ in range(2):
             allocation = ctypes.c_uint64()
             driver.call("cuMemAlloc_v2", ctypes.byref(allocation), ctypes.sizeof(host_input))
@@ -292,7 +379,7 @@ def execute_i32(artifact, codegen, values, *, device_ordinal=0, driver_library=N
         driver.call("cuLaunchKernel", function, *grid, *invocation["block"], 0, None, addresses, None)
         driver.call("cuCtxSynchronize")
         driver.call("cuMemcpyDtoH_v2", host_output, allocations[1], ctypes.sizeof(host_output))
-        return {"output": list(host_output)[:size], "entry": entry,
+        return {"output": list(host_output)[:size], "entry": entry, "element_type": dtype,
                 "device": {"ordinal": device_ordinal, "name": name.value.decode(),
                            "compute_capability": [major, minor], "driver_version": driver_version.value},
                 "grid": grid, "block": invocation["block"],
@@ -306,3 +393,10 @@ def execute_i32(artifact, codegen, values, *, device_ordinal=0, driver_library=N
         if module.value:
             driver.library.cuModuleUnload(module)
         driver.library.cuCtxDestroy_v2(context)
+
+
+def execute_i32(artifact, codegen, values, *, device_ordinal=0, driver_library=None):
+    """Compatibility entry for callers that explicitly require an i32 kernel."""
+    _require(_contract(artifact)[3] == "i32", "execute_i32 requires an i32 artifact; use execute")
+    return execute(artifact, codegen, values, device_ordinal=device_ordinal,
+                   driver_library=driver_library)

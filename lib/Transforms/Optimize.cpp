@@ -106,10 +106,10 @@ private:
 };
 
 Operation *createConstant(OpBuilder &builder, Location location, Type type,
-                          const llvm::APInt &bits, NamedAttrList attributes) {
+                          TypedAttr value, NamedAttrList attributes) {
   attributes.erase("overflow");
   attributes.erase("shape");
-  attributes.set("value", builder.getIntegerAttr(type, bits));
+  attributes.set("value", value);
   OperationState state(location, ConstantOp::getOperationName());
   state.addTypes(type);
   state.addAttributes(attributes);
@@ -122,12 +122,12 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
   int64_t folds = 0;
   for (func::FuncOp function : module.getOps<func::FuncOp>()) {
     // A value in this map is either a scalar constant or a uniform tensor.
-    // One APInt per SSA value avoids materializing tensors, including huge ones.
-    llvm::DenseMap<Value, llvm::APInt> constants;
+    // One scalar attribute per SSA value avoids materializing uniform tensors.
+    llvm::DenseMap<Value, TypedAttr> constants;
     for (Operation &op : llvm::make_early_inc_range(function.front())) {
       if (auto constant = dyn_cast<ConstantOp>(op)) {
         constants.try_emplace(constant.getResult(),
-                              op.getAttrOfType<IntegerAttr>("value").getValue());
+                              op.getAttrOfType<TypedAttr>("value"));
         continue;
       }
       if (auto splat = dyn_cast<SplatOp>(op)) {
@@ -143,23 +143,37 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
       if (lhs == constants.end() || rhs == constants.end())
         continue;
 
-      // Both operands are verified i32. APInt arithmetic wraps at exactly 32 bits.
-      llvm::APInt folded = isa<AddOp>(op) ? lhs->second + rhs->second
-                                        : lhs->second * rhs->second;
+      OpBuilder builder(&op);
+      TypedAttr folded;
+      if (auto left = dyn_cast<IntegerAttr>(lhs->second)) {
+        // APInt arithmetic wraps at the verified i32 width.
+        const llvm::APInt &right = cast<IntegerAttr>(rhs->second).getValue();
+        llvm::APInt bits = isa<AddOp>(op) ? left.getValue() + right
+                                         : left.getValue() * right;
+        folded = builder.getIntegerAttr(left.getType(), bits);
+      } else {
+        auto floating = cast<FloatAttr>(lhs->second);
+        llvm::APFloat bits = floating.getValue();
+        const llvm::APFloat &right = cast<FloatAttr>(rhs->second).getValue();
+        if (isa<AddOp>(op))
+          bits.add(right, llvm::APFloat::rmNearestTiesToEven);
+        else
+          bits.multiply(right, llvm::APFloat::rmNearestTiesToEven);
+        folded = builder.getFloatAttr(floating.getType(), bits);
+      }
       rewrittenOperations.insert(operationId(&op));
       rewrittenValues.insert(valueId(op.getResult(0)));
-      OpBuilder builder(&op);
       Operation *replacement = nullptr;
       Type type = op.getResult(0).getType();
       NamedAttrList attributes(op.getAttrs());
-      if (type.isSignlessInteger(32)) {
+      if (isSupportedElementType(type)) {
         replacement = createConstant(builder, op.getLoc(), type, folded, attributes);
       } else {
         std::string scalarId = ids.scalarFor(operationId(&op));
         NamedAttrList scalarAttributes;
         scalarAttributes.set("ask.id", builder.getStringAttr(scalarId));
         scalarAttributes.set("ask.value_id", builder.getStringAttr(scalarId + ".result0"));
-        Operation *scalar = createConstant(builder, op.getLoc(), builder.getI32Type(),
+        Operation *scalar = createConstant(builder, op.getLoc(), folded.getType(),
                                            folded, scalarAttributes);
         constants.try_emplace(scalar->getResult(0), folded);
         attributes.erase("overflow");

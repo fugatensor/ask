@@ -1,10 +1,12 @@
 """High-level optimization contracts, including identities and frozen shapes."""
 import ctypes
 import json
+import math
 from pathlib import Path
 import re
 import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import unittest
@@ -45,6 +47,30 @@ class OptimizationTests(unittest.TestCase):
         self.assertEqual(result.report["markers"][0]["status"], "rewritten")
         self.assertEqual(result.report["shape_snapshot"]["semantic_revision"],
                          result.report["input_shape_snapshot"]["semantic_revision"] + 1)
+
+    def test_float_folding_rounds_each_operation_without_algebraic_identities(self):
+        module = Module()
+        graph = module.graph("rounding", inputs={}, results=[ScalarType("f32")])
+        product = graph.mul(graph.constant(1.0 + 2 ** -23, dtype="f32"),
+                            graph.constant(1.0 - 2 ** -23, dtype="f32"))
+        graph.return_(graph.add(product, graph.constant(-1.0, dtype="f32")))
+        optimized = self.compiler.optimize(module)
+        self.assertEqual(optimized.report["optimization"]["constant_folds"], 2)
+        self.assertIn("value = 0.000000e+00 : f32", optimized.ir)
+        self.assertNotIn('"ask.add"', optimized.ir)
+        self.assertNotIn('"ask.mul"', optimized.ir)
+        repeated = self.compiler.optimize(optimized.ir)
+        self.assertEqual(repeated.ir, optimized.ir)
+
+        dynamic = Module()
+        graph = dynamic.graph("identity", inputs={"x": ScalarType("f32")},
+                              results=[ScalarType("f32"), ScalarType("f32")])
+        zero = graph.constant(0.0, dtype="f32")
+        graph.return_(graph.add(graph.inputs["x"], zero), graph.mul(graph.inputs["x"], zero))
+        result = self.compiler.optimize(dynamic)
+        self.assertIn('"ask.add"', result.ir)  # x + 0 changes the sign of -0.
+        self.assertIn('"ask.mul"', result.ir)  # NaN/Inf * 0 cannot become 0.
+        self.assertEqual(result.report["optimization"]["constant_folds"], 0)
 
     def test_markers_do_not_keep_dead_computations_alive(self):
         module = Module()
@@ -238,6 +264,55 @@ class OptimizationTests(unittest.TestCase):
                     function.restype = None
                     function(output)
                     self.assertEqual(list(output), [expected] * count if count else [42])
+
+    def test_folded_float_constants_match_executed_ieee_results(self):
+        if not self.compiler.capabilities()["host_codegen"]:
+            self.skipTest("host backend disabled")
+        cc = shutil.which("cc")
+        self.assertIsNotNone(cc)
+        module = Module()
+        cases = [
+            ("add", 16777216.0, 1.0, 16777216.0),
+            ("add", -0.0, -0.0, -0.0),
+            ("add", -0.0, 0.0, 0.0),
+            ("mul", float("inf"), 0.0, float("nan")),
+            ("mul", 1.0, 2 ** -149, 2 ** -149),
+            ("mul", 3.4028234663852886e38, 2.0, float("inf")),
+        ]
+        for index, (opcode, left, right, _) in enumerate(cases):
+            tensor = TensorType((2, 3), "f32")
+            graph = module.graph(f"case{index}", inputs={}, results=[tensor])
+            lhs = graph.splat(graph.constant(left, dtype="f32"), (2, 3))
+            rhs = graph.splat(graph.constant(right, dtype="f32"), (2, 3))
+            graph.return_(getattr(graph, opcode)(lhs, rhs))
+        optimized = self.compiler.optimize(module)
+        self.assertEqual(optimized.report["optimization"]["constant_folds"], len(cases))
+        self.assertTrue(all(item["element_type"] == "f32"
+                            for item in optimized.report["shape_snapshot"]["shape_bindings"]))
+        self.assertNotIn('"ask.add"', optimized.ir)
+        self.assertNotIn('"ask.mul"', optimized.ir)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for label, source in [("before", module.to_mlir()), ("after", optimized.ir)]:
+                obj, shared = path / (label + ".o"), path / (label + ".so")
+                compiled = subprocess.run([DRIVER, "-", "--emit-object", "-o", str(obj)],
+                                          input=source, text=True, capture_output=True)
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                linked = subprocess.run([cc, "-shared", str(obj), "-o", str(shared)],
+                                        text=True, capture_output=True)
+                self.assertEqual(linked.returncode, 0, linked.stderr)
+                library = ctypes.CDLL(str(shared))
+                for index, (_, _, _, expected) in enumerate(cases):
+                    function = getattr(library, f"case{index}")
+                    function.argtypes = [ctypes.POINTER(ctypes.c_float)]
+                    function.restype = None
+                    output = (ctypes.c_float * 6)()
+                    function(output)
+                    for actual in output:
+                        if math.isnan(expected):
+                            self.assertTrue(math.isnan(actual))
+                        else:
+                            self.assertEqual(struct.pack("f", actual), struct.pack("f", expected))
 
 
 if __name__ == "__main__":

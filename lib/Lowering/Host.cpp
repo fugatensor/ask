@@ -50,11 +50,11 @@ llvm::Expected<std::unique_ptr<llvm::TargetMachine>> makeHostMachine() {
 }
 
 llvm::Expected<uint64_t> elementCount(mlir::Type type) {
-  if (type.isSignlessInteger(32))
+  if (isSupportedElementType(type))
     return uint64_t(1);
   auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
   if (!tensor || !tensor.hasStaticShape() || !isSupportedValueType(type))
-    return error("host lowering requires concrete ranked i32 tensors or scalar i32");
+    return error("host lowering requires concrete ranked i32/f32 tensors or scalars");
   if (llvm::is_contained(tensor.getShape(), int64_t(0)))
     return uint64_t(0);
   uint64_t count = 1;
@@ -65,6 +65,17 @@ llvm::Expected<uint64_t> elementCount(mlir::Type type) {
     count *= uint64_t(dimension);
   }
   return count;
+}
+
+mlir::Type elementType(mlir::Type type) {
+  if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type))
+    return tensor.getElementType();
+  return type;
+}
+
+llvm::Type *llvmElementType(mlir::Type type, llvm::LLVMContext &context) {
+  return elementType(type).isF32() ? llvm::Type::getFloatTy(context)
+                                   : llvm::Type::getInt32Ty(context);
 }
 
 std::string valueIdentity(mlir::Value value, mlir::func::FuncOp graph) {
@@ -92,7 +103,8 @@ llvm::json::Object describeArgument(mlir::Value value, mlir::func::FuncOp graph,
   return llvm::json::Object{{"argument", int64_t(argument)},
                             {"value_id", valueIdentity(value, graph)},
                             {"kind", tensor ? "tensor" : "scalar"},
-                            {"dtype", "i32"}, {"shape", std::move(shape)}};
+                            {"dtype", elementType(type).isF32() ? "f32" : "i32"},
+                            {"shape", std::move(shape)}};
 }
 
 llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
@@ -187,7 +199,6 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   auto result = std::make_unique<llvm::Module>("ask.host", context);
   result->setTargetTriple((*target)->getTargetTriple());
   result->setDataLayout((*target)->createDataLayout());
-  auto *i32 = llvm::Type::getInt32Ty(context);
   auto *pointer = llvm::PointerType::getUnqual(context);
   llvm::json::Array functions;
   uint64_t totalLoops = 0, totalUnfusedLoops = 0, totalFusedOutputGroups = 0;
@@ -206,7 +217,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     for (mlir::Type type : graph.getArgumentTypes())
       parameters.push_back(mlir::isa<mlir::RankedTensorType>(type)
                                ? static_cast<llvm::Type *>(pointer)
-                               : static_cast<llvm::Type *>(i32));
+                               : llvmElementType(type, context));
     for (unsigned i = 0; i < graph.getNumResults(); ++i)
       parameters.push_back(pointer);
     auto *functionType = llvm::FunctionType::get(llvm::Type::getVoidTy(context), parameters, false);
@@ -307,8 +318,9 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         auto argument = arguments.find(current);
         if (argument != arguments.end()) {
           if (mlir::isa<mlir::RankedTensorType>(current.getType())) {
-            auto *address = builder.CreateGEP(i32, argument->second, index, "input.address");
-            computed = builder.CreateAlignedLoad(i32, address, llvm::Align(4), "input");
+            auto *element = llvmElementType(current.getType(), context);
+            auto *address = builder.CreateGEP(element, argument->second, index, "input.address");
+            computed = builder.CreateAlignedLoad(element, address, llvm::Align(4), "input");
             ++inputLoads;
           } else {
             computed = argument->second;
@@ -316,15 +328,25 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         } else {
           mlir::Operation *producer = current.getDefiningOp();
           if (auto constant = mlir::dyn_cast<ConstantOp>(producer)) {
-            auto bits = constant->getAttrOfType<mlir::IntegerAttr>("value").getValue();
-            computed = llvm::ConstantInt::get(context, bits);
+            if (auto value = constant->getAttrOfType<mlir::IntegerAttr>("value"))
+              computed = llvm::ConstantInt::get(context, value.getValue());
+            else
+              computed = llvm::ConstantFP::get(
+                  context, constant->getAttrOfType<mlir::FloatAttr>("value").getValue());
           } else if (mlir::isa<SplatOp>(producer)) {
             computed = emit(producer->getOperand(0));
           } else {
             llvm::Value *lhs = emit(producer->getOperand(0));
             llvm::Value *rhs = emit(producer->getOperand(1));
-            computed = mlir::isa<AddOp>(producer) ? builder.CreateAdd(lhs, rhs, "add.wrap")
+            if (lhs->getType()->isFloatingPointTy()) {
+              // No reassociation or contraction: each ASK operation rounds
+              // independently at its declared floating-point width.
+              computed = mlir::isa<AddOp>(producer) ? builder.CreateFAdd(lhs, rhs, "add")
+                                                   : builder.CreateFMul(lhs, rhs, "mul");
+            } else {
+              computed = mlir::isa<AddOp>(producer) ? builder.CreateAdd(lhs, rhs, "add.wrap")
                                                    : builder.CreateMul(lhs, rhs, "mul.wrap");
+            }
           }
         }
         emitted[current] = computed;
@@ -336,7 +358,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       for (unsigned outputIndex : batch.outputs) {
         llvm::Value *computed = emit(returned.getOperand(outputIndex));
         llvm::Value *output = function->getArg(graph.getNumArguments() + outputIndex);
-        auto *address = builder.CreateGEP(i32, output, index, "output.address");
+        auto *address = builder.CreateGEP(computed->getType(), output, index, "output.address");
         builder.CreateAlignedStore(computed, address, llvm::Align(4));
       }
       llvm::Value *next = builder.CreateAdd(index, builder.getInt64(1), "next");

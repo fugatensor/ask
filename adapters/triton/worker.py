@@ -2,7 +2,7 @@
 """ASK protocol-1 Triton exporter. No Triton import occurs before a request/probe.
 
 This initial adapter deliberately accepts only the tested Triton 3.7.1 CUDA
-SM80 ABI: two i32 data pointers, integer constexprs and two unused scratch
+SM80 ABI: two i32/f32 data pointers, integer constexprs and two unused scratch
 pointers. It exports code and descriptions, never Python/kernel handles.
 """
 
@@ -23,7 +23,8 @@ import sys
 import tempfile
 
 PROTOCOL_VERSION = 1
-ADAPTER_VERSION = "0.3.0"
+ADAPTER_VERSION = "0.4.0"
+ELEMENT_TYPES = {"*i32": "i32", "*fp32": "f32"}
 SUPPORTED_TRITON_VERSION = "3.7.1"
 SUPPORTED_TARGET = {"backend": "cuda", "arch": 80, "warp_size": 32}
 
@@ -84,8 +85,10 @@ def validate_request(request):
                                       for k in signature),
             "initial adapter requires exactly two named data-pointer parameters",
             "UnsupportedSignature")
-    require(all(v == "*i32" for v in signature.values()),
-            "initial adapter supports only *i32 data pointers", "UnsupportedSignature")
+    require(all(isinstance(v, str) and v in ELEMENT_TYPES for v in signature.values()),
+            "adapter supports *i32 or *fp32 data pointers", "UnsupportedSignature")
+    require(len(set(signature.values())) == 1,
+            "input and output data pointers must have the same element type", "UnsupportedSignature")
     bindings = request["source_bindings"]
     require(set(bindings) == set(signature),
             "source_bindings must cover exactly the data-pointer signature")
@@ -98,10 +101,13 @@ def validate_request(request):
             "constexpr values must be named signed 64-bit integers")
     require(not set(constants).intersection(signature),
             "data parameters cannot also be constexprs")
-    require(set(request["fixed_options"]) == {"num_warps"} and
+    require({"num_warps"} <= set(request["fixed_options"]) <= {"num_warps", "enable_fp_fusion"} and
             type(request["fixed_options"].get("num_warps")) is int and
-            request["fixed_options"]["num_warps"] in (4, 8),
-            "adapter requires fixed_options={num_warps: 4|8}", "UnsupportedOptions")
+            request["fixed_options"]["num_warps"] in (4, 8) and
+            ("enable_fp_fusion" not in request["fixed_options"] or
+             type(request["fixed_options"]["enable_fp_fusion"]) is bool),
+            "adapter requires fixed_options num_warps=4|8 and optional boolean enable_fp_fusion",
+            "UnsupportedOptions")
     require(request["target"] == SUPPORTED_TARGET and
             type(request["target"].get("arch")) is int and
             type(request["target"].get("warp_size")) is int,
@@ -306,6 +312,9 @@ def build_artifact(request, compiled, triton_version, source_order):
     require(metadata.get("num_warps") == request["fixed_options"]["num_warps"] and
             metadata.get("warp_size") == 32,
             "compiled launch configuration differs from request", "ArtifactMismatch", "artifact")
+    if "enable_fp_fusion" in request["fixed_options"]:
+        require(metadata.get("enable_fp_fusion") is request["fixed_options"]["enable_fp_fusion"],
+                "compiled floating contraction policy differs from request", "ArtifactMismatch", "artifact")
     for name in ("shared", "global_scratch_size", "profile_scratch_size", "tmem_size"):
         require(type(metadata.get(name)) is int and metadata[name] == 0,
                 f"initial ABI requires zero {name}; found {metadata.get(name)!r}",
@@ -331,7 +340,7 @@ def build_artifact(request, compiled, triton_version, source_order):
     for ordinal, name in enumerate(source_order):
         binding = request["source_bindings"][name]
         port_map.append({"source_parameter": name, "logical_port": binding,
-                         "argument": ordinal, "element_type": "i32"})
+                         "argument": ordinal, "element_type": ELEMENT_TYPES[request["signature"][name]]})
         arguments.append({"argument": ordinal, "binding": binding,
                           "llvm_type": parameters[ordinal]["llvm_type"]})
     resources = {}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -15,6 +16,7 @@ sys.path.insert(0, str(ROOT / "python"))
 
 from ask import Compiler, CompilerError, Module, ScalarType, TensorType
 from ask.ir import mlir_string
+from ask.numerics import encode_f32, round_f32
 
 
 def example_module():
@@ -44,8 +46,50 @@ class BuilderTests(unittest.TestCase):
         for shape in [(-1,), (True,), (2**63,), ("10",)]:
             with self.subTest(shape=shape), self.assertRaises(ValueError):
                 TensorType(shape)
+        self.assertEqual(str(ScalarType("f32")), "f32")
+        self.assertEqual(str(TensorType((2, 3), "f32")), "tensor<2x3xf32>")
         with self.assertRaises(ValueError):
-            ScalarType("f32")
+            ScalarType("f64")
+
+    def test_f32_constants_preserve_rounded_bits_and_types(self):
+        module = Module()
+        graph = module.graph("main", inputs={}, results=[ScalarType("f32")])
+        negative_zero = graph.constant(-0.0, dtype="f32")
+        rounded = graph.constant(1.0 + 2.0 ** -24, dtype="f32")
+        result = graph.add(negative_zero, rounded)
+        graph.return_(result)
+        source = module.to_mlir()
+        self.assertIn("0x80000000 : f32", source)
+        self.assertIn("0x3F800000 : f32", source)
+        self.assertNotIn("overflow", source)
+        other = Module().graph("other", inputs={}, results=[])
+        for value in (True, "1", 2 ** 128):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                other.constant(value, dtype="f32")
+        with self.assertRaises(TypeError):
+            other.add(other.constant(1), other.constant(1.0, dtype="f32"))
+
+    def test_f32_encoding_rounds_large_integers_directly(self):
+        midpoint = 2 ** 80 + 2 ** 56
+        # All three integers become the same binary64 value, but they round
+        # differently to binary32. The even lower significand wins the tie.
+        self.assertEqual(float(midpoint - 1), float(midpoint + 1))
+        self.assertEqual(round_f32(midpoint - 1), float(2 ** 80))
+        self.assertEqual(round_f32(midpoint), float(2 ** 80))
+        self.assertEqual(round_f32(midpoint + 1), float(2 ** 80 + 2 ** 57))
+        self.assertEqual(round_f32(-midpoint - 1), -float(2 ** 80 + 2 ** 57))
+        odd_midpoint = 2 ** 80 + 3 * 2 ** 56
+        self.assertEqual(round_f32(odd_midpoint), float(2 ** 80 + 2 ** 58))
+        self.assertEqual(encode_f32(-0.0), bytes.fromhex("00000080"))
+        self.assertTrue(math.isnan(round_f32(float("nan"))))
+        self.assertEqual(round_f32(float("inf")), float("inf"))
+        for value in (1e40, 2 ** 128, True, "1.0"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                encode_f32(value)
+        module = Module()
+        graph = module.graph("large", inputs={}, results=[ScalarType("f32")])
+        graph.return_(graph.constant(midpoint + 1, dtype="f32"))
+        self.assertIn("0x67800001 : f32", module.to_mlir())
 
     def test_utf8_string_escaping(self):
         self.assertEqual(mlir_string('a"\\\n\x00中'), '"a\\22\\5C\\0A\\00\\E4\\B8\\AD"')
@@ -215,6 +259,27 @@ class NativeIntegrationTests(unittest.TestCase):
         external_line = next(line for line in prepared.ir.splitlines() if '"ask.external"' in line)
         self.assertIn("-> tensor<10xi32>", external_line)
         self.assertNotIn("-> tensor<?xi32>", external_line)
+
+    def test_float_external_shape_refinement_and_signature_validation(self):
+        module = Module()
+        tensor, dynamic = TensorType((2, 5), "f32"), TensorType((None, None), "f32")
+        semantics = module.semantics("copy", inputs=[dynamic], results=[dynamic])
+        implementation = module.implementation(
+            "copy_impl", compiler="triton", source="# DSL is not executed during prepare\n",
+            entry="copy", signature={"x": "*fp32", "y": "*fp32"},
+            source_bindings={"x": "input:0", "y": "output:0"}, target={"backend": "cuda"})
+        graph = module.graph("main", inputs={"x": tensor}, results=[dynamic])
+        result = graph.external(graph.inputs["x"], semantics=semantics,
+                                implementation=implementation, result_type=dynamic, id="F")
+        graph.return_(result)
+        prepared = self.compiler.prepare(module)
+        shapes = prepared.report["shape_snapshot"]["shape_bindings"]
+        self.assertTrue(shapes)
+        self.assertTrue(all(item["element_type"] == "f32" and item["shape"] == [2, 5]
+                            for item in shapes))
+        self.assertIn("-> tensor<2x5xf32>", prepared.ir)
+        with self.assertRaises(CompilerError):
+            self.compiler.prepare(module.to_mlir().replace('"*fp32"', '"*i32"'))
 
     def test_real_diagnostics_for_invalid_ir(self):
         with self.assertRaises(CompilerError) as caught:

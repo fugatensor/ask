@@ -37,6 +37,18 @@ class RequestTests(unittest.TestCase):
         value = request()
         self.assertEqual(worker.validate_request(value), value)
 
+    def test_typed_pointers_accept_f32_and_reject_mixed_or_unknown_types(self):
+        value = request()
+        value["signature"] = {"t": "*fp32", "u": "*fp32"}
+        self.assertEqual(worker.validate_request(value), value)
+        for signature in ({"t": "*fp32", "u": "*i32"},
+                          {"t": "*f32", "u": "*f32"},
+                          {"t": ["*fp32"], "u": "*fp32"}):
+            with self.subTest(signature=signature):
+                value["signature"] = signature
+                with self.assertRaises(worker.WorkerError):
+                    worker.validate_request(value)
+
     def test_rejects_boolean_protocol(self):
         value = request()
         value["protocol_version"] = True
@@ -88,6 +100,17 @@ class RequestTests(unittest.TestCase):
         with self.assertRaisesRegex(worker.WorkerError, "fixed_options"):
             worker.validate_request(value)
 
+    def test_floating_contraction_option_is_explicit_boolean(self):
+        for enabled in (True, False):
+            value = request()
+            value["fixed_options"]["enable_fp_fusion"] = enabled
+            self.assertEqual(worker.validate_request(value)["fixed_options"]["enable_fp_fusion"], enabled)
+        for enabled in (0, 1, "false", None):
+            value = request()
+            value["fixed_options"]["enable_fp_fusion"] = enabled
+            with self.assertRaisesRegex(worker.WorkerError, "enable_fp_fusion"):
+                worker.validate_request(value)
+
     def test_grid_is_not_inferred(self):
         value = request()
         value["grid"] = [1, 1]
@@ -103,6 +126,13 @@ class RequestTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_port_map_carries_element_types_separately_from_pointer_abi(self):
+        value = request()
+        value["signature"] = {"t": "*fp32", "u": "*fp32"}
+        artifact = worker.build_artifact(value, compiled(), "3.7.1", ["t", "u"])
+        self.assertEqual([p["element_type"] for p in artifact["port_map"]], ["f32", "f32"])
+        self.assertEqual(artifact["entry_signature"]["parameters"][0]["llvm_type"], "ptr addrspace(1)")
+
     def test_records_both_zero_resource_hidden_parameters(self):
         artifact = worker.build_artifact(request(), compiled(), "3.7.1", ["t", "u"])
         self.assertEqual(len(artifact["entry_signature"]["parameters"]), 4)

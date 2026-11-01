@@ -48,6 +48,12 @@ struct BoundaryInlineSite {
 /// normalized by the caller, as must helper/callsite parameter and return
 /// attributes (such as noundef/range). Instruction-level numerical flags are
 /// preserved. Recognized intrinsic declarations retain their defined contracts.
+/// Floating helpers cannot inherit consumer strictfp, trapping, flush-to-zero,
+/// aggressive contraction or relaxed NaN/Inf/zero assumptions. This includes
+/// integer-signature helpers with floating intermediates or nested callees.
+/// Neutral attributes and unrelated target attributes remain intact. Backend
+/// options are outside the module; the caller must also preserve per-operation
+/// rounding when invoking code generation after inlining.
 ///
 /// Returns a new verified module. Inputs and report are unchanged on failure;
 /// inputs are also unchanged on success. All site pointers describe the inputs,
