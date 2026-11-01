@@ -15,7 +15,7 @@ from typing import Any
 
 from ask import Module, TensorType
 
-DTYPES = ("i32", "f32", "f16", "bf16")
+DTYPES = ("bool", "i32", "i64", "f32", "f16", "bf16")
 # fraction bits, minimum normal exponent, maximum normal exponent
 FLOAT_FORMATS = {"f32": (23, -126, 127), "f16": (10, -14, 15), "bf16": (7, -126, 127)}
 
@@ -26,7 +26,9 @@ def build_module(size: int | None = None, *, shape: tuple[int, ...] | None = Non
                  dtype: str = "i32", offset: int | float = 3,
                  tail_offset: int | float | None = None,
                  external_offset: int | float | None = None,
-                 enable_fp_fusion: bool | None = None, external: bool = True) -> Module:
+                 enable_fp_fusion: bool | None = None, external: bool = True,
+                 compute_dtype: str | None = None, roundtrip_dtype: str | None = None,
+                 arch: int = 80) -> Module:
     """Build pointwise arithmetic over a concrete shape and declared F strategy.
 
     Runtime values are flat contiguous lists; shape remains in ASK's logical
@@ -43,9 +45,19 @@ def build_module(size: int | None = None, *, shape: tuple[int, ...] | None = Non
         raise ValueError("size must equal the product of shape dimensions")
     size = elements
     dtype = TensorType(shape, dtype).dtype
-    expression = f"value * {factor}"
+    compute_dtype = compute_dtype or ("i32" if dtype == "bool" else dtype)
+    compute_dtype = TensorType(shape, compute_dtype).dtype
+    triton_types = {"bool": "int1", "i32": "int32", "i64": "int64", "f32": "float32",
+                    "f16": "float16", "bf16": "bfloat16"}
+    # F has the same declared storage ABI as the surrounding graph. Its own
+    # widening/rounding is explicit in the DSL and remains the producer's policy.
+    working_value = (f"value.to(tl.{triton_types[compute_dtype]})"
+                     if compute_dtype != dtype else "value")
+    expression = f"{working_value} * {factor}"
     if external_offset is not None:
         expression += f" + {external_offset}"
+    if compute_dtype != dtype:
+        expression = f"({expression}).to(value.dtype)"
     source = f'''import triton
 import triton.language as tl
 
@@ -76,7 +88,8 @@ def scale(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
     if external:
         dynamic = TensorType((None,) * len(shape), dtype)
         semantics = module.semantics(f"scale_{dtype}_v1", inputs=[dynamic], results=[dynamic])
-        signature = {"i32": "*i32", "f32": "*fp32", "f16": "*fp16", "bf16": "*bf16"}[dtype]
+        signature = {"bool": "*i1", "i32": "*i32", "i64": "*i64", "f32": "*fp32",
+                     "f16": "*fp16", "bf16": "*bf16"}[dtype]
         options = {"num_warps": num_warps}
         if enable_fp_fusion is not None:
             options["enable_fp_fusion"] = enable_fp_fusion
@@ -85,37 +98,47 @@ def scale(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
             signature={"t": signature, "u": signature},
             source_bindings={"t": "input:0", "u": "output:0"},
             constants={"N": size, "BLOCK": block}, options=options,
-            target={"backend": "cuda", "arch": 80, "warp_size": 32},
+            target={"backend": "cuda", "arch": arch, "warp_size": 32},
             grid=(max(1, (size + block - 1) // block), 1, 1))
     graph = module.graph("pipeline", inputs={"x": tensor}, results=[tensor])
-    increment = graph.splat(graph.constant(bias, dtype=dtype, id="bias"), shape, id="bias_tensor")
-    before = graph.add(graph.inputs["x"], increment, id="P" if pre_factor == 1 else "P_add",
+    incoming = graph.inputs["x"]
+    if roundtrip_dtype:
+        incoming = graph.cast(graph.cast(incoming, dtype=roundtrip_dtype, id="cast_out"),
+                              dtype=dtype, id="cast_back")
+    incoming = graph.cast(incoming, dtype=compute_dtype, id="P_compute")
+    increment = graph.splat(graph.constant(bias, dtype=compute_dtype, id="bias"), shape, id="bias_tensor")
+    before = graph.add(incoming, increment, id="P" if pre_factor == 1 else "P_add",
                        value_id="v_t" if pre_factor == 1 else "v_pre_add")
     if pre_factor != 1:
-        multiplier = graph.splat(graph.constant(pre_factor, dtype=dtype, id="pre_factor"), shape,
+        multiplier = graph.splat(graph.constant(pre_factor, dtype=compute_dtype, id="pre_factor"), shape,
                                   id="pre_factor_tensor")
         before = graph.mul(before, multiplier, id="P", value_id="v_t")
+    before = graph.cast(before, dtype=dtype, id="P_storage")
     if external:
         before = graph.mark(before, mark_id="before_F", role="input", port_id="F.in")
         external_value = graph.external(before, semantics=semantics, implementation=implementation,
                                   id="F", value_id="v_u")
         external_value = graph.mark(external_value, mark_id="after_F", role="output", port_id="F.out")
     else:
-        scale = graph.splat(graph.constant(factor, dtype=dtype, id="factor"), shape)
+        before = graph.cast(before, dtype=compute_dtype, id="F_compute")
+        scale = graph.splat(graph.constant(factor, dtype=compute_dtype, id="factor"), shape)
         external_value = graph.mul(before, scale, id="F")
         if external_offset is not None:
-            shift = graph.splat(graph.constant(external_offset, dtype=dtype, id="F_offset"), shape)
+            shift = graph.splat(graph.constant(external_offset, dtype=compute_dtype, id="F_offset"), shape)
             external_value = graph.add(external_value, shift, id="F_add")
-    offset_value = graph.splat(graph.constant(offset, dtype=dtype, id="offset"), shape, id="offset_tensor")
+        external_value = graph.cast(external_value, dtype=dtype, id="F_storage")
+    external_value = graph.cast(external_value, dtype=compute_dtype, id="Q_compute")
+    offset_value = graph.splat(graph.constant(offset, dtype=compute_dtype, id="offset"), shape, id="offset_tensor")
     result = graph.add(external_value, offset_value, id="Q" if post_factor == 1 else "Q_add",
                        value_id="v_y" if post_factor == 1 else "v_post_add")
     if post_factor != 1:
-        multiplier = graph.splat(graph.constant(post_factor, dtype=dtype, id="post_factor"), shape,
+        multiplier = graph.splat(graph.constant(post_factor, dtype=compute_dtype, id="post_factor"), shape,
                                   id="post_factor_tensor")
         result = graph.mul(result, multiplier, id="Q", value_id="v_y")
     if tail_offset is not None:
-        tail = graph.splat(graph.constant(tail_offset, dtype=dtype, id="tail"), shape, id="tail_tensor")
+        tail = graph.splat(graph.constant(tail_offset, dtype=compute_dtype, id="tail"), shape, id="tail_tensor")
         result = graph.add(result, tail, id="Q_final", value_id="v_final")
+    result = graph.cast(result, dtype=dtype, id="Q_storage")
     graph.return_(result)
     return module
 
@@ -126,8 +149,12 @@ def round_reference(value: int | float | Fraction, dtype: str, *, negative_zero:
     This oracle quantizes at the exponent-dependent spacing with integer division.
     It does not share production encode/decode code, host half arithmetic or LLVM.
     """
-    if dtype == "i32":
-        return ctypes.c_int32(int(value)).value
+    if dtype == "bool":
+        return bool(value)
+    if dtype in ("i32", "i64"):
+        width = int(dtype[1:])
+        integer = int(value) % (1 << width)
+        return integer - (1 << width) if integer >= 1 << (width - 1) else integer
     if isinstance(value, float):
         if not math.isfinite(value):
             return value
@@ -160,7 +187,7 @@ def round_reference(value: int | float | Fraction, dtype: str, *, negative_zero:
 
 
 def arithmetic_reference(kind: str, left, right, dtype: str):
-    if dtype == "i32":
+    if dtype in ("i32", "i64"):
         return round_reference(left + right if kind == "add" else left * right, dtype)
     if not math.isfinite(left) or not math.isfinite(right):
         return left + right if kind == "add" else left * right
@@ -186,9 +213,17 @@ def fma_reference(left, right, addend, dtype):
 
 def input_values(size: int, dtype: str = "i32") -> list[int | float]:
     randomizer = random.Random(7357 + size)
-    if dtype == "i32":
-        edges = [2147483647, -2147483648, -1, 0, 1, 1073741824, -1073741824]
-        return edges[:size] + [randomizer.randint(-(2**31), 2**31 - 1)
+    if dtype == "bool":
+        return [bool(index % 2) for index in range(size)]
+    if dtype in ("i32", "i64"):
+        width = int(dtype[1:])
+        edges = [2**(width-1)-1, -(2**(width-1)), -1, 0, 1, 2**(width-2), -(2**(width-2))]
+        if dtype == "i64":
+            # Low bits below f32/binary64 precision decide which side of a
+            # bf16 midpoint the integer occupies. Keep them as Python integers.
+            edges += [2**40 + 2**32 + 1, -(2**40 + 2**32 + 1),
+                      2**60 + 2**52 + 1, -(2**60 + 2**52 + 1)]
+        return edges[:size] + [randomizer.randint(-(2**(width-1)), 2**(width-1) - 1)
                               for _ in range(max(0, size - len(edges)))]
     fraction, minimum, maximum = FLOAT_FORMATS[dtype]
     smallest = 2.0**(minimum - fraction)
@@ -200,36 +235,59 @@ def input_values(size: int, dtype: str = "i32") -> list[int | float]:
                           for _ in range(max(0, size - len(edges)))]
 
 
+def cast_reference(value, source, target):
+    """Reference ASK casts, distinct from raw input encoding and F's policies."""
+    if target == "bool":
+        return bool(value)  # NaN is nonzero; either sign of zero is false.
+    if target in ("i32", "i64") and source in FLOAT_FORMATS:
+        width = int(target[1:])
+        lower, upper = -(1 << (width - 1)), (1 << (width - 1)) - 1
+        if math.isnan(value):
+            return 0
+        if value <= lower:
+            return lower
+        if value >= upper:
+            return upper
+        return math.trunc(value)
+    return round_reference(value, target)
+
+
 def expected_values(values, bias, factor, *, pre_factor=1, post_factor=1, dtype="i32",
                     offset=3, tail_offset=None, external_offset=None,
-                    enable_fp_fusion=None, external=True):
-    convert = lambda value: round_reference(value, dtype)
-    add = lambda left, right: arithmetic_reference("add", left, right, dtype)
-    mul = lambda left, right: arithmetic_reference("mul", left, right, dtype)
+                    enable_fp_fusion=None, external=True, compute_dtype=None, roundtrip_dtype=None):
+    compute_dtype = compute_dtype or ("i32" if dtype == "bool" else dtype)
+    convert = lambda value: round_reference(value, compute_dtype)
+    add = lambda left, right: arithmetic_reference("add", left, right, compute_dtype)
+    mul = lambda left, right: arithmetic_reference("mul", left, right, compute_dtype)
+    boundary = lambda value: cast_reference(cast_reference(value, compute_dtype, dtype), dtype, compute_dtype)
     result = []
     for value in values:
-        before = add(convert(value), convert(bias))
+        value = round_reference(value, dtype)
+        if roundtrip_dtype:
+            value = cast_reference(cast_reference(value, dtype, roundtrip_dtype), roundtrip_dtype, dtype)
+        before = add(cast_reference(value, dtype, compute_dtype), convert(bias))
         if pre_factor != 1:
             before = mul(before, convert(pre_factor))
-        if dtype != "i32" and external and external_offset is not None and enable_fp_fusion is not False:
-            middle = fma_reference(before, convert(factor), convert(external_offset), dtype)
+        before = boundary(before)
+        if compute_dtype in FLOAT_FORMATS and external and external_offset is not None and enable_fp_fusion is not False:
+            middle = fma_reference(before, convert(factor), convert(external_offset), compute_dtype)
         else:
             middle = mul(before, convert(factor))
             if external_offset is not None:
                 middle = add(middle, convert(external_offset))
-        after = add(middle, convert(offset))
+        after = add(boundary(middle), convert(offset))
         if post_factor != 1:
             after = mul(after, convert(post_factor))
         if tail_offset is not None:
             after = add(after, convert(tail_offset))
-        result.append(after)
+        result.append(cast_reference(after, compute_dtype, dtype))
     return result
 
 
 def numerically_equal(actual, expected, dtype):
     if len(actual) != len(expected):
         return False
-    if dtype == "i32":
+    if dtype in ("bool", "i32", "i64"):
         return actual == expected
     # Every representable f16/bf16/f32 finite value is exact in Python binary64.
     # Equality plus zero sign therefore checks the full format's value bits.
@@ -250,15 +308,22 @@ class GraphCase:
     floating: bool = False
     extended: bool = False
     numeric_variant: str | None = None
+    storage_types: tuple[str, ...] | None = None
 
     def for_dtype(self, dtype: str):
-        if self.floating and dtype == "i32":
+        if self.storage_types is not None and dtype not in self.storage_types:
+            return None
+        if self.floating and dtype not in FLOAT_FORMATS:
             return None
         options = dict(self.options)
         if self.numeric_variant:
             precision = FLOAT_FORMATS[dtype][0]
             step = 2.0**-precision
-            if self.numeric_variant == "ask_rounding":
+            if self.numeric_variant == "mixed_accumulate":
+                # (x + 2**precision) - 2**precision loses x in low precision,
+                # but preserves these values when evaluated as f32 first.
+                options.update(offset=2**precision, tail_offset=-(2**precision))
+            elif self.numeric_variant == "ask_rounding":
                 options.update(post_factor=1 + step, tail_offset=-(1 + 2 * step))
             else:
                 options.update(bias=-2 * step, factor=1 + step)
@@ -284,6 +349,16 @@ GRAPH_CASES = (
                                     "enable_fp_fusion": True}, floating=True, numeric_variant="F_rounding"),
     GraphCase("F-contract-disabled", {"size": 1, "external_offset": -1.0, "offset": -0.0,
                                      "enable_fp_fusion": False}, floating=True, numeric_variant="F_rounding"),
+    GraphCase("mixed-accumulate", {"size": 129, "bias": 0.0, "factor": 1.0, "compute_dtype": "f32"},
+              floating=True, numeric_variant="mixed_accumulate"),
+    GraphCase("mixed-special", {"size": 17, "bias": -0.0, "factor": 1.0, "offset": -0.0,
+                               "compute_dtype": "f32"}, floating=True),
+    GraphCase("mixed-F-contract-enabled", {"size": 17, "external_offset": -1.0, "offset": -0.0,
+              "compute_dtype": "f32", "enable_fp_fusion": True}, floating=True, numeric_variant="F_rounding"),
+    GraphCase("mixed-F-contract-disabled", {"size": 17, "external_offset": -1.0, "offset": -0.0,
+              "compute_dtype": "f32", "enable_fp_fusion": False}, floating=True, numeric_variant="F_rounding"),
+    *(GraphCase("cast-" + destination, {"size": 129, "bias": 0, "factor": 1, "offset": 0,
+                                       "roundtrip_dtype": destination}) for destination in DTYPES),
     GraphCase("block-end", {"size": 127}, extended=True),
     GraphCase("whole-block", {"size": 128}, extended=True),
     GraphCase("multi-block", {"size": 4097}, extended=True),
@@ -294,4 +369,9 @@ GRAPH_CASES = (
     GraphCase("changed-ask-constant", {"size": 10, "bias": 2}, extended=True),
     GraphCase("changed-F-DSL", {"size": 10, "factor": 3}, extended=True),
     GraphCase("changed-shape", {"size": 11}, extended=True),
+    GraphCase("changed-compute-type", {"size": 10, "compute_dtype": "f32"}, extended=True,
+              storage_types=("f16", "bf16")),
+    GraphCase("mixed-underflow", {"size": 17, "bias": -0.0, "factor": 2.0,
+                                 "pre_factor": 2.0, "post_factor": 0.5, "offset": -0.0,
+                                 "compute_dtype": "f32"}, extended=True, floating=True),
 )

@@ -17,7 +17,7 @@ LLVM 链接和内联已抽成[与编译器无关的值边界接口](13-通用LLV
 
 这条路径没有使用 Triton 原来的 cubin，也没有在 CPU 上先执行 P/Q。导出目录中的 `ask.helpers.ll` 和 `external.ll` 是合并的两个输入，`fused.ll` 是实际代码生成的输入。
 
-浮点图使用同一条路径：f32 / f16 / bf16 的 helper 参数和结果分别是 LLVM `float` / `half` / `bfloat`，常量保留该类型的位模式，加乘降为 `fadd` / `fmul`。ASK 不给这些操作加 fast-math 或 contract。dtype 必须在 ASK 图、边界契约、端口表和实际 LLVM 标记类型之间一致；占用相同字节数不代表类型可以互换。
+浮点图使用同一条路径：f32 / f16 / bf16 的 helper 参数和结果分别是 LLVM `float` / `half` / `bfloat`，常量保留该类型的位模式，加乘降为 `fadd` / `fmul`。ASK 不给这些操作加 fast-math 或 contract。每个边界的 dtype 必须在 ASK 图、边界契约、端口表和实际 LLVM 标记类型之间一致；占用相同字节数不代表类型可以互换。P/Q 内部可通过 `ask.cast` 显式使用不同计算类型，进入或离开 F 前仍恢复声明的存储类型；规则见[类型转换与混合精度](15-类型转换与混合精度.md)。
 
 这里还需要补全 F 的代码生成设置。Triton 默认允许乘加收缩，但导出的 LLVM 文本可能只有普通 `fmul`、`fadd`，这项许可留在 backend 的 `enable_fp_fusion` 中。适配器记录实际设置；边界检查通过后，只给原始 F 的浮点加减乘写入对应的 `contract` 标志，再内联不带该标志的 ASK helper。`llc` 使用 `-fp-contract=on`，只收缩 IR 已允许的运算。这样 F 内部仍可生成 FMA，ASK 的运算不会因融合而丢掉中间舍入。请求可显式给出 `enable_fp_fusion=False`，ASK 同样保留；显式 LLVM FMA 的含义也保持不变。
 
@@ -30,15 +30,15 @@ sm80 上，LLVM 可以用 `fma.rn.bf16(x, y, -0)` 表达一次 bf16 乘法，用
 ```python
 i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
 x = tl.load(input_ptr + i, mask=i < N, other=0)
-# 可有若干仅由 x、此前结果、同元素类型常量组成的加、减、乘。
+# 可有仅由 x、此前结果、数值常量组成的加、减、乘，以及显式 .to(...)。
 tl.store(output_ptr + i, x * 2, mask=i < N)
 ```
 
-AST 检查要求只有一次逻辑输入读、一次逻辑输出写，二者索引和掩码相同。禁止指针逃逸、未知调用、原子操作、分支、循环和归约。无法说明整个函数体，就返回 `UnsupportedFusion`。一个线程处理多个元素时，编译器可以把逻辑边界展开成多个 LLVM 站点；导出器记录数量，融合器逐个处理。
+数值数据流中的 `.to(tl.float32)`、`.to(value.dtype)` 等转换保留 F 自己的数值策略；不会用 ASK cast 的规则替换 Triton cast。AST 检查要求只有一次逻辑输入读、一次逻辑输出写，二者索引和掩码相同。禁止指针逃逸、未知调用、原子操作、分支、循环和归约。无法说明整个函数体，就返回 `UnsupportedFusion`。一个线程处理多个元素时，编译器可以把逻辑边界展开成多个 LLVM 站点；导出器记录数量，融合器逐个处理。
 
-适配器用公开 `tl.inline_asm_elementwise` 在读取结果、写入值上各插入一个已知 identity，32 位类型用 `mov.b32`、16 位类型用 `mov.b16` 复制值。它显式携带值、地址、索引和掩码。编译时暂用 `is_pure=False` 保留这两个位置；这只是低层追踪手段，不是给高层 `ask.mark` 增加副作用。标记既不读写内存，也不做同步，融合结束后必须全部删除。
+适配器用公开 `tl.inline_asm_elementwise` 在读取结果、写入值上各插入一个已知 identity，64 位类型用 `mov.b64`、32 位类型用 `mov.b32`、16 位类型用 `mov.b16` 复制位模式；bool 使用 `mov.pred` 透传 i1。它显式携带值、地址、索引和掩码。编译时暂用 `is_pure=False` 保留这两个位置；这只是低层追踪手段，不是给高层 `ask.mark` 增加副作用。标记既不读写内存，也不做同步，融合结束后必须全部删除。
 
-标记的值类型来自请求：i32 用 `tl.int32`，f32 用 `tl.float32`，f16 / bf16 用 `tl.float16` / `tl.bfloat16`。寄存器约束与宽度相符，值始终保持原类型，不经过整数数值转换或扩大精度。地址、索引、掩码继续使用各自的指针或整数类型，访存步长按元素字节数检查。
+标记的逻辑值类型来自请求：bool 用 `tl.int1`，i32 / i64 用 `tl.int32` / `tl.int64`，f32 用 `tl.float32`，f16 / bf16 用 `tl.float16` / `tl.bfloat16`。底层按标记协议搬运位模式，再恢复对应 LLVM 值类型；追踪不会改变数值。地址、索引、掩码继续使用各自的指针或整数类型，访存步长按元素字节数检查。
 
 Triton 的公开 asm API 会用首个参数检查广播。浮点标记因此把整数索引放在首位，值放第二位；契约显式记录每个参数的位置，绑定层按 dtype 验证。ASK 图到通用内联器的衔接读取绑定结果，不再假设 `arg0` 永远是值。
 
@@ -52,13 +52,13 @@ Triton 绑定层识别 ASK 自己定义的标记协议，核对 LLVM 调用类�
 
 | 项目 | 当前要求 |
 |---|---|
-| ASK 图 | 一个函数、一个任意 rank 静态 i32 / f32 / f16 / bf16 输入、一个同形状输出、一个 external |
-| P / Q | `constant/splat/add/mul`；P 只依赖图输入，Q 只依赖 F 输出及常量 |
+| ASK 图 | 一个函数、一个任意 rank 静态 bool / i32 / i64 / f32 / f16 / bf16 输入、一个同形状同存储 dtype 输出、一个 external |
+| P / Q | `constant/splat/add/mul/cast`；P 只依赖图输入，Q 只依赖 F 输出及常量；计算 dtype 可显式改变 |
 | F | 上述数据流子集，Triton 3.7.1；identity 可展开成多对 LLVM 调用 |
 | 形状 | `1 <= N <= 2147483520`，N 是 ASK 张量元素总数，ShapeSnapshot 保留原始维度 |
 | 固定策略 | BLOCK 为 1–1024 的二次幂；4 或 8 warps；`grid=[ceil(N/BLOCK),1,1]`；保留请求策略，无共享或 scratch 存储 |
-| 目标 | CUDA sm80，warp32；运行器核对设备二进制兼容性 |
-| ABI | 两个带 i32 / f32 / f16 / bf16 端口类型的数据指针、两个已证明未使用的 scratch 指针，后两者传 null |
+| 目标 | 按请求选择普通 CUDA sm >= 70，warp32；含 bf16 要求 sm >= 80；后端支持和设备二进制兼容性另查 |
+| ABI | 两个相同存储 dtype 的数据指针、两个已证明未使用的 scratch 指针，后两者传 null；bool 每元素 1 字节 |
 | 运行输入 | Python 数值列表，按产物 dtype 打包到连续且互不重叠的设备缓冲区 |
 
 这些限制属于首个适配器和融合 Pass，不是 ASK IR 的通用规则。F 的 DSL 算法、grid、warps 和布局由请求确定；ASK 不为融合改选这些参数。没有覆盖的图会报不支持，当前没有完整混合图调度器替它自动选择三次独立调用。零长度融合也明确拒绝。
@@ -83,9 +83,9 @@ print(kernel.cache["status"], kernel.cache["counters"])
 
 Python SDK 本身不导入 Triton 或 CUDA。显式调用编译入口时先检查构建允许清单，`none` 构建在读缓存、启动 worker 前就拒绝请求。`run` 才加载 CUDA driver；无需 PyTorch、NumPy 或 CUDA Python 包。
 
-`kernel.run(values)` 从产物读取 dtype，选择对应的 32 位或 16 位编码。调用方无需挑选另一套执行函数。例如 `TensorType(shape, "bf16")` 配合 `graph.constant(value, dtype="bf16")`，Triton 签名写 `*bf16`；fp16 可写 `TensorType(shape, "fp16")`，会规范为 ASK `f16`，对应 Triton `*fp16`。完整类型规则见[框架接入](10-上层框架接入.md#dtype-path)。
+`kernel.run(values)` 从产物读取 dtype，选择对应的 1 / 2 / 4 / 8 字节编码。调用方无需挑选另一套执行函数。例如 `TensorType(shape, "bf16")` 配合 `graph.constant(value, dtype="bf16")`，Triton 签名写 `*bf16`；fp16 可写 `TensorType(shape, "fp16")`，会规范为 ASK `f16`，对应 Triton `*fp16`。完整类型规则见[框架接入](10-上层框架接入.md#dtype-path)。
 
-运行 bf16 时先读取实际设备的 compute capability，低于 8.0 就抛出带设备名称和能力版本的 `CUDAError`，发生在 context 创建、模块加载、设备分配和 launch 之前。缓存命中不能跳过这项检查。导出器也拒绝低于 sm80 的 bf16 编译目标。类型不支持与 cubin 不兼容分别报告，不静默改成 f32。
+图中任何值使用 bf16，包括 f32 输入、bf16 中间值、f32 输出的情况，运行前都先读取实际设备的 compute capability；major 小于 8 就抛出带设备名称和能力版本的 `CUDAError`，发生在 context 创建、模块加载、设备分配和 launch 之前。缓存命中不能跳过这项检查。导出器和 ASK 代码生成也拒绝低于 sm80 的 bf16 编译目标。普通图按请求架构生成 PTX / cubin，不固定为 sm80。后端不认识目标、实际硬件缺少 bf16、cubin 不兼容分别报告，不静默改成 f32。
 
 `--capabilities` 中的 `gpu_execution` / `cuda_execution_via_python` 描述本构建是否启用了这条 SDK 路径，不是 GPU 探测结果。`ask-opt` 本身没有 launch 命令，实际工具和设备是否可用由编译、运行时检查。
 
@@ -138,10 +138,10 @@ PYTHONPATH=python python3 examples/triton_fused_gpu.py \
   --ptxas /path/to/triton/backends/nvidia/bin/ptxas \
   --cache-dir build/new-validation-cache \
   --output-dir build/new-validation-results \
-  --dtypes i32 f32 f16 bf16
+  --dtypes bool i32 i64 f32 f16 bf16
 ```
 
-脚本要求新缓存，每个有效的图与 dtype 组合执行冷、热两次编译。基础矩阵覆盖单元素、尾部 mask、多维形状、多站点、长表达式、溢出和特殊值；浮点还检查逐步舍入与 FMA 开关。`--cases` 可以只选某几张图，`--extended` 添加大形状、更多启动策略，以及只修改 ASK 常量、F DSL 或形状的缓存失效用例。
+脚本要求新缓存，每个有效的图与 dtype 组合执行冷、热两次编译。基础矩阵覆盖单元素、尾部 mask、多维形状、多站点、长表达式、溢出和特殊值；六种类型遍历 6×6 cast 方向，浮点还检查逐步舍入、显式 f32 中间计算与 FMA 开关。`--cases` 可以只选某几张图，`--extended` 添加大形状、更多启动策略，以及只修改 ASK 常量、F DSL 或形状的缓存失效用例。
 
 参考计算使用独立的精确有理数实现，按声明格式在每个操作后舍入。有限结果和零的符号必须一致；NaN 比较类别。不会把 f32 参考结果最后转为 f16 / bf16，就当成低精度图的答案。图定义、参考实现、硬件拒绝测试与扩展方法见[多精度测试](14-多精度测试.md)。
 
@@ -149,6 +149,19 @@ PYTHONPATH=python python3 examples/triton_fused_gpu.py \
 
 无 GPU 的测试另行检查真实 Triton 导出后的 LLVM link/inline、失配的形状/摘要/边界拒绝，以及缓存损坏、失败后重试和多进程竞争。相关实现：[通用内联](../lib/LLIR/Inline.cpp)、[ASK 图衔接](../lib/LLIR/Fuse.cpp)、[Triton 边界绑定](../lib/Adapters/TritonBoundary.cpp)、[Triton 边界导出](../adapters/triton/fusion.py)、[GPU 编译入口](../python/ask/gpu.py)、[CUDA 运行器](../python/ask/cuda.py)、[IR 缓存](../python/ask/cache.py)。
 
-在 RTX 3080（sm86）上使用 Triton 3.7.1、锁定 LLVM 23.0.0git 和 ptxas 12.8.93 实测，四种精度的基础矩阵完成 86 次融合执行；另外选取 f16 / bf16 的三维、8-warp、BLOCK512 和单因素缓存失效用例，完成 24 次。合计 110 次全部通过，比较 i32 1404 个、f32 1702 个、f16 3014 个、bf16 3014 个结果；IR 缓存 55 次命中、55 次未命中。每次都核对逻辑形状、dtype、报告入口以及实际执行的新 cubin。
+在 RTX 3080（sm86）上使用 Triton 3.7.1、锁定 LLVM 23.0.0git 和 ptxas 12.8.93 实测：六类型基础矩阵按 sm80 编译，完成 208 次执行；sm86 专项完成 58 次，覆盖三维、8-warp、BLOCK512、计算类型变化、低精度下溢及 i64 舍入边界。合计 266 次融合执行全部通过，比较 28842 个结果，IR 缓存 133 次命中、133 次未命中，失效条目为零。
 
-舍入敏感例中，ASK 的独立乘加在三种浮点格式下都得到 `+0`；F 开启 FMA 时，f32 / f16 / bf16 分别得到 `-2^-46`、`-2^-20`、`-2^-14`，关闭后都得到 `+0`。冷、热缓存一致，最小非正规数和负零也通过。核心构建 10 组 CTest、Triton 构建 12 组 CTest 全部通过，none / all / triton 构建及安装后的低精度 prepare/optimize 均验证通过。bf16 不支持的设备使用模拟能力值验证提前拒绝；缓存损坏重建另有自动测试覆盖。这里只证明表中子集，未宣称任意 Triton kernel 可以融合。
+| dtype | GPU 执行次数 | 比较结果数 |
+|---|---:|---:|
+| bool | 34 | 4460 |
+| i32 | 34 | 4460 |
+| i64 | 34 | 4460 |
+| f32 | 52 | 5118 |
+| f16 | 56 | 5172 |
+| bf16 | 56 | 5172 |
+
+六种类型的 36 个 cast 方向、显式 f32 中间计算、NaN / 无穷 / 负零 / 非正规数、饱和转换和整数回绕均经过同一组图与独立参考验证。低精度的 `(x + large) - large` 例子确认 f32 中间计算保留了原本会丢失的 ULP；F 的 FMA 开关与 ASK 的独立舍入分别检查。每次实际执行的新 cubin、类型、形状和产物摘要均已核对，两个矩阵的原始记录也按计划重新审计，未漏跑或重复计数。
+
+另有一次普通、未融合的 F 执行：f32 端口内部先转 bf16 再转回 f32，29 个边界值在 GPU 上全部通过；相同 DSL 的 sm75 导出明确拒绝。这次执行不计入上面的融合缓存统计。不支持 bf16 的实际设备路径使用模拟能力 7.5 验证，确认未创建 context、分配显存或 launch。
+
+核心构建 10 组 CTest、Triton 构建 12 组 CTest、all 构建 12 组 CTest 均通过；Triton 测试含 49 项适配器测试。安装后的六类型 SDK、host 转换、外部混合精度融合和 C++ 下游链接也通过。开发机 CPU 没有 BF16 feature，host 正确拒绝；支持 BF16 的 CPU 分支已检查能力策略及生成代码，但尚无该类 CPU 的实机执行记录。这里验证的是本章列出的子集，未宣称任意 Triton kernel 都能融合。

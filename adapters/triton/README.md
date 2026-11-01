@@ -6,20 +6,29 @@ patch Triton, replace compiler stages, invoke private hooks, or launch a kernel.
 The core communicates with this Python process; importing the worker module alone
 does not import Triton.
 
-The currently tested configuration is:
+The current adapter contract is:
 
 - Triton 3.7.1; observed Python 3.14.7.
-- CUDA `arch=80`, `warp_size=32`, requested `num_warps=4` or `8`.
-- One `@triton.jit` entry, two matching `*i32`, `*fp32`, `*fp16`, or `*bf16` data pointers, integer `tl.constexpr` values.
+- CUDA ordinary `arch >= 70`, `warp_size=32`, requested `num_warps=4` or `8`; BF16 requires `arch >= 80`. The requested integer architecture is retained; Triton, LLVM and ptxas must also support it. Suffixed targets such as `90a` are not accepted.
+- One `@triton.jit` entry, two matching `*i1`, `*i32`, `*i64`, `*fp32`, `*fp16`, or `*bf16` data pointers, integer `tl.constexpr` values.
 - One logical input and one logical output, with explicit source parameter bindings.
 - No shared, global scratch, profile scratch, tensor descriptors, or cooperative resources.
 
-`fp16` uses the ASK spelling `f16`; `bf16` remains distinct despite the same
-two-byte storage size. A bf16 target below sm80 is rejected before compilation.
-The CUDA runner also checks the actual selected device before context creation
-or launch; a supported export target is not proof of device support.
+`*i1` corresponds to ASK `bool`: LLVM computation uses i1, while each buffer
+element occupies one byte containing 0 or 1. `i64` uses signed interpretation and
+ASK arithmetic wraps at 64 bits. `fp16` uses the ASK spelling `f16`; `bf16` remains
+distinct despite the same two-byte storage size. BF16 pointer types reject targets
+below sm80 before compilation. Internal computation types are also collected from
+the public `compiled.asm["ttir"]` output, excluding comments, strings and names;
+an internal BF16 conversion rejects an older target before artifact publication.
+The resulting top-level `required_element_types` applies to ordinary exports as
+well as fusion. The CUDA runner checks the actual selected device
+before context creation, requiring compute capability major >= 8 whenever any
+ASK value or the external computation requires BF16. Intermediate BF16 casts
+count too. Backend target support, BF16 device capability, and cubin compatibility
+are separate checks.
 
-Other configurations fail explicitly. Supporting another compiler version requires
+Configurations outside this contract fail explicitly. Supporting another compiler version requires
 checking its physical ABI and updating the tests, not merely removing the version
 check. The source format allows `import triton`, `import triton.language as tl`,
 and the single entry definition. It is a source-format restriction, not a security
@@ -101,7 +110,10 @@ An additional request field `"fusion": {"enabled": true}` asks the adapter to
 validate a one-load/one-store pointwise typed dataflow and insert two logical
 identity traces through public `tl.inline_asm_elementwise`. Local aliases,
 reassignments, equivalent affine arithmetic and positional/keyword arguments
-are accepted without prescribing a single source template. It compares the
+are accepted without prescribing a single source template. Explicit numeric
+`.to(tl.float32)` and `.to(value.dtype)` conversions are checked as dataflow;
+the adapter retains their Triton semantics and does not replace them with ASK
+cast rules. Pointer conversions and unknown calls remain unsupported. It compares the
 unmodified and traced kernels' blocked layouts and execution metadata. Ordinary
 export requests keep their existing behavior.
 
@@ -111,14 +123,20 @@ lower to multiple LLVM calls, so the contract records actual `marker_count`
 for each boundary. All sites are bound before using the compiler-independent
 [LLVM value inliner](../../include/ask/LLIR/Inline.h).
 
-Markers preserve LLVM `float`, `half`, or `bfloat` values directly. The 16-bit
-formats use `mov.b16`; 32-bit formats use `mov.b32`. No precision conversion is
-introduced by tracing. Address validation uses the actual element byte width.
+Markers preserve the declared logical value type. The 16-bit formats use
+`mov.b16`, 32-bit formats use `mov.b32`, and i64 uses `mov.b64`; bool uses
+`mov.pred` to preserve its i1 value. These are bit-preserving
+traces, not numeric casts. Address validation uses the actual element byte width.
 The producer's optional `enable_fp_fusion` setting is recorded and normalized
 onto F's own instructions before inserting separately rounded ASK helpers.
 
-Native and GPU tests share one graph builder across i32/f32/f16/bf16, with an
-independent exact arithmetic oracle. See [multi-precision tests](../../docs/14-多精度测试.md).
+Native and GPU tests share one graph builder across bool/i32/i64/f32/f16/bf16,
+with an independent exact arithmetic oracle. Its `compute_dtype`,
+`roundtrip_dtype`, and `arch` parameters produce explicit ASK casts and matching
+F source without copying the graph per type. The current fusion path still has
+one external region and matching storage dtypes on all boundaries; P/Q may use
+other explicit intermediate types. See [multi-precision tests](../../docs/14-多精度测试.md)
+and [cast and mixed-precision rules](../../docs/15-类型转换与混合精度.md).
 
 The response includes `instrumented_source` and a versioned `fusion_contract`
 bound to original source, instrumented source and exact LLVM content hashes.

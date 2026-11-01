@@ -60,7 +60,7 @@ class CUDAContractTests(unittest.TestCase):
             result = self.compile_fixture(directory, value)
             self.assertEqual(result["commands"][0][1:4],
                              ["-march=nvptx64", "-mcpu=sm_80", "-mattr=+ptx80"])
-            self.assertEqual(result["commands"][0][4], "--fp-contract=on")
+            self.assertEqual(result["commands"][0][4], "--fp-contract=fast")
             self.assertEqual(result["commands"][0][5], str(directory / "source.ll"))
             self.assertEqual(result["commands"][1][1], "--gpu-name=sm_80")
             self.assertFalse(result["original_triton_binary_used"])
@@ -95,7 +95,7 @@ class CUDAContractTests(unittest.TestCase):
             lambda a: a["invocation"].update(grid=[2, 1, 1]),
             lambda a: a["invocation"].update(block=[64, 1, 1]),
             lambda a: a["invocation"].update(shared_bytes=4),
-            lambda a: a["target"].update(arch=90),
+            lambda a: a["target"].update(arch="90a"),
             lambda a: a["specializations"]["constants"].update(N=-1),
             lambda a: a["specializations"]["constants"].update(N=True),
             lambda a: a["specializations"]["constants"].update(N=129),
@@ -189,6 +189,37 @@ class CUDAContractTests(unittest.TestCase):
         source, _ = _host_buffers([value], 1, "f32")
         self.assertEqual(source[0], float(2**100 + 2**77))
 
+    def test_bool_and_i64_buffers_keep_their_storage_width_and_values(self):
+        for dtype, values, width in (("bool", [False, True], 1),
+                                     ("i64", [-(2**63), 2**63 - 1, 2**53 + 1, -1], 8)):
+            source, _ = _host_buffers(values, len(values), dtype)
+            self.assertEqual(ctypes.sizeof(source), len(values) * width)
+            self.assertEqual(_decode_output(source, len(values), dtype), values)
+        for dtype, value in (("bool", 1), ("bool", "false"), ("i64", True),
+                             ("i64", 2**63), ("i64", -(2**63) - 1), ("i64", 1.0)):
+            with self.subTest(dtype=dtype, value=value), self.assertRaises(CUDAError):
+                _host_buffers([value], 1, dtype)
+
+    def test_declared_target_drives_codegen_without_changing_producer_strategy(self):
+        for arch in (75, 86, 90):
+            with self.subTest(arch=arch), tempfile.TemporaryDirectory() as temporary:
+                value = artifact(1)
+                value["target"]["arch"] = arch
+                codegen = self.compile_fixture(Path(temporary), value)
+                self.assertEqual(codegen["arch"], arch)
+                self.assertIn(f"-mcpu=sm_{arch}", codegen["commands"][0])
+                self.assertIn(f"--gpu-name=sm_{arch}", codegen["commands"][1])
+
+    def test_internal_bf16_requires_a_capable_compilation_target(self):
+        value = artifact(1, dtype="i32")
+        value["target"]["arch"] = 75
+        value["fusion_contract"] = {"dtype": "i32", "required_element_types": ["i32", "bf16"]}
+        with tempfile.TemporaryDirectory() as temporary, patch("ask.cuda.subprocess.run") as compiler:
+            with self.assertRaisesRegex(CUDAError, "bf16 compilation requires"):
+                compile_cuda(Path(temporary) / "missing.ll", value, temporary,
+                             llc="/test/llc", ptxas="/test/ptxas")
+            compiler.assert_not_called()
+
     def test_low_precision_buffers_preserve_bits_and_decode_values(self):
         for dtype, fraction_bits, minimum in (("f16", 10, 2**-24), ("bf16", 7, 2**-133)):
             with self.subTest(dtype=dtype):
@@ -225,17 +256,22 @@ class CUDAContractTests(unittest.TestCase):
             def attribute(self, device, attribute):
                 return {75: 7, 76: 5}[attribute]
 
-        with tempfile.TemporaryDirectory() as temporary:
-            value = artifact(1, dtype="bf16")
-            codegen = self.compile_fixture(Path(temporary), value)
-            driver = UnsupportedDriver()
-            with patch("ask.cuda._Driver", return_value=driver):
-                with self.assertRaisesRegex(CUDAError, r"bf16 requires hardware support.*7\.5"):
-                    execute(value, codegen, [1.0])
-            self.assertNotIn("cuCtxCreate_v2", driver.calls)
-            self.assertNotIn("cuModuleLoadDataEx", driver.calls)
-            self.assertNotIn("cuMemAlloc_v2", driver.calls)
-            self.assertNotIn("cuLaunchKernel", driver.calls)
+        for dtype, location in (("bf16", None), ("i32", "fusion_contract"), ("f32", "artifact")):
+            with self.subTest(dtype=dtype, location=location), tempfile.TemporaryDirectory() as temporary:
+                value = artifact(1, dtype=dtype)
+                if location == "fusion_contract":
+                    value["fusion_contract"] = {"dtype": "i32", "required_element_types": ["i32", "bf16"]}
+                elif location == "artifact":
+                    value["required_element_types"] = ["f32", "bf16"]
+                codegen = self.compile_fixture(Path(temporary), value)
+                driver = UnsupportedDriver()
+                with patch("ask.cuda._Driver", return_value=driver):
+                    with self.assertRaisesRegex(CUDAError, r"bf16 requires hardware support.*7\.5"):
+                        execute(value, codegen, [1])
+                self.assertNotIn("cuCtxCreate_v2", driver.calls)
+                self.assertNotIn("cuModuleLoadDataEx", driver.calls)
+                self.assertNotIn("cuMemAlloc_v2", driver.calls)
+                self.assertNotIn("cuLaunchKernel", driver.calls)
         for capability in ((8, 0), (8, 6), (9, 0)):
             _check_device_dtype("bf16", *capability, "supported")
         _check_device_dtype("f16", 7, 5, "no bf16, still has fp16")
@@ -263,7 +299,7 @@ class CUDAContractTests(unittest.TestCase):
                 driver.assert_not_called()
 
     def test_float_codegen_preserves_raw_and_fused_contraction_policies(self):
-        for dtype in ("f32", "f16", "bf16"):
+        for dtype in ("bool", "i32", "i64", "f32", "f16", "bf16"):
             for fused in (False, True):
                 for enabled in (False, True):
                     with self.subTest(dtype=dtype, fused=fused, enabled=enabled), tempfile.TemporaryDirectory() as temporary:
@@ -274,7 +310,9 @@ class CUDAContractTests(unittest.TestCase):
                             value["validation"] = {"stage": "fused_llvm", "llvm_module_verified": True}
                             value["source_fusion_contract"] = {"dtype": dtype, "numerics": dict(metadata)}
                             value["fusion"] = {
-                                "ask_numerics": f"{dtype}-rne-no-fast-math-no-contract",
+                                "ask_numerics": ("bool-exact" if dtype == "bool" else dtype + "-wrap"
+                                                 if dtype in ("i32", "i64") else f"{dtype}-rne-no-fast-math-no-contract"),
+                                "required_element_types": [dtype, "f32"],
                                 "producer_numerics": {
                                     "producer_enable_fp_fusion": enabled, "producer_enable_reflect_ftz": True,
                                     "representation": "original-F-instruction-contract-flags"}}
@@ -303,7 +341,8 @@ class CUDAContractTests(unittest.TestCase):
 
     def test_failed_launch_is_not_replayed_and_resources_are_released(self):
         class FakeDriver:
-            def __init__(self):
+            def __init__(self, major=8, minor=6):
+                self.major, self.minor = major, minor
                 self.calls, self.freed = [], []
                 self.library = SimpleNamespace(
                     cuFuncGetParamInfo=lambda *a: 1,
@@ -313,7 +352,7 @@ class CUDAContractTests(unittest.TestCase):
                 self.next_pointer = 1000
 
             def attribute(self, device, attribute):
-                return {75: 8, 76: 6, 10: 32}.get(attribute, 2**20)
+                return {75: self.major, 76: self.minor, 10: 32}.get(attribute, 2**20)
 
             def function_attribute(self, function, attribute):
                 return {0: 128, 1: 0, 4: 14}[attribute]
@@ -332,17 +371,20 @@ class CUDAContractTests(unittest.TestCase):
                 elif name == "cuLaunchKernel":
                     raise CUDAError("injected launch failure")
 
-        with tempfile.TemporaryDirectory() as temporary:
-            value = artifact()
-            result = self.compile_fixture(Path(temporary), value)
-            driver = FakeDriver()
-            with patch("ask.cuda._Driver", return_value=driver):
-                with self.assertRaisesRegex(CUDAError, "injected launch failure"):
-                    execute_i32(value, result, [0] * 10)
-            self.assertEqual(driver.calls.count("cuLaunchKernel"), 1)
-            self.assertEqual(driver.freed, [2000, 1000])
-            self.assertEqual(driver.calls[-2:], ["unload", "destroy"])
-            self.assertNotIn("cuMemcpyDtoH_v2", driver.calls)
+        for dtype, arch, capability in (("i32", 80, (8, 6)), ("bf16", 80, (8, 6)),
+                                         ("bf16", 90, (9, 0))):
+            with self.subTest(dtype=dtype, arch=arch), tempfile.TemporaryDirectory() as temporary:
+                value = artifact(dtype=dtype)
+                value["target"]["arch"] = arch
+                result = self.compile_fixture(Path(temporary), value)
+                driver = FakeDriver(*capability)
+                with patch("ask.cuda._Driver", return_value=driver):
+                    with self.assertRaisesRegex(CUDAError, "injected launch failure"):
+                        execute(value, result, [0] * 10)
+                self.assertEqual(driver.calls.count("cuLaunchKernel"), 1)
+                self.assertEqual(driver.freed, [2000, 1000])
+                self.assertEqual(driver.calls[-2:], ["unload", "destroy"])
+                self.assertNotIn("cuMemcpyDtoH_v2", driver.calls)
 
 
 if __name__ == "__main__":

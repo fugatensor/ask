@@ -43,6 +43,52 @@ def float_request():
 
 
 class BoundarySourceTests(unittest.TestCase):
+    def test_numeric_casts_preserve_source_and_prove_only_values(self):
+        for expression in ("(value.to(tl.float32) * 1.25 + 0.1).to(value.dtype)",
+                           "tl.cast(value, tl.float32) * 1.25",
+                           "value.to(dtype=tl.float16, fp_downcast_rounding='rtz')",
+                           "value.to(tl.int32, bitcast=True)"):
+            with self.subTest(expression=expression):
+                value = float_request()
+                value["source"] = value["source"].replace("value * 1.25 + 0.1", expression)
+                source, contract = fusion.instrument(worker.validate_request(value))
+                self.assertIn(ast.unparse(ast.parse(expression, mode="eval")), source)
+                self.assertTrue(contract["proof"]["no_pointer_escape"])
+                self.assertEqual(contract["dtype"], "f32")
+        rejected = ("t.to(tl.int64)", "value.to(tl.pointer_type(tl.float32))",
+                    "value.to(t.dtype)", "value.to(unknown_dtype())",
+                    "value.to(tl.float32, hook())", "value.to(tl.float32, bitcast=hook())",
+                    "value.to(tl.float32, fp_downcast_rounding=hook())",
+                    "value.to(tl.float32, unsupported=True)", "value.unknown(tl.float32)")
+        for expression in rejected:
+            with self.subTest(expression=expression):
+                value = float_request()
+                value["source"] = value["source"].replace("value * 1.25 + 0.1", expression)
+                with self.assertRaises(fusion.FusionError):
+                    fusion.instrument(worker.validate_request(value))
+        value = float_request()
+        value["source"] = value["source"].replace("value * 1.25 + 0.1", "value.to(tl.bfloat16).to(value.dtype)")
+        value["target"]["arch"] = 75
+        with self.assertRaisesRegex(fusion.FusionError, "bf16 computation requires"):
+            fusion.instrument(worker.validate_request(value))
+
+    def test_bool_and_i64_trace_widths_and_large_integer_values(self):
+        for dtype, signature, opcode, constraints, width in (
+                ("bool", "*i1", "mov.pred", "=b,r,b,l,r", 1),
+                ("i64", "*i64", "mov.b64", "=l,r,l,l,r", 8)):
+            with self.subTest(dtype=dtype):
+                value = request()
+                value["signature"] = {name: signature for name in value["signature"]}
+                value["source"] = value["source"].replace("value * 2", "value" if dtype == "bool" else
+                                                         "value + 9223372036854775807")
+                source, contract = fusion.instrument(worker.validate_request(value))
+                for role in ("input", "output"):
+                    self.assertIn(opcode + " $0, $2;", contract[role]["marker_asm"])
+                    self.assertEqual(contract[role]["constraints"], constraints)
+                    self.assertEqual(contract[role]["storage_bytes"], width)
+                self.assertEqual(contract["dtype"], dtype)
+                self.assertEqual(contract["required_element_types"], [dtype])
+
     def test_low_precision_markers_copy_sixteen_bits_without_promoting_values(self):
         for dtype, signature, tl_type in (("f16", "*fp16", "tl.float16"),
                                          ("bf16", "*bf16", "tl.bfloat16")):
@@ -164,7 +210,7 @@ def scale2(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
         source, contract = fusion.instrument(worker.validate_request(value))
         self.assertIn("read_at", source)
         self.assertIn("value * 2", source)
-        self.assertEqual(contract["proof"]["source_subset"], "affine-pointwise-typed-v4")
+        self.assertEqual(contract["proof"]["source_subset"], "affine-pointwise-typed-casts-v5")
         self.assertEqual(contract["shape"], [10])
 
     def test_index_need_not_have_a_specific_local_variable(self):
@@ -229,7 +275,6 @@ def scale2(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
             "reassigned_index": original.replace("    tl.store", "    i = i + 1\n    tl.store"),
             "branch": original.replace("    tl.store", "    if N > 0:\n        value = value + 1\n    tl.store"),
             "loop": original.replace("    tl.store", "    for j in range(2):\n        value = value + 1\n    tl.store"),
-            "float": original.replace("value * 2", "value * 2.0"),
             "division": original.replace("value * 2", "value // 2"),
         }
         for label, source in rejected.items():
@@ -266,6 +311,43 @@ def scale2(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
 
 @unittest.skipUnless(PYTHON, "set ASK_TEST_TRITON_PYTHON for real trace exports")
 class RealBoundaryExportTests(unittest.TestCase):
+    def test_bool_i64_and_explicit_fp32_accumulation_keep_requested_targets(self):
+        cases = (("bool", "*i1", "tl.int32", 75, "i1", 1),
+                 ("i64", "*i64", None, 86, "i64", 8),
+                 ("f16", "*fp16", "tl.float32", 86, "half", 2),
+                 ("bf16", "*bf16", "tl.float32", 80, "bfloat", 2))
+        with tempfile.TemporaryDirectory(prefix="ask-mixed-boundary-export-") as directory:
+            directory = Path(directory)
+            for dtype, signature, compute, arch, llvm_type, width in cases:
+                with self.subTest(dtype=dtype, arch=arch):
+                    value = request()
+                    value["signature"] = {name: signature for name in value["signature"]}
+                    value["target"]["arch"] = arch
+                    expression = f"(value.to({compute}) * 2 + 1).to(value.dtype)" if compute else "value * 2"
+                    value["source"] = value["source"].replace("value * 2", expression)
+                    source, output = directory / "request.json", directory / "artifact.json"
+                    source.write_text(json.dumps(value))
+                    result = subprocess.run([PYTHON, str(ROOT / "worker.py"), "--request", str(source),
+                                             "--output", str(output)], text=True,
+                                            capture_output=True, timeout=180)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    artifact = json.loads(output.read_text())
+                    self.assertEqual(artifact["target"]["arch"], arch)
+                    self.assertEqual(artifact["invocation"]["compiler_metadata"]["target"], value["target"])
+                    self.assertIn(f"call {llvm_type} asm sideeffect", artifact["payload"])
+                    self.assertTrue(artifact["fusion_contract"]["proof"]["layout"]["matched_uninstrumented_baseline"])
+                    self.assertEqual([port["storage_bytes"] for port in artifact["port_map"]], [width, width])
+                    if dtype in ("f16", "bf16"):
+                        self.assertIn(f"fpext {llvm_type}", artifact["payload"])
+                        self.assertIn("fmul float", artifact["payload"])
+                        self.assertIn("fadd float", artifact["payload"])
+                        self.assertIn("fptrunc float", artifact["payload"])
+                        self.assertIn("f32", artifact["fusion_contract"]["required_element_types"])
+                    if dtype == "bool":
+                        self.assertIn("ld.global.b8", artifact["payload"])
+                        self.assertIn("st.global.b8", artifact["payload"])
+                        self.assertIn("mov.pred $0, $2", artifact["payload"])
+
     def test_f16_bf16_export_preserves_low_precision_values_and_layout(self):
         with tempfile.TemporaryDirectory(prefix="ask-lowp-boundary-export-") as directory:
             directory = Path(directory)

@@ -8,7 +8,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[2]
 sys.path[:0] = [str(ROOT / "tests"), str(ROOT / "python")]
 from support.pointwise import (arithmetic_reference, expected_values, fma_reference,
-                               numerically_equal, round_reference)
+                               numerically_equal, round_reference, cast_reference)
 
 
 class PrecisionReferenceTests(unittest.TestCase):
@@ -89,6 +89,30 @@ class PrecisionReferenceTests(unittest.TestCase):
         self.assertEqual(arithmetic_reference("add", 2147483647, 1, "i32"), -2147483648)
         self.assertEqual(arithmetic_reference("mul", 1073741824, 4, "i32"), 0)
         self.assertEqual(expected_values([2147483647, -2147483648], 1, 2), [3, 5])
+
+    def test_cast_reference_covers_saturation_nan_truth_and_signed_integer_width(self):
+        for target, width in (("i32", 32), ("i64", 64)):
+            with self.subTest(target=target):
+                lower, upper = -(1 << (width - 1)), (1 << (width - 1)) - 1
+                for value, expected in ((math.nan, 0), (math.inf, upper), (-math.inf, lower),
+                                         (-1.9, -1), (1.9, 1), (float(1 << 100), upper)):
+                    self.assertEqual(cast_reference(value, "f32", target), expected)
+                self.assertEqual(arithmetic_reference("add", upper, 1, target), lower)
+        self.assertEqual(cast_reference(2**32 + 3, "i64", "i32"), 3)
+        self.assertEqual(cast_reference(-1, "i32", "i64"), -1)
+        self.assertTrue(cast_reference(math.nan, "f32", "bool"))
+        self.assertFalse(cast_reference(-0.0, "f32", "bool"))
+        self.assertEqual(cast_reference(True, "bool", "i64"), 1)
+
+    def test_mixed_accumulation_retains_values_lost_by_low_precision_arithmetic(self):
+        for dtype, large in (("f16", 1024), ("bf16", 128)):
+            value = 1 + (2**-10 if dtype == "f16" else 2**-7)
+            mixed = expected_values([value], 0, 1, dtype=dtype, compute_dtype="f32",
+                                    offset=large, tail_offset=-large)
+            low = expected_values([value], 0, 1, dtype=dtype,
+                                  offset=large, tail_offset=-large)
+            self.assertEqual(mixed, [value])
+            self.assertEqual(low, [1.0])
 
 
 if __name__ == "__main__":

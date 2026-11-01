@@ -7,7 +7,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-from .types import ScalarType, TensorType, Type, as_type, compatible
+from .types import ScalarType, TensorType, Type, as_type, compatible, compatible_shapes
 from .numerics import encode_float
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
@@ -126,7 +126,7 @@ class Module:
             type(shape_operand) is not int or not 0 <= shape_operand < len(input_types)
         ):
             raise ValueError("shape_operand must select an input")
-        if shape_rule == "same_as" and not compatible(input_types[shape_operand], result_types[0]):
+        if shape_rule == "same_as" and not compatible_shapes(input_types[shape_operand], result_types[0]):
             raise ValueError("same_as input and result types must have compatible shapes")
         if shape_rule == "fixed" and any(
             isinstance(type_, TensorType) and None in type_.shape for type_ in result_types
@@ -248,14 +248,19 @@ class Graph:
         self._counter += 1
         return Value(name, result_type, logical_id, self)
 
-    def constant(self, value: int | float, *, dtype: str = "i32",
+    def constant(self, value: bool | int | float, *, dtype: str = "i32",
                  id: str | None = None, value_id: str | None = None) -> Value:
         result_type = ScalarType(dtype)
         dtype = result_type.dtype
-        if dtype == "i32":
-            if type(value) is not int or not -(2**31) <= value < 2**31:
-                raise ValueError(f"constant must be a signed i32 integer, got {value!r}")
-            literal = f"{value} : i32"
+        if dtype == "bool":
+            if type(value) is not bool:
+                raise ValueError("bool constants require Python bool values")
+            literal = "true" if value else "false"
+        elif dtype in ("i32", "i64"):
+            width = int(dtype[1:])
+            if type(value) is not int or not -(2 ** (width - 1)) <= value < 2 ** (width - 1):
+                raise ValueError(f"constant must be a signed {dtype} integer, got {value!r}")
+            literal = f"{value} : {dtype}"
         else:
             encoded = encode_float(value, dtype)
             # MLIR's hex float syntax records the rounded IEEE bits exactly,
@@ -275,17 +280,33 @@ class Graph:
         return self._emit("ask.splat", (value,), result_type,
                           {"shape": _array_i64(result_type.shape)}, id=id, value_id=value_id)
 
+    def cast(self, value: Value, *, dtype: str, id: str | None = None,
+             value_id: str | None = None) -> Value:
+        """Convert element values while preserving scalar/tensor shape.
+
+        Floating results use round-to-nearest-even. Float-to-integer truncates
+        toward zero and saturates, with NaN becoming zero. Integer narrowing
+        keeps low bits; widening sign-extends except bool, which zero-extends.
+        Conversion to bool tests nonzero, including NaN as true.
+        """
+        self._check_values((value,))
+        result_type = (TensorType(value.type.shape, dtype) if isinstance(value.type, TensorType)
+                       else ScalarType(dtype))
+        return self._emit("ask.cast", (value,), result_type, {}, id=id, value_id=value_id)
+
     def _binary(self, operation: str, lhs: Value, rhs: Value, *, id: str | None,
                 value_id: str | None) -> Value:
         self._check_values((lhs, rhs))
         if not compatible(lhs.type, rhs.type):
-            raise TypeError("add/mul require matching operand shapes; use an explicit splat")
+            raise TypeError("add/mul require matching operand shapes and dtypes; use explicit cast or splat")
+        if lhs.type.dtype == "bool":
+            raise TypeError("bool add/mul is not defined; cast to a numeric type explicitly")
         result_type = lhs.type
         if isinstance(lhs.type, TensorType) and isinstance(rhs.type, TensorType):
             result_type = TensorType(tuple(left if left is not None else right
                                            for left, right in zip(lhs.type.shape, rhs.type.shape)),
                                      lhs.type.dtype)
-        attributes = {"overflow": '"wrap"'} if lhs.type.dtype == "i32" else {}
+        attributes = {"overflow": '"wrap"'} if lhs.type.dtype in ("i32", "i64") else {}
         return self._emit(operation, (lhs, rhs), result_type, attributes,
                           id=id, value_id=value_id)
 

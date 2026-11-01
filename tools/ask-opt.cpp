@@ -226,9 +226,11 @@ int main(int argc, char **argv) {
         {"ir_optimization", true}, {"elementwise_fusion", true}, {"llvm_optimization", true},
         {"external_export", bool(ASK_WITH_TRITON)}, {"gpu_execution", bool(ASK_WITH_TRITON)},
         {"triton_llir_fusion", bool(ASK_WITH_TRITON)}, {"cuda_execution_via_python", bool(ASK_WITH_TRITON)},
-        {"supported_element_types", json::Array{"i32", "f32", "f16", "bf16"}},
-        {"host_supported_element_types", ASK_WITH_HOST ? json::Array{"i32", "f32", "f16"} : json::Array{}},
-        {"gpu_supported_element_types", ASK_WITH_TRITON ? json::Array{"i32", "f32", "f16", "bf16"} : json::Array{}}};
+        {"supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
+        {"explicit_cast", true}, {"mixed_precision", true},
+        {"host_bf16_hardware_supported", bool(ASK_WITH_HOST) && ask::nativeHostSupportsBF16()},
+        {"host_supported_element_types", ASK_WITH_HOST ? json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"} : json::Array{}},
+        {"gpu_supported_element_types", ASK_WITH_TRITON ? json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"} : json::Array{}}};
     outs() << formatv("{0:2}\n", result);
     return 0;
   }

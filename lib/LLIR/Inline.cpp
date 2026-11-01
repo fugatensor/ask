@@ -61,6 +61,7 @@ bool safeIntrinsic(llvm::Intrinsic::ID id) {
   case llvm::Intrinsic::minnum:
   case llvm::Intrinsic::maxnum:
   case llvm::Intrinsic::fma:
+  case llvm::Intrinsic::fptosi_sat:
     return true;
   default:
     return false;

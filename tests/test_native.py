@@ -16,7 +16,8 @@ sys.path.insert(0, str(ROOT / "python"))
 from ask import Module, ScalarType, TensorType
 from ask.numerics import encode_float, decode_float
 sys.path.insert(0, str(ROOT / "tests"))
-from support.pointwise import build_module, input_values, expected_values, numerically_equal, DTYPES
+from support.pointwise import (build_module, input_values, expected_values, numerically_equal, DTYPES,
+                               cast_reference, round_reference, FLOAT_FORMATS)
 
 
 def run(*args, source=None):
@@ -202,13 +203,14 @@ define void @f() {
         shape, count = (2, 8), 16
         # This builder is also used by the GPU precision matrix. The operation
         # graph is identical; dtype controls only types and numerical encoding.
-        for dtype in DTYPES:
-            module = build_module(shape=shape, dtype=dtype, external=False)
+        supports_bf16 = json.loads(run("--capabilities").stdout)["host_bf16_hardware_supported"]
+        for dtype, compute in [(dtype, None) for dtype in DTYPES] + [(dtype, "f32") for dtype in ("f16", "bf16")]:
+            module = build_module(shape=shape, dtype=dtype, external=False, compute_dtype=compute)
             prepared = run("-", "--prepare", source=module.to_mlir())
             self.assertEqual(prepared.returncode, 0, prepared.stderr)
-            with self.subTest(dtype=dtype), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(dtype=dtype, compute=compute), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory)
-                if dtype == "bf16":
+                if dtype == "bf16" and not supports_bf16:
                     for mode in ("--emit-llvm", "--emit-object"):
                         output = path / "unsupported"
                         rejected = run("-", mode, "-o", output, source=module.to_mlir())
@@ -217,12 +219,12 @@ define void @f() {
                         self.assertFalse(output.exists())
                     continue
                 values = input_values(count, dtype)
-                expected = expected_values(values, 1, 2, dtype=dtype, external=False)
-                storage_type = {"i32": ctypes.c_int32, "f32": ctypes.c_float,
-                                "f16": ctypes.c_uint16}[dtype]
+                expected = expected_values(values, 1, 2, dtype=dtype, external=False, compute_dtype=compute)
+                storage_type = {"bool": ctypes.c_uint8, "i32": ctypes.c_int32, "i64": ctypes.c_int64,
+                                "f32": ctypes.c_float, "f16": ctypes.c_uint16, "bf16": ctypes.c_uint16}[dtype]
                 storage = storage_type * count
                 encoded = ([int.from_bytes(encode_float(value, dtype), "little") for value in values]
-                           if dtype == "f16" else values)
+                           if dtype in ("f16", "bf16") else values)
                 for optimize in (False, True):
                     obj, library_path, report = path / f"{optimize}.o", path / f"{optimize}.so", path / f"{optimize}.json"
                     arguments = ["-", "--emit-object", "-o", obj, "--report-json", report]
@@ -240,7 +242,7 @@ define void @f() {
                     inputs, outputs = storage(*encoded), storage()
                     function(inputs, outputs)
                     actual = ([decode_float(value.to_bytes(2, "little"), dtype) for value in outputs]
-                              if dtype == "f16" else list(outputs))
+                              if dtype in ("f16", "bf16") else list(outputs))
                     self.assertTrue(numerically_equal(actual, expected, dtype), (dtype, actual, expected))
                     abi = json.loads(report.read_text())["abi"]["functions"][0]
                     width = ctypes.sizeof(storage_type)
@@ -248,6 +250,87 @@ define void @f() {
                     self.assertTrue(all(port["dtype"] == dtype and port["element_bytes"] == width
                                         and port["minimum_alignment"] == width
                                         for port in abi["inputs"] + abi["outputs"]))
+
+    def test_cast_matrix_executes_and_mixed_outputs_share_a_loop(self):
+        caps = json.loads(run("--capabilities").stdout)
+        if not caps["host_codegen"]:
+            self.skipTest("host backend disabled")
+        dtypes = [dtype for dtype in DTYPES if dtype != "bf16" or caps["host_bf16_hardware_supported"]]
+        storage_types = {"bool": ctypes.c_uint8, "i32": ctypes.c_int32, "i64": ctypes.c_int64,
+                         "f32": ctypes.c_float, "f16": ctypes.c_uint16, "bf16": ctypes.c_uint16}
+        count = 32
+        module = Module()
+        data = {}
+        for source in dtypes:
+            values = input_values(count, source)
+            if source == "i64":
+                values[-6:] = [(2**40 + 2**32 + delta) * sign for delta in (-1, 0, 1) for sign in (-1, 1)]
+            if source == "f32":
+                values[-10:] = [2**-134, 3 * 2**-134, 2**-133, 2**-24, 2**-25,
+                                65520.0, 2**31, -(2**31), 2**63, -(2**63)]
+            data[source] = [round_reference(value, source) for value in values]
+            for target in dtypes:
+                graph = module.graph(f"cast_{source}_{target}", inputs={"x": TensorType((count,), source)},
+                                     results=[TensorType((count,), target)])
+                graph.return_(graph.cast(graph.inputs["x"], dtype=target))
+        # Return three dtypes from one same-shape chain. The f32 root is used
+        # by both narrower outputs, so one loop must share its computation.
+        tensor = TensorType((count,), "i64")
+        mixed = module.graph("mixed", inputs={"x": tensor},
+                             results=[TensorType((count,), dtype) for dtype in ("f32", "f16", "bool")])
+        widened = mixed.cast(mixed.inputs["x"], dtype="f32")
+        narrowed = mixed.cast(widened, dtype="f16")
+        truth = mixed.cast(narrowed, dtype="bool")
+        mixed.return_(widened, narrowed, truth)
+        # Bool scalar input and tensor input both use one byte at the C ABI.
+        boolean = module.graph("bool_abi", inputs={"x": TensorType((4,), "bool"), "s": ScalarType("bool")},
+                               results=[TensorType((4,), "bool"), ScalarType("bool")])
+        boolean.return_(boolean.inputs["x"], boolean.inputs["s"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            for optimize in (False, True):
+                obj, shared, report = (path / f"cast-{optimize}.{extension}" for extension in ("o", "so", "json"))
+                args = ["-", "--emit-object", "-o", obj, "--report-json", report]
+                if optimize:
+                    args.append("--optimize")
+                compiled = run(*args, source=module.to_mlir())
+                self.assertEqual(compiled.returncode, 0, compiled.stderr)
+                linked = subprocess.run(["cc", "-shared", str(obj), "-o", str(shared)], capture_output=True, text=True)
+                self.assertEqual(linked.returncode, 0, linked.stderr)
+                library = ctypes.CDLL(str(shared))
+                for source in dtypes:
+                    encoded = [int.from_bytes(encode_float(value, source), "little") for value in data[source]] if source in ("f16", "bf16") else data[source]
+                    inputs = (storage_types[source] * count)(*encoded)
+                    for target in dtypes:
+                        with self.subTest(source=source, target=target, optimized=optimize):
+                            outputs = (storage_types[target] * count)()
+                            function = getattr(library, f"cast_{source}_{target}")
+                            function.argtypes = [ctypes.POINTER(storage_types[source]), ctypes.POINTER(storage_types[target])]
+                            function.restype = None
+                            function(inputs, outputs)
+                            actual = [decode_float(value.to_bytes(2, "little"), target) for value in outputs] if target in ("f16", "bf16") else list(outputs)
+                            expected = [cast_reference(value, source, target) for value in data[source]]
+                            self.assertTrue(numerically_equal(actual, expected, target), (source, target, actual, expected))
+                inputs = (ctypes.c_int64 * count)(*data["i64"])
+                floats, halves, bools = (ctypes.c_float * count)(), (ctypes.c_uint16 * count)(), (ctypes.c_uint8 * count)()
+                library.mixed(inputs, floats, halves, bools)
+                expected_floats = [cast_reference(value, "i64", "f32") for value in data["i64"]]
+                expected_halves = [cast_reference(value, "f32", "f16") for value in expected_floats]
+                self.assertTrue(numerically_equal(list(floats), expected_floats, "f32"))
+                self.assertTrue(numerically_equal([decode_float(value.to_bytes(2, "little"), "f16") for value in halves], expected_halves, "f16"))
+                self.assertEqual(list(bools), [bool(value) for value in expected_halves])
+                byte_input, byte_output, scalar = (ctypes.c_uint8 * 4)(0, 1, 2, 255), (ctypes.c_uint8 * 4)(), ctypes.c_uint8()
+                library.bool_abi.argtypes = [ctypes.POINTER(ctypes.c_uint8), ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint8), ctypes.POINTER(ctypes.c_uint8)]
+                library.bool_abi(byte_input, 255, byte_output, ctypes.byref(scalar))
+                self.assertEqual(list(byte_output), [0, 1, 1, 1])
+                self.assertEqual(scalar.value, 1)
+                abi = json.loads(report.read_text())["abi"]
+                self.assertNotEqual(abi["target_cpu"], "generic")
+                metadata = next(item for item in abi["functions"] if item["name"] == "mixed")
+                self.assertEqual(metadata["lowering"]["loop_count"], 1 if optimize else 3)
+                metadata = next(item for item in abi["functions"] if item["name"] == "bool_abi")
+                self.assertTrue(all(item["dtype"] == "bool" and item["element_bytes"] == 1
+                                    for item in metadata["inputs"] + metadata["outputs"]))
 
     def test_float_type_mismatch_and_integer_only_options_are_rejected(self):
         source = '''module {

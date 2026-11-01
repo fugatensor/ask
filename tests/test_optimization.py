@@ -15,6 +15,8 @@ ROOT = Path(__file__).resolve().parents[1]
 DRIVER = str(Path(sys.argv.pop(1)).resolve())
 sys.path.insert(0, str(ROOT / "python"))
 from ask import Compiler, CompilerError, Module, ScalarType, TensorType
+sys.path.insert(0, str(ROOT / "tests"))
+from support.pointwise import DTYPES, input_values, cast_reference, round_reference
 
 
 def shared_graph():
@@ -47,6 +49,60 @@ class OptimizationTests(unittest.TestCase):
         self.assertEqual(result.report["markers"][0]["status"], "rewritten")
         self.assertEqual(result.report["shape_snapshot"]["semantic_revision"],
                          result.report["input_shape_snapshot"]["semantic_revision"] + 1)
+
+    def test_cast_constant_folding_matches_shared_six_type_reference(self):
+        module, reference = Module(), Module()
+        for source in DTYPES:
+            values = input_values(16, source)
+            for target in DTYPES:
+                name = source + "_to_" + target
+                graph = module.graph(name, inputs={}, results=[ScalarType(target)] * len(values))
+                expected = reference.graph(name, inputs={}, results=[ScalarType(target)] * len(values))
+                graph.return_(*(graph.cast(graph.constant(value, dtype=source), dtype=target)
+                                for value in values))
+                expected.return_(*(expected.constant(cast_reference(round_reference(value, source), source, target),
+                                                     dtype=target) for value in values))
+        optimized = self.compiler.optimize(module)
+        prepared_reference = self.compiler.prepare(reference)
+        self.assertNotIn('"ask.cast"', optimized.ir)
+        self.assertEqual(optimized.report["optimization"]["constant_folds"], len(DTYPES) ** 2 * 16)
+        # Parse only constant attribute values; identities and SSA names differ.
+        values = lambda ir: re.findall(r"\bvalue = ([^},]+)", ir)
+        self.assertEqual(values(optimized.ir), values(prepared_reference.ir))
+
+    def test_i64_wrapping_and_bool_arithmetic_rejection(self):
+        module = Module()
+        graph = module.graph("wide", inputs={}, results=[ScalarType("i64")])
+        graph.return_(graph.add(graph.constant(2 ** 63 - 1, dtype="i64"),
+                                graph.constant(1, dtype="i64")))
+        optimized = self.compiler.optimize(module)
+        self.assertIn("value = -9223372036854775808 : i64", optimized.ir)
+        invalid = '''module {
+  func.func @f(%x: i1, %y: i1) -> i1 {
+    %z = "ask.add"(%x, %y) : (i1, i1) -> i1
+    return %z : i1
+  }
+}'''
+        with self.assertRaisesRegex(CompilerError, "bool add/mul"):
+            self.compiler.optimize(invalid)
+
+    def test_casts_join_shape_groups_without_implicit_precision_changes(self):
+        module = Module()
+        graph = module.graph("mixed", inputs={"x": TensorType((2, 5), "f16")},
+                             results=[TensorType((2, 5), "bf16")])
+        promoted = graph.cast(graph.inputs["x"], dtype="f32", id="promote")
+        shifted = graph.add(promoted, graph.splat(graph.constant(0.1, dtype="f32"), (2, 5)), id="add")
+        narrowed = graph.cast(shifted, dtype="bf16", id="narrow")
+        graph.return_(narrowed)
+        optimized = self.compiler.optimize(module)
+        groups = optimized.report["optimization"]["fusion_groups"]
+        self.assertEqual(len(groups), 1)
+        self.assertIn("promote", groups[0]["operations"])
+        self.assertIn("narrow", groups[0]["operations"])
+        self.assertEqual(optimized.ir.count('"ask.cast"'), 2)
+        shapes = optimized.report["shape_snapshot"]["shape_bindings"]
+        self.assertEqual({item["element_type"] for item in shapes}, {"f16", "f32", "bf16"})
+        self.assertTrue(all(item["shape"] == [2, 5] for item in shapes))
 
     def test_float_folding_rounds_each_operation_without_algebraic_identities(self):
         for dtype, fraction_bits in [("f32", 23), ("f16", 10), ("bf16", 7)]:

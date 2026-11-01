@@ -30,16 +30,19 @@ def _numerics(request):
     if not isinstance(signature, dict) or len(signature) != 2:
         raise CompilerError("CUDA fusion requires two explicitly typed data pointers")
     types = list(signature.values())
-    dtypes = {"*i32": "i32", "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
+    dtypes = {"*i1": "bool", "*i32": "i32", "*i64": "i64", "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
     if any(value not in dtypes for value in types) or types[0] != types[1]:
-        raise CompilerError("CUDA fusion requires matching i32/f32/f16/bf16 data-pointer types")
-    if types[0] == "*i32":
-        return {"element_type": "i32", "arithmetic": "wrap-modulo-2^32"}
+        raise CompilerError("CUDA fusion requires matching bool/i32/i64/f32/f16/bf16 data-pointer types")
     dtype = dtypes[types[0]]
+    cast = {"cast_semantics": "rne-saturating-fptosi-nan-zero-v1", "compute_types": "explicit-per-SSA-value"}
+    if dtype == "bool":
+        return {"element_type": dtype, "arithmetic": "boolean", "storage_bytes": 1, **cast}
+    if dtype in ("i32", "i64"):
+        return {"element_type": dtype, "arithmetic": "wrap-modulo-2^" + dtype[1:], **cast}
     return {"element_type": dtype, "arithmetic": {"f32": "ieee754-binary32",
             "f16": "ieee754-binary16", "bf16": "bfloat16"}[dtype],
             "rounding": "roundTiesToEven", "fast_math": False, "contraction": False,
-            "operation_result_type": dtype}
+            "operation_result_type": "explicit-per-SSA-value", **cast}
 
 
 def _validate_environment():
@@ -131,7 +134,7 @@ def compile_graph(compiler, module, *, cache_dir, output_dir, triton_python,
         raise CompilerError(f"cannot fingerprint the selected Triton installation: {exc}") from exc
     request = requests[0]
     key = {
-        "schema_version": 1, "pipeline_version": "ask.triton.typed-boundary.v3",
+        "schema_version": 1, "pipeline_version": "ask.triton.typed-boundary.v4",
         "graph": _sha(source.encode()), "dsl": _sha(request["source"].encode()),
         "config": {"request": {k: v for k, v in request.items() if k != "source"},
                    "environment_sha256": _sha(_json(dict(os.environ)))},

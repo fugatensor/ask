@@ -2,7 +2,7 @@
 """ASK protocol-1 Triton exporter. No Triton import occurs before a request/probe.
 
 This initial adapter deliberately accepts only the tested Triton 3.7.1 CUDA
-SM80 ABI: two i32/f32/f16/bf16 data pointers, integer constexprs and two unused scratch
+pointer ABI: two equally typed data pointers, integer constexprs and two unused scratch
 pointers. It exports code and descriptions, never Python/kernel handles.
 """
 
@@ -23,10 +23,11 @@ import sys
 import tempfile
 
 PROTOCOL_VERSION = 1
-ADAPTER_VERSION = "0.5.0"
-ELEMENT_TYPES = {"*i32": "i32", "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
+ADAPTER_VERSION = "0.6.0"
+ELEMENT_TYPES = {"*i1": "bool", "*i32": "i32", "*i64": "i64",
+                 "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
+STORAGE_BYTES = {"bool": 1, "i32": 4, "i64": 8, "f32": 4, "f16": 2, "bf16": 2}
 SUPPORTED_TRITON_VERSION = "3.7.1"
-SUPPORTED_TARGET = {"backend": "cuda", "arch": 80, "warp_size": 32}
 
 
 class WorkerError(Exception):
@@ -86,7 +87,7 @@ def validate_request(request):
             "initial adapter requires exactly two named data-pointer parameters",
             "UnsupportedSignature")
     require(all(isinstance(v, str) and v in ELEMENT_TYPES for v in signature.values()),
-            "adapter supports *i32, *fp32, *fp16 or *bf16 data pointers", "UnsupportedSignature")
+            "adapter supports *i1, *i32, *i64, *fp32, *fp16 or *bf16 data pointers", "UnsupportedSignature")
     require(len(set(signature.values())) == 1,
             "input and output data pointers must have the same element type", "UnsupportedSignature")
     if "*bf16" in signature.values():
@@ -114,10 +115,11 @@ def validate_request(request):
              type(request["fixed_options"]["enable_fp_fusion"]) is bool),
             "adapter requires fixed_options num_warps=4|8 and optional boolean enable_fp_fusion",
             "UnsupportedOptions")
-    require(request["target"] == SUPPORTED_TARGET and
-            type(request["target"].get("arch")) is int and
-            type(request["target"].get("warp_size")) is int,
-            "initial adapter supports only cuda arch=80 warp_size=32", "UnsupportedTarget")
+    target = request["target"]
+    require(set(target) == {"backend", "arch", "warp_size"} and target["backend"] == "cuda" and
+            type(target["arch"]) is int and 70 <= target["arch"] <= 999 and
+            type(target["warp_size"]) is int and target["warp_size"] == 32,
+            "adapter requires cuda, an ordinary integer arch >= 70 and warp_size=32", "UnsupportedTarget")
     grid = request["grid"]
     require(isinstance(grid, list) and len(grid) == 3 and
             all(type(v) is int and 0 < v <= 2**31 - 1 for v in grid),
@@ -213,7 +215,10 @@ def probe():
     return {"protocol_version": PROTOCOL_VERSION, "compiler_id": "triton",
             "adapter_version": ADAPTER_VERSION, "triton_version": triton.__version__,
             "python_version": platform.python_version(), "formats": ["llvm-ir"],
-            "supported_target": SUPPORTED_TARGET, "device_execution_tested": False,
+            "target_constraints": {"backend": "cuda", "minimum_arch": 70, "warp_size": 32,
+                                   "arch_encoding": "ordinary-integer-sm",
+                                   "requires_successful_compilation": True},
+            "supported_element_types": list(ELEMENT_TYPES.values()), "device_execution_tested": False,
             "fusion_supported": True}
 
 
@@ -305,6 +310,56 @@ def _json_data(value):
     raise WorkerError("UnsupportedMetadata", f"cannot serialize {type(value).__name__}", "artifact")
 
 
+def compiled_element_types(ttir):
+    """Read builtin scalar types from Triton's public MLIR assembly output.
+
+    This is a lexical type inventory, not an operation or effect proof. Ignore
+    quoted strings, comments, SSA/symbol names and attribute keys, then accept
+    builtin type tokens, including compact shaped types such as 128xbf16.
+    LLVM IR alone is too late: BF16 casts may already be lowered to integer/PTX
+    instructions, even though the external pointer ABI is entirely f32.
+    """
+    require(isinstance(ttir, str) and ttir.strip(),
+            "compiler did not return asm['ttir'] for computation type requirements",
+            "MissingMLIRArtifact", "artifact")
+    visible = []
+    position = 0
+    while position < len(ttir):
+        if ttir[position] == '"':
+            position += 1
+            while position < len(ttir) and ttir[position] != '"':
+                position += 2 if ttir[position] == "\\" else 1
+            require(position < len(ttir), "unterminated MLIR string",
+                    "UnsupportedMLIRArtifact", "artifact")
+            position += 1
+            visible.append(" ")
+        elif ttir.startswith("//", position):
+            end = ttir.find("\n", position + 2)
+            position = len(ttir) if end == -1 else end + 1
+            visible.append("\n")
+        elif ttir.startswith("/*", position):
+            position += 2
+            depth = 1
+            while position < len(ttir) and depth:
+                if ttir.startswith("/*", position):
+                    depth += 1
+                    position += 2
+                elif ttir.startswith("*/", position):
+                    depth -= 1
+                    position += 2
+                else:
+                    position += 1
+            require(depth == 0, "unterminated MLIR comment", "UnsupportedMLIRArtifact", "artifact")
+            visible.append(" ")
+        else:
+            visible.append(ttir[position])
+            position += 1
+    scalar_types = re.findall(
+        r"(?<![-\w.$%@#!])(?:(?:[0-9]+|\?|\[[0-9]+\]|\*)x)*"
+        r"(bf16|f16|f32|i1|i32|i64)(?![-\w.$])(?!\s*=)", "".join(visible))
+    return {"bool" if name == "i1" else name for name in scalar_types}
+
+
 def build_artifact(request, compiled, triton_version, source_order):
     require(isinstance(compiled.asm.get("llir"), str) and compiled.asm["llir"].strip(),
             "compiler did not return asm['llir']", "MissingLLVMArtifact", "artifact")
@@ -315,6 +370,11 @@ def build_artifact(request, compiled, triton_version, source_order):
             "compiled name/version metadata mismatch", "ArtifactMismatch", "artifact")
     require(metadata.get("target") == request["target"],
             "compiled target differs from requested target", "ArtifactMismatch", "artifact")
+    required_types = {ELEMENT_TYPES[signature] for signature in request["signature"].values()}
+    required_types.update(compiled_element_types(compiled.asm.get("ttir")))
+    require("bf16" not in required_types or request["target"]["arch"] >= 80,
+            "bf16 computation requires a CUDA target with compute capability 8.0 or newer",
+            "UnsupportedDType", "artifact")
     require(metadata.get("num_warps") == request["fixed_options"]["num_warps"] and
             metadata.get("warp_size") == 32,
             "compiled launch configuration differs from request", "ArtifactMismatch", "artifact")
@@ -345,8 +405,10 @@ def build_artifact(request, compiled, triton_version, source_order):
     port_map, arguments = [], []
     for ordinal, name in enumerate(source_order):
         binding = request["source_bindings"][name]
+        element_type = ELEMENT_TYPES[request["signature"][name]]
         port_map.append({"source_parameter": name, "logical_port": binding,
-                         "argument": ordinal, "element_type": ELEMENT_TYPES[request["signature"][name]]})
+                         "argument": ordinal, "element_type": element_type,
+                         "storage_bytes": STORAGE_BYTES[element_type]})
         arguments.append({"argument": ordinal, "binding": binding,
                           "llvm_type": parameters[ordinal]["llvm_type"]})
     resources = {}
@@ -370,7 +432,7 @@ def build_artifact(request, compiled, triton_version, source_order):
                          "adapter_version": ADAPTER_VERSION,
                          "python_version": platform.python_version(), "llvm_version": None},
             "target": {**request["target"], "data_layout": layout[0]},
-            "port_map": port_map,
+            "port_map": port_map, "required_element_types": sorted(required_types),
             "invocation": {"kind": "cuda-kernel", "version": 1,
                            "grid": request["grid"], "block": [metadata["num_warps"] * metadata["warp_size"], 1, 1],
                            "num_warps": metadata["num_warps"], "num_ctas": 1, "shared_bytes": 0,

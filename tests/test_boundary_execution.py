@@ -7,6 +7,25 @@ import sys
 import tempfile
 
 test_binary, llvm_tools = sys.argv[1:]
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT / "python"), str(ROOT / "tests")]
+from ask.numerics import encode_float, decode_float
+from support.pointwise import DTYPES, FLOAT_FORMATS, input_values, cast_reference, round_reference, numerically_equal
+
+STORAGE = {"bool": ctypes.c_uint8, "i32": ctypes.c_int32, "i64": ctypes.c_int64,
+           "f32": ctypes.c_float, "f16": ctypes.c_uint16, "bf16": ctypes.c_uint16}
+
+
+def encode(value, dtype):
+    if dtype in ("f16", "bf16"):
+        return int.from_bytes(encode_float(value, dtype), "little")
+    return value
+
+
+def decode(value, dtype):
+    if dtype in ("f16", "bf16"):
+        return decode_float(value.to_bytes(2, "little"), dtype)
+    return value
 
 
 def checked(arguments):
@@ -58,4 +77,27 @@ with tempfile.TemporaryDirectory(prefix="ask-generic-inline-") as directory:
     values, output = vector(-3.0, 4.0, 1.5, -9.0), vector()
     library.masked_vector(values, output)
     assert list(output) == [2.0, 4.0, 6.5, -9.0]
-    print("Executed ordinary LLVM i64/i32/f32/f64/vector fusion with multiple sites, scalar and lane masks")
+    cast_checks = 0
+    for source in DTYPES:
+        values = input_values(24, source)
+        if source == "i64":
+            # Integer -> bf16 halfway cases whose low bits disappear in f32.
+            values += [(2**40 + 2**32 + delta) * sign for delta in (-1, 0, 1)
+                       for sign in (-1, 1)]
+        if source == "f32":
+            values += [2**-134, 3 * 2**-134, 2**-133, 2**-24, 2**-25,
+                       65504.0, 65520.0, 2**31, -(2**31), 2**63, -(2**63)]
+        values = [round_reference(value, source) for value in values]
+        for target in DTYPES:
+            function = getattr(library, f"cast_{source}_{target}")
+            function.argtypes = [ctypes.POINTER(STORAGE[source]), ctypes.POINTER(STORAGE[target])]
+            function.restype = None
+            for value in values:
+                input_buffer = STORAGE[source](encode(value, source))
+                output_buffer = STORAGE[target]()
+                function(ctypes.byref(input_buffer), ctypes.byref(output_buffer))
+                actual = decode(output_buffer.value, target)
+                expected = cast_reference(value, source, target)
+                assert numerically_equal([actual], [expected], target), (source, target, value, actual, expected)
+                cast_checks += 1
+    print(f"Executed ordinary LLVM scalar/vector fusion and {cast_checks} values across all 36 cast pairs")

@@ -1,4 +1,6 @@
 #include "ask/LLIR/Inline.h"
+#include "ask/LLIR/Numeric.h"
+#include "ask/Lowering/Host.h"
 
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/IRBuilder.h"
@@ -157,6 +159,38 @@ std::unique_ptr<Module> success(LLVMContext &context) {
                                      ConstantInt::getTrue(context), ConstantInt::getFalse(context)});
   sites.push_back({vector, helpers->getFunction("vector_add"), {vector->getArgOperand(0)},
                   mask, vector->getArgOperand(0)});
+  // The same boundary transformation accepts every scalar cast pair. Public
+  // wrappers use pointers so half/bfloat/i1 calling conventions cannot hide a
+  // wrong conversion behind a platform-specific scalar ABI.
+  SmallVector<std::pair<StringRef, Type *>> types = {
+      {"bool", Type::getInt1Ty(context)}, {"i32", Type::getInt32Ty(context)},
+      {"i64", Type::getInt64Ty(context)}, {"f32", Type::getFloatTy(context)},
+      {"f16", Type::getHalfTy(context)}, {"bf16", Type::getBFloatTy(context)}};
+  for (auto [sourceName, sourceType] : types) {
+    for (auto [targetName, targetType] : types) {
+      auto name = ("cast_" + sourceName + "_" + targetName).str();
+      auto *f = Function::Create(FunctionType::get(targetType, {sourceType}, false),
+                                  GlobalValue::ExternalLinkage, name + "_helper", *helpers);
+      IRBuilder<> b(BasicBlock::Create(context, "entry", f));
+      b.CreateRet(ask::llir::createNumericCast(b, f->getArg(0), targetType));
+      auto *pointer = PointerType::getUnqual(context);
+      auto *wrapper = Function::Create(FunctionType::get(b.getVoidTy(), {pointer, pointer}, false),
+                                        GlobalValue::ExternalLinkage, name, *consumer);
+      b.SetInsertPoint(BasicBlock::Create(context, "entry", wrapper));
+      auto *sourceStorage = sourceType->isIntegerTy(1) ? b.getInt8Ty() : sourceType;
+      auto *loaded = b.CreateLoad(sourceStorage, wrapper->getArg(0));
+      Value *input = sourceType->isIntegerTy(1) ? b.CreateICmpNE(loaded, b.getInt8(0)) : loaded;
+      auto identity = consumer->getOrInsertFunction(name + "_marker",
+          FunctionType::get(targetType, {targetType}, false));
+      auto *call = b.CreateCall(identity, {Constant::getNullValue(targetType)});
+      Value *output = targetType->isIntegerTy(1) ? b.CreateZExt(call, b.getInt8Ty()) : call;
+      b.CreateStore(output, wrapper->getArg(1));
+      b.CreateRetVoid();
+      sites.push_back({call, f, {input}});
+    }
+  }
+  originalConsumer = print(*consumer);
+  originalHelpers = print(*helpers);
   json::Object report;
   auto output = ask::llir::inlineValueBoundaries(*consumer, *helpers, sites, report);
   if (!output) {
@@ -165,7 +199,7 @@ std::unique_ptr<Module> success(LLVMContext &context) {
   }
   require(print(*consumer) == originalConsumer && print(*helpers) == originalHelpers,
           "successful transaction must not mutate inputs");
-  require(report.getObject("boundary_inlining")->getInteger("sites") == 8, "all sites must be reported");
+  require(report.getObject("boundary_inlining")->getInteger("sites") == 44, "all sites must be reported");
   require((*output)->getFunction("__ask_value_helper_0") != nullptr, "consumer helper-like names must survive");
   for (auto &function : **output)
     if (!function.isDeclaration())
@@ -241,6 +275,21 @@ void consumerNumerics(LLVMContext &context, StringRef attributes,
 
 int main(int argc, char **argv) {
   LLVMContext context;
+  StringMap<bool> features;
+  require(!ask::hostSupportsBF16("x86_64", features), "missing CPU BF16 feature must reject");
+  features["avx512bf16"] = false;
+  features["amx-bf16"] = true;
+  require(!ask::hostSupportsBF16("x86_64", features), "AMX-only must not claim scalar BF16 support");
+  features["avx512bf16"] = true;
+  require(ask::hostSupportsBF16("x86_64", features), "AVX512 BF16 CPU must be accepted");
+  require(!ask::hostSupportsBF16("aarch64", features), "features must belong to the target architecture");
+  features.clear();
+  features["avxneconvert"] = true;
+  require(ask::hostSupportsBF16("x86_64", features), "AVX-NE-CONVERT CPU must be accepted");
+  features.clear();
+  features["bf16"] = true;
+  require(ask::hostSupportsBF16("aarch64", features), "AArch64 BF16 CPU must be accepted");
+  require(!ask::hostSupportsBF16("unknown", features), "unknown target must not assume BF16 support");
   auto result = success(context);
   rejection(context, R"(define i64 @h(i64 %x) memory(none) { store i64 %x, ptr null ret i64 %x })", "pointer operand");
   rejection(context, R"(define i64 @h(i64 %x) {

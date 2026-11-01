@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -18,7 +19,7 @@ def request():
     return json.loads((FIXTURES / "scale2.request.json").read_text())
 
 
-def compiled(metadata_changes=None, llvm_ir=None):
+def compiled(metadata_changes=None, llvm_ir=None, ttir="tensor<128xi32>"):
     metadata = {"name": "scale2", "triton_version": "3.7.1",
                 "target": {"backend": "cuda", "arch": 80, "warp_size": 32},
                 "num_warps": 4, "warp_size": 32, "num_ctas": 1,
@@ -28,11 +29,24 @@ def compiled(metadata_changes=None, llvm_ir=None):
                 "launch_cooperative_grid": False, "launch_pdl": False, "extern_libs": []}
     metadata.update(metadata_changes or {})
     return SimpleNamespace(name="scale2", metadata=SimpleNamespace(_asdict=lambda: metadata),
-                           asm={"llir": llvm_ir if llvm_ir is not None else
+                           asm={"ttir": ttir, "llir": llvm_ir if llvm_ir is not None else
                                 (FIXTURES / "scale2.ll").read_text()})
 
 
 class RequestTests(unittest.TestCase):
+    def test_bool_i64_and_declared_cuda_architectures(self):
+        for signature in ("*i1", "*i64"):
+            for arch in (70, 75, 80, 86, 89, 90):
+                value = request()
+                value["signature"] = {"t": signature, "u": signature}
+                value["target"]["arch"] = arch
+                self.assertEqual(worker.validate_request(value), value)
+        for arch in (True, 69, "90a", 80.0, 1000):
+            value = request()
+            value["target"]["arch"] = arch
+            with self.subTest(arch=arch), self.assertRaisesRegex(worker.WorkerError, "integer arch"):
+                worker.validate_request(value)
+
     def test_valid_request(self):
         value = request()
         self.assertEqual(worker.validate_request(value), value)
@@ -140,6 +154,36 @@ class RequestTests(unittest.TestCase):
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_compiled_type_inventory_ignores_names_comments_and_strings(self):
+        spelling = '''
+          // tensor<128xbf16>
+          /* bf16 /* nested tensor<bf16> */ */
+          @bf16(%bf16: tensor<128xf32>) attributes {bf16 = 1 : i32,
+            note = "tensor<128xbf16> escaped \\"bf16\\"", custom.bf16 = true}
+          %xbf16 = "bf16"(%bf16) : tensor<128xf32>
+          #bf16 = loc("bf16")
+        '''
+        self.assertEqual(worker.compiled_element_types(spelling), {"f32", "i32"})
+        self.assertEqual(worker.compiled_element_types(
+            "tensor<2x128xbf16> !tt.ptr<bf16> vector<[4]xf16> i64 tensor<?xi1>"),
+            {"bf16", "f16", "i64", "bool"})
+        for malformed in (None, "", '"unfinished', "/* unfinished"):
+            with self.subTest(malformed=malformed), self.assertRaises(worker.WorkerError):
+                worker.compiled_element_types(malformed)
+
+    def test_raw_internal_bf16_requires_supported_target_and_records_receipt(self):
+        value = request()
+        value["signature"] = {"t": "*fp32", "u": "*fp32"}
+        code = compiled(ttir="tensor<128xf32> tensor<128xbf16>")
+        artifact = worker.build_artifact(value, code, "3.7.1", ["t", "u"])
+        self.assertEqual(artifact["required_element_types"], ["bf16", "f32"])
+        self.assertNotIn("fusion_contract", artifact)
+        value["target"]["arch"] = 75
+        code = compiled({"target": value["target"]}, ttir="tensor<128xbf16>")
+        with self.assertRaisesRegex(worker.WorkerError, "bf16 computation requires") as error:
+            worker.build_artifact(value, code, "3.7.1", ["t", "u"])
+        self.assertEqual(error.exception.code, "UnsupportedDType")
+
     def test_port_map_carries_element_types_separately_from_pointer_abi(self):
         value = request()
         value["signature"] = {"t": "*fp32", "u": "*fp32"}
@@ -204,6 +248,35 @@ class ArtifactTests(unittest.TestCase):
 
 
 class CommandLineTests(unittest.TestCase):
+    @unittest.skipUnless(os.environ.get("ASK_TEST_TRITON_PYTHON"), "set ASK_TEST_TRITON_PYTHON for real exports")
+    def test_real_raw_export_records_internal_bf16_and_rejects_sm75(self):
+        with tempfile.TemporaryDirectory(prefix="ask-raw-bf16-") as directory:
+            value = request()
+            value["signature"] = {"t": "*fp32", "u": "*fp32"}
+            value["source"] = value["source"].replace(
+                "value * 2", "value.to(tl.bfloat16).to(tl.float32)")
+            for arch in (75, 80):
+                value["target"]["arch"] = arch
+                source = Path(directory) / f"sm{arch}.request.json"
+                output = Path(directory) / f"sm{arch}.artifact.json"
+                source.write_text(json.dumps(value))
+                result = subprocess.run([os.environ["ASK_TEST_TRITON_PYTHON"], str(ROOT / "worker.py"),
+                                         "--request", str(source), "--output", str(output)],
+                                        capture_output=True, text=True, timeout=180)
+                with self.subTest(arch=arch):
+                    if arch == 75:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertFalse(output.exists())
+                        self.assertIn("bf16 computation requires", result.stderr)
+                        self.assertIn('"UnsupportedDType"', result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        artifact = json.loads(output.read_text())
+                        self.assertTrue({"f32", "bf16"} <= set(artifact["required_element_types"]))
+                        self.assertNotIn("fusion_contract", artifact)
+                        self.assertEqual(artifact["target"]["arch"], arch)
+                        self.assertTrue(all(port["element_type"] == "f32" for port in artifact["port_map"]))
+
     def test_invalid_request_needs_no_triton_and_publishes_no_output(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "request.json"

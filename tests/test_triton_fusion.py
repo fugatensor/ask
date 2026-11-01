@@ -191,6 +191,75 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
         bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
         replay(dtype + "-wrong-marker-type", bad, "malformed ASK boundary marker", low_graph)
 
+    # bool has one-bit registers and one-byte storage; i64 has eight-byte
+    # storage and full-width register copies. The address proof checks both.
+    for dtype, llvm_type, width, constraint, arch in (
+        ("bool", "i1", 1, "=b,r,b,l,r", 75),
+        ("i64", "i64", 8, "=l,r,l,l,r", 86),
+    ):
+        typed_graph = build_module(10, dtype=dtype, arch=arch).to_mlir()
+        typed = fuse(dtype, typed_graph)
+        typed_ir = (typed / "fused.ll").read_text()
+        typed_artifact = json.loads((typed / "exports/external-0.artifact.json").read_text())
+        typed_report = json.loads((typed / "report.json").read_text())
+        assert typed_report["fusion"]["dtype"] == dtype
+        assert typed_artifact["target"]["arch"] == arch
+        assert f"ld.global.b{width * 8}" in typed_ir
+        assert f"st.global.b{width * 8}" in typed_ir
+        assert "ASK_BOUNDARY" not in typed_ir
+        assert all(port["element_type"] == dtype and port["storage_bytes"] == width
+                   for port in typed_artifact["port_map"])
+        for boundary in ("input", "output"):
+            assert typed_artifact["fusion_contract"][boundary]["storage_bytes"] == width
+        bad = copy.deepcopy(typed_artifact)
+        assert f"getelementptr {llvm_type}" in bad["payload"]
+        bad["payload"] = bad["payload"].replace(f"getelementptr {llvm_type}", "getelementptr i16")
+        bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
+        replay(dtype + "-wrong-byte-stride", bad, "element index", typed_graph)
+        bad = copy.deepcopy(typed_artifact)
+        bad["fusion_contract"]["input"]["storage_bytes"] = width * 8
+        replay(dtype + "-wrong-storage-width", bad, "storage byte width", typed_graph)
+        bad = copy.deepcopy(typed_artifact)
+        bad["port_map"][0]["storage_bytes"] = 4
+        replay(dtype + "-wrong-port-width", bad, "storage byte width", typed_graph)
+        bad = copy.deepcopy(typed_artifact)
+        bad["payload"], changed = re.subn(
+            rf'("{re.escape(constraint)}"\(i32 %[^,]+, ){llvm_type} %[^,]+',
+            r'\1i16 0', bad["payload"])
+        assert changed
+        bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
+        replay(dtype + "-wrong-marker-type", bad, "malformed ASK boundary marker", typed_graph)
+
+    # F may choose a wider computation than its storage ABI. Preserve its own
+    # casts and contraction policy, while ASK helpers use explicit ASK casts.
+    for dtype, llvm_type in (("bool", "i1"), ("i64", "i64"),
+                             ("f16", "half"), ("bf16", "bfloat")):
+        mixed_graph = build_module(10, dtype=dtype, compute_dtype="f32", factor=1.25,
+                                   external_offset=0.1, arch=86).to_mlir()
+        mixed = fuse(dtype + "-compute-f32", mixed_graph)
+        mixed_ir = (mixed / "fused.ll").read_text()
+        mixed_artifact = json.loads((mixed / "exports/external-0.artifact.json").read_text())
+        mixed_report = json.loads((mixed / "report.json").read_text())
+        assert mixed_artifact["target"]["arch"] == 86
+        assert mixed_artifact["fusion_contract"]["proof"]["layout"]["matched_uninstrumented_baseline"]
+        assert {dtype, "f32"} <= set(mixed_artifact["fusion_contract"]["required_element_types"])
+        assert {dtype, "f32"} <= set(mixed_report["fusion"]["required_element_types"])
+        # Triton may fold bool's two possible input values before LLVM export.
+        if dtype != "bool":
+            assert "fmul contract float" in mixed_ir and "fadd contract float" in mixed_ir
+        assert mixed_artifact["fusion_contract"]["numerics"]["enable_fp_fusion"]
+        assert "ASK_BOUNDARY" not in mixed_ir
+        if dtype in ("f16", "bf16"):
+            assert f"fpext {llvm_type}" in mixed_artifact["payload"]
+            assert "fptrunc float" in mixed_artifact["payload"]
+        elif dtype == "i64":
+            assert "sitofp i64" in mixed_artifact["payload"]
+            assert "fptosi float" in mixed_artifact["payload"]
+            assert "llvm.fptosi.sat" not in mixed_artifact["payload"]
+        bad = copy.deepcopy(mixed_artifact)
+        del bad["fusion_contract"]["required_element_types"]
+        replay(dtype + "-missing-compute-types", bad, "computation type requirements", mixed_graph)
+
     # BLOCK > physical threads creates two value sites per logical boundary.
     # N=19 also makes one masked lane group normalize to a sign-bit expression.
     multiple = source.replace("tensor<10xi32>", "tensor<19xi32>").replace(
@@ -200,4 +269,4 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     multi_report = json.loads((multi / "report.json").read_text())
     assert multi_report["fusion"]["removed_boundary_markers"] == 4
     assert "ASK_BOUNDARY" not in (multi / "fused.ll").read_text()
-    print("Native LLVM fusion verified for i32/f32/f16/bf16, producer contraction, equivalent masks and multiple sites; inconsistent requests rejected")
+    print("Native LLVM fusion verified for bool/i32/i64/f32/f16/bf16, mixed computation, declared targets, producer contraction, equivalent masks and multiple sites; inconsistent requests rejected")

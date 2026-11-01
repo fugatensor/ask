@@ -45,6 +45,17 @@ public:
   ASK_NO_MEMORY_EFFECTS
 };
 
+class CastOp final
+    : public mlir::Op<CastOp, mlir::OpTrait::OneOperand,
+                      mlir::OpTrait::OneResult, mlir::OpTrait::ZeroRegions,
+                      mlir::OpTrait::ZeroSuccessors,
+                      mlir::MemoryEffectOpInterface::Trait> {
+public:
+  ASK_OP_COMMON("ask.cast");
+  ASK_SINGLE_RESULT
+  ASK_NO_MEMORY_EFFECTS
+};
+
 class AddOp final
     : public mlir::Op<AddOp, mlir::OpTrait::NOperands<2>::Impl,
                       mlir::OpTrait::OneResult, mlir::OpTrait::ZeroRegions,
@@ -107,9 +118,14 @@ public:
   ASK_NO_MEMORY_EFFECTS
 };
 
+// Accept an element type or ranked tensor type. Names use Python/API spelling;
+// bool is represented by MLIR i1 but occupies one byte in buffers.
+llvm::StringRef elementTypeName(mlir::Type type);
+unsigned elementByteWidth(mlir::Type type);
 bool isSupportedElementType(mlir::Type type);
 bool isSupportedValueType(mlir::Type type);
 bool haveCompatibleShapes(mlir::Type lhs, mlir::Type rhs);
+bool haveCompatibleShapeOnly(mlir::Type lhs, mlir::Type rhs);
 
 #undef ASK_OP_COMMON
 #undef ASK_NO_MEMORY_EFFECTS

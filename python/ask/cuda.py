@@ -20,7 +20,7 @@ class CUDAError(RuntimeError):
     pass
 
 
-_STORAGE_TYPES = {"i32": ctypes.c_int32, "f32": ctypes.c_float,
+_STORAGE_TYPES = {"bool": ctypes.c_uint8, "i32": ctypes.c_int32, "i64": ctypes.c_int64, "f32": ctypes.c_float,
                   "f16": ctypes.c_uint16, "bf16": ctypes.c_uint16}
 
 
@@ -48,8 +48,10 @@ def _contract(artifact):
     _require(isinstance(entry, str) and entry.isascii() and entry.isidentifier(),
              "unsupported entry name")
     target = artifact.get("target", {})
-    _require(isinstance(target, dict) and target.get("backend") == "cuda" and target.get("arch") == 80
-             and target.get("warp_size") == 32, "initial CUDA runtime requires cuda/sm_80/warp32")
+    _require(isinstance(target, dict) and target.get("backend") == "cuda"
+             and type(target.get("arch")) is int and target["arch"] >= 70
+             and target.get("warp_size") == 32,
+             "CUDA runtime requires an explicit ordinary sm architecture >= 70 and warp32")
     invocation = artifact.get("invocation", {})
     _require(isinstance(invocation, dict) and invocation.get("kind") == "cuda-kernel" and invocation.get("version") == 1,
              "unsupported invocation kind/version")
@@ -95,7 +97,7 @@ def _contract(artifact):
         _require(type(index) is int and 0 <= index < 2 and binding == data_bindings[index]
                  and binding not in port_types, "logical port and invocation argument mappings disagree")
         _require(isinstance(dtype, str) and dtype in _STORAGE_TYPES,
-                 "CUDA buffers support i32, f32, f16 and bf16 element types")
+                 "CUDA buffers support bool, i32, i64, f32, f16 and bf16 element types")
         port_types[binding] = dtype
     dtype = port_types["input:0"]
     _require(port_types["output:0"] == dtype,
@@ -133,9 +135,12 @@ def _host_buffers(values, size, dtype):
     """
     _require(isinstance(values, (list, tuple)) and len(values) == size,
              "input length must equal the artifact's explicit N specialization")
-    if dtype == "i32":
-        _require(all(type(value) is int and -(2**31) <= value < 2**31 for value in values),
-                 "input values must be signed i32 integers")
+    if dtype == "bool":
+        _require(all(type(value) is bool for value in values), "bool input values must be Python bool scalars")
+    elif dtype in ("i32", "i64"):
+        width = int(dtype[1:])
+        _require(all(type(value) is int and -(2**(width - 1)) <= value < 2**(width - 1) for value in values),
+                 f"input values must be signed {dtype} integers")
     else:
         _require(all(type(value) in (int, float) for value in values),
                  f"{dtype} input values must be Python int or float scalars")
@@ -152,6 +157,8 @@ def _host_buffers(values, size, dtype):
 
 
 def _decode_output(storage, size, dtype):
+    if dtype == "bool":
+        return [bool(value) for value in storage[:size]]
     if dtype in ("f16", "bf16"):
         return [decode_float(int(bits).to_bytes(2, "little"), dtype)
                 for bits in storage[:size]]
@@ -169,10 +176,21 @@ def _check_device_dtype(dtype, major, minor, name):
                  f"selected device {name!r} has {major}.{minor}. No emulation fallback is enabled")
 
 
+def _required_types(artifact, dtype):
+    result = {dtype}
+    for field in (None, "fusion", "fusion_contract", "source_fusion_contract"):
+        receipt = artifact if field is None else artifact.get(field, {})
+        label = field or "artifact"
+        _require(isinstance(receipt, dict), label + " must be an object")
+        required = receipt.get("required_element_types", [])
+        _require(isinstance(required, list) and all(isinstance(t, str) and t in _STORAGE_TYPES for t in required),
+                 "invalid required element types in " + label)
+        result.update(required)
+    return result
+
+
 def _fp_contract(artifact, dtype):
     """Keep F's backend contraction setting without applying it to ASK ops."""
-    if dtype == "i32":
-        return "on"
     metadata = artifact["invocation"].get("compiler_metadata")
     _require(isinstance(metadata, dict)
              and type(metadata.get("enable_fp_fusion")) is bool
@@ -192,13 +210,15 @@ def _fp_contract(artifact, dtype):
              "floating fused code generation requires a verified fusion receipt")
     normalized = fusion.get("producer_numerics")
     provenance = artifact.get("source_fusion_contract", {}).get("numerics")
+    expected = ("bool-exact" if dtype == "bool" else dtype + "-wrap" if dtype in ("i32", "i64")
+                else f"{dtype}-rne-no-fast-math-no-contract")
     _require(isinstance(normalized, dict) and isinstance(provenance, dict)
              and normalized.get("representation") == "original-F-instruction-contract-flags"
              and normalized.get("producer_enable_fp_fusion") is enabled
              and normalized.get("producer_enable_reflect_ftz") is metadata["enable_reflect_ftz"]
              and provenance.get("enable_fp_fusion") is enabled
              and provenance.get("enable_reflect_ftz") is metadata["enable_reflect_ftz"]
-             and fusion.get("ask_numerics") == f"{dtype}-rne-no-fast-math-no-contract",
+             and fusion.get("ask_numerics") == expected,
              "floating fusion numerical normalization does not match the producer settings")
     return "on"
 
@@ -207,10 +227,13 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
     """Compile the exact supplied LLVM bytes to a new cubin; never reuse Triton binaries.
 
     llc and ptxas are explicit executable paths. No target or launch policy is
-    selected here. The current target is sm_80; launch dimensions come from the
+    selected here. The target architecture and launch dimensions come from the
     producer artifact rather than a runtime-selected scheduling policy.
     """
     entry, invocation, _, dtype = _contract(artifact)
+    arch = artifact["target"]["arch"]
+    required = _required_types(artifact, dtype)
+    _require("bf16" not in required or arch >= 80, "bf16 compilation requires target sm80 or newer")
     fp_contract = _fp_contract(artifact, dtype)
     llvm_ir, output_directory = Path(llvm_ir).resolve(), Path(output_directory).resolve()
     llc, ptxas = Path(llc).resolve(), Path(ptxas).resolve()
@@ -224,9 +247,9 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
     _require(not any(path.exists() for path in (ptx, cubin, receipt)),
              "codegen destination already contains artifacts; use a fresh directory")
     commands = [
-        [str(llc), "-march=nvptx64", "-mcpu=sm_80", "-mattr=+ptx80", "--fp-contract=" + fp_contract,
+        [str(llc), "-march=nvptx64", f"-mcpu=sm_{arch}", "-mattr=+ptx80", "--fp-contract=" + fp_contract,
          str(llvm_ir), "-o", str(ptx)],
-        [str(ptxas), "--gpu-name=sm_80", "-v", str(ptx), "-o", str(cubin)],
+        [str(ptxas), f"--gpu-name=sm_{arch}", "-v", str(ptx), "-o", str(cubin)],
     ]
     logs = []
     for command in commands:
@@ -239,7 +262,7 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
                             + result.stdout + result.stderr)
         logs.append(result.stdout + result.stderr)
     _require(llvm_ir.read_bytes() == source, "LLVM input changed during compilation")
-    result = {"schema_version": 1, "entry": entry, "arch": 80, "element_type": dtype,
+    result = {"schema_version": 1, "entry": entry, "arch": arch, "element_type": dtype,
               "fp_contract": fp_contract,
               "artifact_sha256": _artifact_digest(artifact),
               "llvm_ir": str(llvm_ir), "llvm_sha256": _digest(source),
@@ -326,9 +349,11 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
     Failed launches are never replayed or silently replaced by another kernel.
     """
     entry, invocation, size, dtype = _contract(artifact)
+    required = _required_types(artifact, dtype)
     _require(isinstance(codegen, dict), "codegen receipt must be an object")
     host_input, host_output = _host_buffers(values, size, dtype)
-    _require(codegen.get("entry") == entry and codegen.get("arch") == 80
+    arch = artifact["target"]["arch"]
+    _require(codegen.get("entry") == entry and codegen.get("arch") == arch
              and codegen.get("invocation") == invocation and codegen.get("element_type") == dtype
              and codegen.get("fp_contract") == _fp_contract(artifact, dtype),
              "codegen and execution contracts disagree")
@@ -349,9 +374,13 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
     driver.call("cuDeviceGetName", name, len(name), device)
     major, minor = driver.attribute(device, 75), driver.attribute(device, 76)
     _check_device_dtype(dtype, major, minor, name.value.decode())
-    # Cubin compatibility for ordinary sm_80 targets is within the same major
+    for intermediate_type in required:
+        _check_device_dtype(intermediate_type, major, minor, name.value.decode())
+    # Cubin compatibility for ordinary sm targets is within the same major
     # family with an equal or newer minor revision; do not assume across-major.
-    _require(major == 8 and minor >= 0, "sm_80 cubin requires a compatible compute capability 8.x device")
+    _require(major == arch // 10 and minor >= arch % 10,
+             f"sm_{arch} cubin is incompatible with device capability {major}.{minor}; "
+             "compile the graph for the selected device's target architecture")
     _require(driver.attribute(device, 10) == 32, "device warp size disagrees with contract")
     grid = invocation["grid"]
     _require(all(value <= driver.attribute(device, attr) for value, attr in zip(grid, (5, 6, 7))),

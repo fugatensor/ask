@@ -1,6 +1,6 @@
 """Trace-only instrumentation for the first provable Triton fusion boundary.
 
-The accepted source has one guarded i32/f32/f16/bf16 load, pure pointwise arithmetic, and
+The accepted source has one guarded typed load, pure pointwise arithmetic, and
 one store using the same index and mask. This module never decodes Triton's
 memory inline assembly. ASK's LLVM pass validates the identity trace calls.
 """
@@ -18,10 +18,14 @@ PROTOCOL = "ask.triton.boundary.v1"
 INPUT_ASM = "// ASK_BOUNDARY_INPUT_V1\nmov.b32 $0, $1;"
 OUTPUT_ASM = "// ASK_BOUNDARY_OUTPUT_V1\nmov.b32 $0, $1;"
 CONSTRAINTS = "=r,r,l,r,r"
-VALUE_TYPES = {"*i32": ("i32", "tl.int32", CONSTRAINTS),
+VALUE_TYPES = {"*i1": ("bool", "tl.int1", "=b,r,b,l,r"),
+               "*i32": ("i32", "tl.int32", CONSTRAINTS),
+               "*i64": ("i64", "tl.int64", "=l,r,l,l,r"),
                "*fp32": ("f32", "tl.float32", "=f,r,f,l,r"),
                "*fp16": ("f16", "tl.float16", "=h,r,h,l,r"),
                "*bf16": ("bf16", "tl.bfloat16", "=h,r,h,l,r")}
+CAST_TYPES = {triton_type: dtype for dtype, triton_type, _ in VALUE_TYPES.values()}
+STORAGE_BYTES = {"bool": 1, "i32": 4, "i64": 8, "f32": 4, "f16": 2, "bf16": 2}
 MAX_ELEMENTS = 2147483520
 ALLOWED_TRITON_ENVIRONMENT = frozenset({
     "TRITON_CACHE_DIR", "TRITON_HOME", "TRITON_ALWAYS_COMPILE",
@@ -104,6 +108,7 @@ class _Dataflow:
     def __init__(self, constants, bindings, dtype):
         self.constants = constants
         self.dtype = dtype
+        self.used_types = {dtype}
         self.names = {name: _linear(constant=value) for name, value in constants.items()}
         self.names.update({name: ("pointer", binding, (0, 0, 0))
                            for name, binding in bindings.items()})
@@ -114,14 +119,59 @@ class _Dataflow:
         # reassigned between the input and output boundary.
         self.index_ast = _expression("tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)")
 
+    def cast_dtype(self, node):
+        name = ast.unparse(node)
+        if name in CAST_TYPES:
+            self.used_types.add(CAST_TYPES[name])
+            return
+        if isinstance(node, ast.Attribute) and node.attr == "dtype":
+            require(self.evaluate(node.value)[0] in ("linear", "value", "float", "mask"),
+                    "cast dtype must come from a numeric value, not a pointer")
+            return
+        raise FusionError("cast destination must be a supported tl dtype or a numeric value.dtype")
+
+    def cast(self, node, method):
+        # Check public numeric conversion APIs without rewriting them. Unknown
+        # methods, pointer conversions and evaluated option expressions cannot
+        # hide an effect inside an otherwise proven load/store graph.
+        if method:
+            value = self.evaluate(node.func.value)
+            args = node.args
+        else:
+            require(bool(node.args), "tl.cast requires an explicit numeric value")
+            value = self.evaluate(node.args[0])
+            args = node.args[1:]
+        require(value[0] in ("linear", "value", "float", "mask"),
+                "only numeric values can be cast; pointers must not escape")
+        require(len(args) <= 1, "cast accepts one dtype and explicit keyword options")
+        keywords = {}
+        for item in node.keywords:
+            require(item.arg in ("dtype", "fp_downcast_rounding", "bitcast") and item.arg not in keywords,
+                    "unsupported or repeated cast option")
+            keywords[item.arg] = item.value
+        require((len(args) == 1) != ("dtype" in keywords), "cast requires exactly one destination dtype")
+        self.cast_dtype(args[0] if args else keywords["dtype"])
+        if "fp_downcast_rounding" in keywords:
+            option = keywords["fp_downcast_rounding"]
+            require(isinstance(option, ast.Constant) and option.value in (None, "rtne", "rtz"),
+                    "cast rounding must be an explicit supported constant")
+        if "bitcast" in keywords:
+            option = keywords["bitcast"]
+            require(isinstance(option, ast.Constant) and type(option.value) is bool,
+                    "cast bitcast option must be an explicit boolean")
+        # A numeric conversion does not establish an address/index equality.
+        # The actual value and dtype are still computed by the original DSL.
+        return ("value",)
+
     def evaluate(self, node):
         number = _integer(node)
         if number is not None:
-            require(-(2**31) <= number < 2**31, "literal must fit signed i32")
+            require(-(2**63) <= number < 2**63, "literal must fit signed i64")
             return _linear(constant=number)
+        if isinstance(node, ast.Constant) and type(node.value) is bool:
+            return ("value",)
         if isinstance(node, ast.Constant) and type(node.value) is float:
-            require(self.dtype != "i32" and math.isfinite(node.value),
-                    "floating literals require floating data and a finite value")
+            require(math.isfinite(node.value), "floating literals must be finite")
             return ("float", node.value)
         if isinstance(node, ast.Name):
             require(node.id in self.names, "unknown or forward local reference: " + node.id)
@@ -161,10 +211,16 @@ class _Dataflow:
             return ("value",)
         if isinstance(node, ast.Compare) and len(node.ops) == len(node.comparators) == 1:
             left, right = self.evaluate(node.left), self.evaluate(node.comparators[0])
+            require(left[0] in ("linear", "value", "float", "mask") and
+                    right[0] in ("linear", "value", "float", "mask"),
+                    "comparison requires numeric values")
+            require(isinstance(node.ops[0], (ast.Lt, ast.Gt, ast.LtE, ast.GtE, ast.Eq, ast.NotEq)),
+                    "unsupported numeric comparison")
+            if left[0] != "linear" or right[0] != "linear" or \
+                    not isinstance(node.ops[0], (ast.Gt, ast.Lt)):
+                return ("value",)
             if isinstance(node.ops[0], ast.Gt):
                 left, right = right, left
-            else:
-                require(isinstance(node.ops[0], ast.Lt), "boundary predicate must be a strict upper bound")
             require(left[0] == right[0] == "linear" and right[1][:2] == (0, 0),
                     "predicate must compare an affine index with a constexpr bound")
             return ("mask", left[1], right[1][2])
@@ -178,6 +234,10 @@ class _Dataflow:
                     self.evaluate(args["end"]) == _linear(constant=self.constants["BLOCK"]),
                     "arange must span [0, BLOCK)")
             return _linear(lane=1)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "to":
+            return self.cast(node, method=True)
+        if _call(node, "cast"):
+            return self.cast(node, method=False)
         raise FusionError("unsupported expression or call in boundary dataflow")
 
     def address(self, node, binding):
@@ -188,7 +248,7 @@ class _Dataflow:
         require(self.evaluate(node) == self.mask, "memory mask must describe the logical index < N")
 
     def numeric(self, node):
-        require(self.evaluate(node)[0] in ("linear", "value", "float"), "stored value must be numeric")
+        require(self.evaluate(node)[0] in ("linear", "value", "float", "mask"), "stored value must be numeric")
 
 def _trace(value, address, index, mask, asm, dtype, constraints, *, store=False):
     mask_i32 = ast.Call(func=ast.Attribute(value=copy.deepcopy(mask), attr="to", ctx=ast.Load()),
@@ -241,15 +301,15 @@ def instrument(request):
     signature = request["signature"]
     require(signature.get(input_name) in VALUE_TYPES and
             signature.get(input_name) == signature.get(output_name),
-            "fusion requires matching *i32, *fp32, *fp16 or *bf16 data pointers")
+            "fusion requires matching supported data-pointer types")
     dtype, triton_dtype, constraints = VALUE_TYPES[signature[input_name]]
     input_asm, output_asm = INPUT_ASM, OUTPUT_ASM
     arguments = {"value": 0, "address": 1, "index": 2, "mask": 3}
     if dtype != "i32":
         input_asm, output_asm = (text.replace("$1", "$2") for text in (INPUT_ASM, OUTPUT_ASM))
         arguments = {"index": 0, "value": 1, "address": 2, "mask": 3}
-    if dtype in ("f16", "bf16"):
-        input_asm, output_asm = (text.replace("mov.b32", "mov.b16") for text in (input_asm, output_asm))
+    opcode = {"bool": "mov.pred", "i64": "mov.b64", "f16": "mov.b16", "bf16": "mov.b16"}.get(dtype, "mov.b32")
+    input_asm, output_asm = (text.replace("mov.b32", opcode) for text in (input_asm, output_asm))
     tree = ast.parse(request["source"])
     function = next(item for item in tree.body if isinstance(item, ast.FunctionDef))
     require(function.returns is None and not getattr(function, "type_params", []),
@@ -268,7 +328,8 @@ def instrument(request):
                 args = _bind(statement.value, ("pointer", "mask", "other"))
                 flow.address(args["pointer"], "input:0")
                 flow.predicate(args["mask"])
-                require(flow.evaluate(args["other"]) in (_linear(), ("float", 0.0)),
+                require(flow.evaluate(args["other"]) in (_linear(), ("float", 0.0)) or
+                        (isinstance(args["other"], ast.Constant) and args["other"].value is False),
                         "input load requires other=0")
                 flow.names[name] = ("value",)
                 input_trace = ast.Assign(targets=[ast.Name(id=name, ctx=ast.Store())],
@@ -299,6 +360,8 @@ def instrument(request):
         else:
             raise FusionError("only local assignments and the output store are supported")
     require(input_trace is not None and store is not None, "both input load and output store are required")
+    require("bf16" not in flow.used_types or request["target"]["arch"] >= 80,
+            "bf16 computation requires CUDA compute capability 8.0 or newer")
     function.body = rewritten
     ast.fix_missing_locations(tree)
     source = ast.unparse(tree) + "\n"
@@ -307,16 +370,17 @@ def instrument(request):
         return {"marker_asm": asm, "constraints": constraints,
                 "source_parameter": parameter, "source_binding": binding,
                 "arguments": dict(arguments),
-                "mask_encoding": "zext_i1_to_i32"}
+                "mask_encoding": "zext_i1_to_i32", "storage_bytes": STORAGE_BYTES[dtype]}
 
     contract = {
         "protocol": PROTOCOL, "entry": request["entry"], "dtype": dtype, "shape": [count],
+        "required_element_types": sorted(flow.used_types),
         "block": block, "grid": list(request["grid"]), "num_warps": warps,
         "original_source_sha256": hashlib.sha256(request["source"].encode()).hexdigest(),
         "instrumented_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "input": {**boundary(input_name, "input:0", input_asm), "other": 0},
         "output": boundary(output_name, "output:0", output_asm),
-        "proof": {"source_subset": "affine-pointwise-typed-v4", "input_loads": 1,
+        "proof": {"source_subset": "affine-pointwise-typed-casts-v5", "input_loads": 1,
                   "output_stores": 1, "same_index": True, "same_mask": True,
                   "no_pointer_escape": True, "only_output_store_has_effect": True,
                   "requires_disjoint_input_output": True,

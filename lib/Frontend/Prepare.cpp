@@ -46,7 +46,7 @@ LogicalResult checkSize(Operation *owner, Type type) {
   uint64_t elements = 1;
   // The prototype uses signed 64-bit byte counts in its external descriptions.
   const uint64_t maxElements = uint64_t(std::numeric_limits<int64_t>::max()) /
-      (tensor.getElementType().getIntOrFloatBitWidth() / 8);
+      elementByteWidth(tensor);
   for (int64_t extent : tensor.getShape()) {
     if (extent < 0 || uint64_t(extent) > maxElements / elements)
       return owner->emitError("tensor byte count exceeds the prototype's signed 64-bit size range");
@@ -81,6 +81,14 @@ LogicalResult inferOperation(Operation *op, bool &changed) {
                   RankedTensorType::get(shape.asArrayRef(), splat.getOperand().getType()),
                   changed);
   }
+  if (auto cast = dyn_cast<CastOp>(op)) {
+    Type inferred = cast.getResult().getType();
+    if (auto input = dyn_cast<RankedTensorType>(cast.getOperand().getType())) {
+      auto output = mlir::cast<RankedTensorType>(inferred);
+      inferred = RankedTensorType::get(input.getShape(), output.getElementType());
+    }
+    return refine(op, 0, inferred, changed);
+  }
   if (isa<AddOp, MulOp>(op)) {
     Type lhs = op->getOperand(0).getType();
     Type rhs = op->getOperand(1).getType();
@@ -97,8 +105,11 @@ LogicalResult inferOperation(Operation *op, bool &changed) {
     auto operand = semantics->getAttrOfType<IntegerAttr>("shape_operand");
     unsigned shapeOperand = operand ? unsigned(operand.getInt()) : 0;
     for (unsigned i = 0; i < op->getNumResults(); ++i) {
-      Type inferred = rule == "same_as" ? op->getOperand(shapeOperand).getType()
-                                        : semantics.getFunctionType().getResult(i);
+      Type inferred = semantics.getFunctionType().getResult(i);
+      if (rule == "same_as")
+        if (auto input = dyn_cast<RankedTensorType>(op->getOperand(shapeOperand).getType()))
+          inferred = RankedTensorType::get(input.getShape(),
+                     cast<RankedTensorType>(inferred).getElementType());
       if (failed(refine(op, i, inferred, changed)))
         return failure();
     }
@@ -202,8 +213,8 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
     for (Operation &op : function.front()) {
       if (isa<func::ReturnOp>(op))
         continue;
-      if (!isa<ConstantOp, SplatOp, AddOp, MulOp, ExternalOp, MarkOp>(op))
-        return op.emitOpError("unsupported graph operation; initial subset is constant, splat, add, mul, external, and mark");
+      if (!isa<ConstantOp, SplatOp, CastOp, AddOp, MulOp, ExternalOp, MarkOp>(op))
+        return op.emitOpError("unsupported graph operation; initial subset is constant, splat, cast, add, mul, external, and mark");
       auto id = op.getAttrOfType<StringAttr>("ask.id");
       if (op.hasAttr("ask.id") && (!id || id.getValue().empty()))
         return op.emitOpError("ask.id must be a nonempty string");
@@ -222,7 +233,7 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
     for (auto [index, argument] : llvm::enumerate(function.getArguments())) {
       if (!isSupportedValueType(argument.getType()) || !isConcrete(argument.getType()))
         return function.emitOpError() << "input " << index
-             << " requires a concrete ranked i32/f32/f16/bf16 tensor or scalar; result constraints cannot supply unknown input dimensions";
+             << " requires a concrete ranked bool/i32/i64/f32/f16/bf16 tensor or scalar; result constraints cannot supply unknown input dimensions";
       if (failed(checkSize(function, argument.getType())))
         return failure();
       auto declaredId = function.getArgAttrOfType<StringAttr>(index, "ask.value_id");
@@ -370,7 +381,7 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
         bindings.push_back(llvm::json::Object{
             {"function", function.getSymName().str()}, {"value_id", identity},
             {"rank", tensor.getRank()}, {"shape", shapeArray(tensor)},
-            {"element_type", printType(tensor.getElementType())}, {"type", type}});
+            {"element_type", elementTypeName(tensor)}, {"element_bytes", int64_t(elementByteWidth(tensor))}, {"type", type}});
       }
       if (input)
         specializations.push_back(llvm::json::Object{

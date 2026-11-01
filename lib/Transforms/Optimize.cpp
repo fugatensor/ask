@@ -5,6 +5,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
@@ -33,7 +34,7 @@ std::string valueId(Value value) {
 }
 
 bool isKnownPure(Operation *op) {
-  return isa<ConstantOp, SplatOp, AddOp, MulOp>(op);
+  return isa<ConstantOp, SplatOp, CastOp, AddOp, MulOp>(op);
 }
 
 bool namesPort(StringRef port, Operation *op) {
@@ -116,6 +117,48 @@ Operation *createConstant(OpBuilder &builder, Location location, Type type,
   return builder.create(state);
 }
 
+TypedAttr foldCast(TypedAttr source, Type target, OpBuilder &builder) {
+  if (source.getType() == target) return source;
+  if (target.isSignlessInteger(1)) {
+    bool nonzero = isa<IntegerAttr>(source) ? !cast<IntegerAttr>(source).getValue().isZero()
+                                           : !cast<FloatAttr>(source).getValue().isZero();
+    return builder.getIntegerAttr(target, llvm::APInt(1, nonzero));
+  }
+  if (auto integer = dyn_cast<IntegerType>(target)) {
+    if (auto input = dyn_cast<IntegerAttr>(source)) {
+      auto bits = input.getType().isSignlessInteger(1)
+                      ? input.getValue().zextOrTrunc(integer.getWidth())
+                      : input.getValue().sextOrTrunc(integer.getWidth());
+      return builder.getIntegerAttr(target, bits);
+    }
+    const auto &value = cast<FloatAttr>(source).getValue();
+    if (value.isNaN()) return builder.getIntegerAttr(target, llvm::APInt(integer.getWidth(), 0));
+    llvm::APSInt converted(integer.getWidth(), false);
+    bool exact;
+    auto status = value.convertToInteger(converted, llvm::APFloat::rmTowardZero, &exact);
+    if (status & llvm::APFloat::opInvalidOp)
+      return builder.getIntegerAttr(target, value.isNegative()
+          ? llvm::APInt::getSignedMinValue(integer.getWidth())
+          : llvm::APInt::getSignedMaxValue(integer.getWidth()));
+    return builder.getIntegerAttr(target, converted);
+  }
+  auto floating = cast<FloatType>(target);
+  llvm::APFloat converted(floating.getFloatSemantics());
+  if (auto input = dyn_cast<IntegerAttr>(source)) {
+    converted.convertFromAPInt(input.getValue(), !input.getType().isSignlessInteger(1),
+                               llvm::APFloat::rmNearestTiesToEven);
+  } else {
+    converted = cast<FloatAttr>(source).getValue();
+    bool losesInfo;
+    // Both 16-bit formats extend exactly to f32 before the final conversion.
+    if ((source.getType().isF16() && target.isBF16()) ||
+        (source.getType().isBF16() && target.isF16()))
+      converted.convert(llvm::APFloat::IEEEsingle(), llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+    converted.convert(floating.getFloatSemantics(), llvm::APFloat::rmNearestTiesToEven, &losesInfo);
+  }
+  return builder.getFloatAttr(target, converted);
+}
+
 int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
                       llvm::StringSet<> &rewrittenValues) {
   IdAllocator ids(module);
@@ -136,30 +179,33 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
           constants.try_emplace(splat.getResult(), known->second);
         continue;
       }
-      if (!isa<AddOp, MulOp>(op))
+      if (!isa<CastOp, AddOp, MulOp>(op))
         continue;
       auto lhs = constants.find(op.getOperand(0));
-      auto rhs = constants.find(op.getOperand(1));
-      if (lhs == constants.end() || rhs == constants.end())
-        continue;
-
+      if (lhs == constants.end()) continue;
       OpBuilder builder(&op);
       TypedAttr folded;
-      if (auto left = dyn_cast<IntegerAttr>(lhs->second)) {
-        // APInt arithmetic wraps at the verified i32 width.
-        const llvm::APInt &right = cast<IntegerAttr>(rhs->second).getValue();
-        llvm::APInt bits = isa<AddOp>(op) ? left.getValue() + right
-                                         : left.getValue() * right;
-        folded = builder.getIntegerAttr(left.getType(), bits);
+      if (isa<CastOp>(op)) {
+        Type target = op.getResult(0).getType();
+        if (auto tensor = dyn_cast<RankedTensorType>(target)) target = tensor.getElementType();
+        folded = foldCast(lhs->second, target, builder);
       } else {
-        auto floating = cast<FloatAttr>(lhs->second);
-        llvm::APFloat bits = floating.getValue();
-        const llvm::APFloat &right = cast<FloatAttr>(rhs->second).getValue();
-        if (isa<AddOp>(op))
-          bits.add(right, llvm::APFloat::rmNearestTiesToEven);
-        else
-          bits.multiply(right, llvm::APFloat::rmNearestTiesToEven);
-        folded = builder.getFloatAttr(floating.getType(), bits);
+        auto rhs = constants.find(op.getOperand(1));
+        if (rhs == constants.end()) continue;
+        if (auto left = dyn_cast<IntegerAttr>(lhs->second)) {
+          // APInt arithmetic wraps at the verified signed integer width.
+          const llvm::APInt &right = cast<IntegerAttr>(rhs->second).getValue();
+          llvm::APInt bits = isa<AddOp>(op) ? left.getValue() + right
+                                           : left.getValue() * right;
+          folded = builder.getIntegerAttr(left.getType(), bits);
+        } else {
+          auto floating = cast<FloatAttr>(lhs->second);
+          llvm::APFloat bits = floating.getValue();
+          const llvm::APFloat &right = cast<FloatAttr>(rhs->second).getValue();
+          if (isa<AddOp>(op)) bits.add(right, llvm::APFloat::rmNearestTiesToEven);
+          else bits.multiply(right, llvm::APFloat::rmNearestTiesToEven);
+          folded = builder.getFloatAttr(floating.getType(), bits);
+        }
       }
       rewrittenOperations.insert(operationId(&op));
       rewrittenValues.insert(valueId(op.getResult(0)));
@@ -246,11 +292,11 @@ llvm::json::Array planFusion(ModuleOp module, bool enabled, bool &changed) {
         auto type = dyn_cast<RankedTensorType>(op.getResult(0).getType());
         if (!type)
           continue; // Scalar arithmetic may occur between tensor operations.
-        if (!type.hasStaticShape() || !isa<SplatOp, AddOp, MulOp>(op)) {
+        if (!type.hasStaticShape() || !isa<SplatOp, CastOp, AddOp, MulOp>(op)) {
           finish();
           continue;
         }
-        if (groupType && type != groupType)
+        if (groupType && type.getShape() != groupType.getShape())
           finish();
         if (!groupType)
           groupType = type;

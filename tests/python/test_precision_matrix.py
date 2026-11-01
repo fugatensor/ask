@@ -16,13 +16,19 @@ from support.pointwise import DTYPES, build_module
 class PrecisionMatrixTests(unittest.TestCase):
     def test_plan_accounts_for_eligible_and_skipped_combinations_before_execution(self):
         plan = plan_matrix(DTYPES)
-        self.assertEqual(plan.gpu_executions, 86)
-        self.assertEqual(len(plan.eligible), 43)
-        self.assertEqual(len(plan.skipped), 5)
+        self.assertEqual(plan.gpu_executions, 208)
+        self.assertEqual(len(plan.eligible), 104)
+        self.assertEqual(len(plan.skipped), 28)
         self.assertEqual(len(plan.eligible) + len(plan.skipped), len(plan.cases) * len(DTYPES))
-        self.assertTrue(all(item["dtype"] == "i32" and item["reason"] for item in plan.skipped))
+        self.assertTrue(all(item["reason"] for item in plan.skipped))
         self.assertEqual(plan.cache_counters,
-                         {"requests": 86, "hits": 43, "misses": 43, "invalid": 0, "builds": 43})
+                         {"requests": 208, "hits": 104, "misses": 104, "invalid": 0, "builds": 104})
+
+    def test_identical_typed_graphs_are_accounted_for_before_cache_access(self):
+        plan = plan_matrix(["f32", "f16", "bf16"], ["special", "mixed-special"])
+        self.assertEqual(plan.gpu_executions, 10)
+        self.assertEqual(plan.skipped, ({"case": "mixed-special", "dtype": "f32",
+                                        "reason": "identical typed graph already covered by special"},))
 
     def test_alias_selection_runs_one_case_and_unknown_or_empty_selections_fail(self):
         plan = plan_matrix(["fp16", "f16"], ["same-shape"])
@@ -42,7 +48,7 @@ class PrecisionMatrixTests(unittest.TestCase):
             module = build_module(dtype=item.dtype, **item.options)
             text = module.to_mlir()
             topologies.append(re.findall(r'"(ask\.[a-z_]+)"\(', text))
-            self.assertIn(f"tensor<17x{item.dtype}>", text)
+            self.assertIn(f"tensor<17x{'i1' if item.dtype == 'bool' else item.dtype}>", text)
             self.assertIn('ask.id = "P"', text)
             self.assertIn('ask.id = "F"', text)
             self.assertIn('ask.id = "Q"', text)
@@ -64,6 +70,19 @@ class PrecisionMatrixTests(unittest.TestCase):
         self.assertFalse(any(item.graph.name.startswith("changed-") for item in default.eligible))
         extended = plan_matrix(["bf16"], extended=True)
         self.assertTrue(set(names) <= {item.graph.name for item in extended.eligible})
+
+    def test_compute_precision_is_distinct_from_storage_dtype(self):
+        plan = plan_matrix(["f16", "bf16", "f32"], ["same-shape", "changed-compute-type"])
+        self.assertEqual(plan.gpu_executions, 10)
+        self.assertEqual(len(plan.skipped), 1)
+        self.assertEqual(plan.skipped[0]["dtype"], "f32")
+        for dtype in ("f16", "bf16"):
+            low = build_module(size=10, dtype=dtype).to_mlir()
+            mixed = build_module(size=10, dtype=dtype, compute_dtype="f32").to_mlir()
+            self.assertNotEqual(low, mixed)
+            self.assertIn("tensor<10xf32>", mixed)
+            self.assertIn(f"tensor<10x{dtype}>", mixed)
+            self.assertIn('"ask.cast"', mixed)
 
     def test_cli_rejects_zero_eligible_matrix_before_tool_or_output_access(self):
         with tempfile.TemporaryDirectory(prefix="ask-empty-matrix-") as temporary:

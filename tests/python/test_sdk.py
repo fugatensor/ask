@@ -55,6 +55,36 @@ class BuilderTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ScalarType("f64")
 
+    def test_bool_i64_constants_and_explicit_casts(self):
+        self.assertEqual(str(ScalarType("bool")), "i1")
+        self.assertEqual(str(TensorType((2, 3), "bool")), "tensor<2x3xi1>")
+        self.assertEqual(str(ScalarType("i64")), "i64")
+        module = Module()
+        tensor = TensorType((2, 3), "bool")
+        graph = module.graph("mixed", inputs={"x": tensor}, results=[TensorType((2, 3), "f32")])
+        integer = graph.cast(graph.inputs["x"], dtype="i64", id="widen", value_id="int_value")
+        result = graph.cast(integer, dtype="f32")
+        self.assertEqual(result.type, TensorType((2, 3), "f32"))
+        graph.return_(result)
+        self.assertEqual(module.to_mlir().count('"ask.cast"'), 2)
+        self.assertIn('ask.value_id = "int_value"', module.to_mlir())
+        constants = Module().graph("constants", inputs={}, results=[])
+        true = constants.constant(True, dtype="bool")
+        self.assertEqual(true.type, ScalarType("bool"))
+        for operation in (constants.add, constants.mul):
+            with self.assertRaisesRegex(TypeError, "bool add/mul"):
+                operation(true, true)
+        for value in (0, 1, "true"):
+            with self.assertRaises(ValueError):
+                constants.constant(value, dtype="bool")
+        for value in (True, 2 ** 63, -(2 ** 63) - 1):
+            with self.assertRaises(ValueError):
+                constants.constant(value, dtype="i64")
+        lower = constants.constant(-(2 ** 63), dtype="i64")
+        upper = constants.constant(2 ** 63 - 1, dtype="i64")
+        constants.return_()
+        self.assertEqual(lower.type, upper.type)
+
     def test_float_constants_preserve_rounded_bits_and_types(self):
         for dtype, precision, zero, one in [("f32", 23, "80000000", "3F800000"),
                                             ("f16", 10, "8000", "3C00"),
@@ -324,6 +354,33 @@ class NativeIntegrationTests(unittest.TestCase):
                 with self.assertRaises(CompilerError):
                     self.compiler.prepare(module.to_mlir().replace(f'"{signature}"', '"*i32"'))
 
+
+    def test_cast_shape_refinement_and_bool_storage_contract(self):
+        dtypes = ("bool", "i32", "i64", "f32", "f16", "bf16")
+        module = Module()
+        for source in dtypes:
+            graph = module.graph("from_" + source, inputs={"x": TensorType((2, 5), source)},
+                                 results=[TensorType((2, 5), target) for target in dtypes])
+            graph.return_(*(graph.cast(graph.inputs["x"], dtype=target) for target in dtypes))
+        prepared = self.compiler.prepare(module)
+        self.assertEqual(prepared.ir.count('"ask.cast"'), 36)
+        shapes = prepared.report["shape_snapshot"]["shape_bindings"]
+        self.assertTrue(all(item["shape"] == [2, 5] for item in shapes))
+        self.assertTrue(all(item["element_bytes"] == 1 for item in shapes if item["element_type"] == "bool"))
+        source = '''module {
+  func.func @f(%x: tensor<2x5xi64>) -> tensor<?x?xf32> {
+    %y = "ask.cast"(%x) : (tensor<2x5xi64>) -> tensor<?x?xf32>
+    return %y : tensor<?x?xf32>
+  }
+}'''
+        refined = self.compiler.prepare(source)
+        self.assertNotIn("?", refined.ir)
+        self.assertIn("tensor<2x5xf32>", refined.ir)
+        for invalid in (source.replace("tensor<?x?xf32>", "tensor<2x4xf32>"),
+                        source.replace("tensor<?x?xf32>", "f32"),
+                        source.replace('"ask.cast"(%x)', '"ask.cast"(%x) {rounding = "toward_zero"}')):
+            with self.assertRaises(CompilerError):
+                self.compiler.prepare(invalid)
 
     def test_real_diagnostics_for_invalid_ir(self):
         with self.assertRaises(CompilerError) as caught:

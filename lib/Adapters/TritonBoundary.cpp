@@ -93,9 +93,15 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   auto dtype = contract->getString("dtype");
   llvm::Type *valueType;
   llvm::StringRef constraints;
-  if (dtype == "i32") {
+  if (dtype == "bool") {
+    valueType = llvm::Type::getInt1Ty(m.getContext());
+    constraints = "=b,r,b,l,r";
+  } else if (dtype == "i32") {
     valueType = llvm::Type::getInt32Ty(m.getContext());
     constraints = "=r,r,l,r,r";
+  } else if (dtype == "i64") {
+    valueType = llvm::Type::getInt64Ty(m.getContext());
+    constraints = "=l,r,l,l,r";
   } else if (dtype == "f32") {
     valueType = llvm::Type::getFloatTy(m.getContext());
     constraints = "=f,r,f,l,r";
@@ -106,7 +112,11 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   } else {
     return error("unsupported Triton boundary dtype");
   }
-  uint64_t elementBytes = m.getDataLayout().getTypeStoreSize(valueType).getFixedValue();
+  // Logical bool values occupy i1 registers, but Triton's pointer ABI loads
+  // and stores one byte per element. Never divide the logical bit width by 8.
+  uint64_t elementBytes = dtype == "bool" ? 1 : m.getDataLayout().getTypeStoreSize(valueType).getFixedValue();
+  if (m.getDataLayout().getTypeAllocSize(valueType).getFixedValue() != elementBytes)
+    return error("logical element allocation size differs from the producer's storage ABI");
   auto *proof = contract->getObject("proof");
   if (!proof || proof->getInteger("input_loads") != 1 || proof->getInteger("output_stores") != 1)
     return error("boundary contract lacks complete input/output coverage");
@@ -122,11 +132,25 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   if (!constants || !options || !invocation) return error("missing Triton launch/specialization contract");
   auto n = constants->getInteger("N"), block = constants->getInteger("BLOCK");
   auto warps = options->getInteger("num_warps"), warpSize = target->getInteger("warp_size");
+  auto arch = target->getInteger("arch");
   if (!n || !block || !warps || !warpSize || *n < 1 || *n > 2147483520 ||
       *block < 1 || *block > 1024 || (*block & (*block - 1)) ||
       (*warps != 4 && *warps != 8) || *warpSize != 32 ||
-      target->getString("backend") != "cuda" || target->getInteger("arch") != 80)
+      target->getString("backend") != "cuda" || !arch || *arch < 70 || *arch > 999)
     return error("unsupported Triton launch contract");
+  auto *requiredTypes = contract->getArray("required_element_types");
+  if (!requiredTypes) return error("missing external computation type requirements");
+  bool containsPortType = false;
+  for (const auto &type : *requiredTypes) {
+    auto name = type.getAsString();
+    if (name != "bool" && name != "i32" && name != "i64" &&
+        name != "f32" && name != "f16" && name != "bf16")
+      return error("unsupported external computation type requirement");
+    containsPortType |= name == dtype;
+    if (name == "bf16" && *arch < 80)
+      return error("bf16 computation requires CUDA compute capability 8.0 or newer");
+  }
+  if (!containsPortType) return error("external computation types omit the boundary dtype");
   auto *shape = contract->getArray("shape");
   if (!shape || shape->size() != 1 || (*shape)[0].getAsInteger() != n ||
       contract->getInteger("block") != block || contract->getInteger("num_warps") != warps ||
@@ -164,10 +188,10 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
     result.indexArgument = 0;
   }
   llvm::SmallVector<llvm::CallInst *> *sites[] = {&result.inputs, &result.outputs};
-  std::string asmText[] = {"// ASK_BOUNDARY_INPUT_V1\nmov.b",
-                           "// ASK_BOUNDARY_OUTPUT_V1\nmov.b"};
+  std::string asmText[] = {"// ASK_BOUNDARY_INPUT_V1\nmov.",
+                           "// ASK_BOUNDARY_OUTPUT_V1\nmov."};
   for (auto &text : asmText)
-    text += std::to_string(elementBytes * 8) + " $0, $" +
+    text += (dtype == "bool" ? "pred" : "b" + std::to_string(elementBytes * 8)) + " $0, $" +
             std::to_string(result.valueArgument + 1) + ";";
   for (auto &bb : *entry) for (auto &instruction : bb) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
@@ -205,6 +229,8 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
         boundary->getString("source_binding") != binding ||
         boundary->getInteger("marker_count") != static_cast<int64_t>(sites[i]->size()))
       return error("boundary marker definition/count differs from the exported evidence");
+    if (boundary->getInteger("storage_bytes") != static_cast<int64_t>(elementBytes))
+      return error("boundary storage byte width does not match its logical dtype");
     auto *arguments = boundary->getObject("arguments");
     if (!arguments || arguments->getInteger("value") != result.valueArgument ||
         arguments->getInteger("address") != result.addressArgument ||
@@ -217,6 +243,8 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
       if (p && p->getString("logical_port") == binding) {
         if (p->getString("element_type") != dtype)
           return error("boundary dtype does not match data port element type");
+        if (p->getInteger("storage_bytes") != static_cast<int64_t>(elementBytes))
+          return error("data port storage byte width does not match its logical dtype");
         auto index = p->getInteger("argument");
         if (!index || *index < 0 || *index > 1) return error("invalid data argument mapping");
         arg = entry->getArg(*index);

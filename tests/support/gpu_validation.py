@@ -49,17 +49,28 @@ def plan_matrix(dtypes, case_names=None, *, extended=False):
     cases = tuple(case for case in GRAPH_CASES if
                   (case_names is not None and case.name in case_names) or
                   (case_names is None and (extended or not case.extended)))
-    eligible, skipped = [], []
+    eligible, skipped, seen_graphs = [], [], {}
     for case in cases:
         for dtype in dtypes:
             options = case.for_dtype(dtype)
             if options is None:
                 skipped.append({"case": case.name, "dtype": dtype,
-                                "reason": "case requires a floating-point dtype"})
+                                "reason": ("case requires one of " + ", ".join(case.storage_types)
+                                           if case.storage_types else "case requires a floating-point dtype")})
             else:
+                # A case name is not compilation identity. For example f32
+                # storage with f32 compute can be exactly the baseline graph.
+                # These cases also use the same dtype/shape-derived inputs;
+                # account for the duplicate before touching tools or caches.
+                source = build_module(dtype=dtype, **options).to_mlir()
+                if source in seen_graphs:
+                    skipped.append({"case": case.name, "dtype": dtype,
+                                    "reason": "identical typed graph already covered by " + seen_graphs[source]})
+                    continue
+                seen_graphs[source] = case.name
                 eligible.append(MatrixCase(case, dtype, options))
     if not eligible:
-        raise ValueError("no eligible dtype/graph combinations; floating-point cases cannot run as i32")
+        raise ValueError("no eligible dtype/graph combinations; floating-point cases cannot run as integer/bool")
     return MatrixPlan(dtypes, cases, tuple(eligible), tuple(skipped))
 
 
@@ -77,6 +88,7 @@ def main(argv=None):
     parser.add_argument("--extended", action="store_true", help="include extra shapes and launch strategies")
     parser.add_argument("--float", action="store_true", help="include f32 (compatibility spelling)")
     parser.add_argument("--low-precision", action="store_true", help="include f16 and bf16")
+    parser.add_argument("--arch", type=int, default=80, help="producer CUDA target architecture, e.g. 80 or 86")
     arguments = parser.parse_args(argv)
     selected = arguments.dtypes or (["i32"] + (["f32"] if arguments.float else [])
                                     + (["f16", "bf16"] if arguments.low_precision else []))
@@ -96,14 +108,16 @@ def main(argv=None):
     def check(label, size=None, *, shape=None, block=128, num_warps=4, bias=1, factor=2,
               pre_factor=1, post_factor=1, aliased_dsl=False, expected_hit=False,
               dtype="i32", offset=3, tail_offset=None, external_offset=None,
-              enable_fp_fusion=None):
+              enable_fp_fusion=None, compute_dtype=None, roundtrip_dtype=None):
         shape = (size,) if shape is None else shape
         size = math.prod(shape)
         module = build_module(size, shape=shape, block=block, num_warps=num_warps,
                               bias=bias, factor=factor, pre_factor=pre_factor,
                               post_factor=post_factor, aliased_dsl=aliased_dsl,
                               dtype=dtype, offset=offset, tail_offset=tail_offset,
-                              external_offset=external_offset, enable_fp_fusion=enable_fp_fusion)
+                              external_offset=external_offset, enable_fp_fusion=enable_fp_fusion,
+                              compute_dtype=compute_dtype, roundtrip_dtype=roundtrip_dtype,
+                              arch=arguments.arch)
         kernel = compiler.compile_cuda(
             module, cache_dir=arguments.cache_dir,
             output_dir=arguments.output_dir / label,
@@ -121,7 +135,8 @@ def main(argv=None):
         expected = expected_values(values, bias, factor,
                                    pre_factor=pre_factor, post_factor=post_factor,
                                    dtype=dtype, offset=offset, tail_offset=tail_offset,
-                                   external_offset=external_offset, enable_fp_fusion=enable_fp_fusion)
+                                   external_offset=external_offset, enable_fp_fusion=enable_fp_fusion,
+                                   compute_dtype=compute_dtype, roundtrip_dtype=roundtrip_dtype)
         if not numerically_equal(actual, expected, dtype):
             mismatches = [(i, left, right) for i, (left, right) in enumerate(zip(actual, expected))
                           if not numerically_equal([left], [right], dtype)]
@@ -141,6 +156,8 @@ def main(argv=None):
                   "bias": bias, "factor": factor, "offset": offset, "tail_offset": tail_offset,
                   "external_offset": external_offset, "enable_fp_fusion": enable_fp_fusion,
                   "pre_factor": pre_factor, "post_factor": post_factor,
+                  "compute_dtype": compute_dtype or ("i32" if dtype == "bool" else dtype),
+                  "roundtrip_dtype": roundtrip_dtype, "arch": arguments.arch,
                   "logical_block": block, "num_warps": num_warps,
                   "launch_block": execution["block"],
                   "cache": kernel.cache, "llvm_sha256": kernel.codegen["llvm_sha256"],

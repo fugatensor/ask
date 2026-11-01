@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_DTYPES = frozenset({"i32", "f32", "f16", "bf16"})
+_DTYPES = frozenset({"bool", "i32", "i64", "f32", "f16", "bf16"})
 
 
 def _dtype(value: str) -> str:
     value = "f16" if value == "fp16" else value
     if not isinstance(value, str) or value not in _DTYPES:
-        raise ValueError(f"ASK supports i32, f32, f16 and bf16, got {value!r}")
+        raise ValueError(f"ASK supports bool, i32, i64, f32, f16 and bf16, got {value!r}")
     return value
 
 
@@ -22,7 +22,7 @@ class ScalarType:
         object.__setattr__(self, "dtype", _dtype(self.dtype))
 
     def __str__(self) -> str:
-        return self.dtype
+        return "i1" if self.dtype == "bool" else self.dtype
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,8 @@ class TensorType:
 
     def __str__(self) -> str:
         dims = "".join(("?" if dim is None else str(dim)) + "x" for dim in self.shape)
-        return f"tensor<{dims}{self.dtype}>"
+        element = "i1" if self.dtype == "bool" else self.dtype
+        return f"tensor<{dims}{element}>"
 
 
 Type = ScalarType | TensorType
@@ -57,8 +58,8 @@ def as_type(value: Type | str) -> Type:
     raise TypeError(f"expected ScalarType or TensorType, got {type(value).__name__}")
 
 
-def compatible(actual: Type, declared: Type) -> bool:
-    if type(actual) is not type(declared) or actual.dtype != declared.dtype:
+def compatible_shapes(actual: Type, declared: Type) -> bool:
+    if type(actual) is not type(declared):
         return False
     if isinstance(actual, TensorType) and isinstance(declared, TensorType):
         return len(actual.shape) == len(declared.shape) and all(
@@ -66,3 +67,7 @@ def compatible(actual: Type, declared: Type) -> bool:
             for left, right in zip(actual.shape, declared.shape)
         )
     return True
+
+
+def compatible(actual: Type, declared: Type) -> bool:
+    return actual.dtype == declared.dtype and compatible_shapes(actual, declared)

@@ -4,7 +4,7 @@
 namespace ask {
 ASKDialect::ASKDialect(mlir::MLIRContext *context)
     : Dialect(getDialectNamespace(), context, mlir::TypeID::get<ASKDialect>()) {
-  addOperations<ConstantOp, SplatOp, AddOp, MulOp, SemanticsOp,
+  addOperations<ConstantOp, SplatOp, CastOp, AddOp, MulOp, SemanticsOp,
                 ImplementationOp, ExternalOp, MarkOp>();
 }
 } // namespace ask

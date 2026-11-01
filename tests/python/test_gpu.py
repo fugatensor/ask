@@ -30,8 +30,14 @@ class GPUEntryTests(unittest.TestCase):
         for signature, dtype in (("*fp16", "f16"), ("*bf16", "bf16")):
             descriptor = _numerics({"signature": {"a": signature, "b": signature}})
             self.assertEqual(descriptor["element_type"], dtype)
-            self.assertEqual(descriptor["operation_result_type"], dtype)
+            self.assertEqual(descriptor["operation_result_type"], "explicit-per-SSA-value")
             self.assertEqual(descriptor["rounding"], "roundTiesToEven")
+            self.assertNotIn(descriptor, descriptors)
+            descriptors.append(descriptor)
+        for signature, dtype in (("*i1", "bool"), ("*i64", "i64")):
+            descriptor = _numerics({"signature": {"a": signature, "b": signature}})
+            self.assertEqual(descriptor["element_type"], dtype)
+            self.assertEqual(descriptor["cast_semantics"], "rne-saturating-fptosi-nan-zero-v1")
             self.assertNotIn(descriptor, descriptors)
             descriptors.append(descriptor)
         for signature in ({"a": "*i32", "b": "*fp32"}, {"a": "*fp64", "b": "*fp64"}):
