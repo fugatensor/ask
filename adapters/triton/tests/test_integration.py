@@ -129,6 +129,8 @@ class TritonPipelineAndFusionTests(unittest.TestCase):
 
             # Tamper replay rejections against one real exported artifact (zero extra Triton JIT runs).
             for label, mutator, msg in (
+                ("producer-version", lambda b: b["producer"].update(version="0.0.0"), "pinned producer"),
+                ("adapter-version", lambda b: b["producer"].update(adapter_version="0.3.0"), "pinned producer"),
                 ("digest", lambda b: b.update(payload=b["payload"] + "\n; bad\n"), "digest"),
                 ("no-contract", lambda b: b.pop("fusion_contract"), "source / instrumentation evidence"),
                 ("mask-proof", lambda b: b["fusion_contract"]["proof"].update(same_mask=False), "same_mask"),

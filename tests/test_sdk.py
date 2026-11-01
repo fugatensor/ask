@@ -19,7 +19,7 @@ for entry in (str(ROOT / "python"), str(ROOT / "tests")):
     if entry not in sys.path:
         sys.path.insert(0, entry)
 
-from ask import Compiler, CompilerError, Module, ScalarType, TensorType
+from ask import Compiler, CompilerError, Module, ScalarType, TensorType, __version__
 from ask.ir import mlir_string
 from ask.numerics import decode_float, encode_f32, encode_float, round_f32, round_float
 from support.host_runner import ask_opt_path
@@ -229,6 +229,7 @@ class NativeCompilerAndBindingTests(unittest.TestCase):
             with self.assertRaises(CompilerError) as caught:
                 native.prepare("module { unknown }")
         self.assertEqual(caps["python_bindings"], "nanobind")
+        self.assertEqual(caps["ask_version"], __version__)
         self.assertEqual(prepared.report["phase"], "prepared")
         self.assertEqual(optimized.report["phase"], "optimized")
         self.assertIn("<ask-python>", caught.exception.diagnostics)
@@ -249,6 +250,11 @@ class NativeCompilerAndBindingTests(unittest.TestCase):
                    return_value=subprocess.CompletedProcess([], 0, json.dumps(mismatched), "")):
             with self.assertRaisesRegex(CompilerError, "different builds"):
                 Compiler()._check_companion()
+
+        from ask import _native
+        with patch.object(_native, "capabilities", return_value=json.dumps(dict(caps, ask_version="0.0.0"))):
+            with self.assertRaisesRegex(CompilerError, "different versions"):
+                Compiler()
 
 
 if __name__ == "__main__":

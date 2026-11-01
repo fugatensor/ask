@@ -42,6 +42,24 @@ def make_nanobind_bytes(member_name: str = "nanobind-test/cmake/nanobind-config.
 
 
 class CompilerSelectionTests(unittest.TestCase):
+    def test_cmake_release_version_rejects_different_python_metadata(self):
+        import runpy
+        version = runpy.run_path(str(ROOT / "python/ask/_version.py"))["__version__"]
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "version.cmake"
+            script.write_text(
+                "cmake_minimum_required(VERSION 3.28)\n"
+                f'include("{ROOT}/cmake/AskVersion.cmake")\n'
+                'message(STATUS "ASK_VERSION=${ASK_VERSION}")\n', encoding="utf-8")
+            accepted = subprocess.run(["cmake", f"-DSKBUILD_PROJECT_VERSION={version}", "-P", str(script)],
+                                      capture_output=True, text=True)
+            self.assertEqual(accepted.returncode, 0, accepted.stderr)
+            self.assertIn("ASK_VERSION=" + version, accepted.stdout)
+            rejected = subprocess.run(["cmake", "-DSKBUILD_PROJECT_VERSION=999.0.0", "-P", str(script)],
+                                      capture_output=True, text=True)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn("differs from ASK", rejected.stderr)
+
     def test_cmake_allowlist_resolution(self):
         cases = {
             "none": "", "all": "triton", "triton": "triton",
@@ -140,6 +158,35 @@ class FetchDepsTests(unittest.TestCase):
             fifo.type = tarfile.FIFOTYPE
             with self.assertRaises(ValueError):
                 fetcher.archive_filter(record)(fifo, directory)
+
+
+class CITestReportTests(unittest.TestCase):
+    def test_ci_rejects_skipped_missing_and_empty_suites(self):
+        spec = importlib.util.spec_from_file_location("ask_ci_runner", ROOT / "tools/run_ci_tests.py")
+        runner = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(runner)
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.xml"
+            valid = '<testsuite><testcase name="ask-unit" status="run"><system-out>Ran 4 tests in 0.1s\n\nOK</system-out></testcase></testsuite>'
+            report.write_text(valid, encoding="utf-8")
+            runner.check_report(report, {"ask-unit"})
+            invalid = [
+                valid.replace("OK", "OK (skipped=1)"),
+                valid.replace("OK", "test_native ... skipped 'missing extension'"),
+                valid.replace("Ran 4 tests", "Ran 0 tests"),
+                valid.replace('status="run"', 'status="notrun"'),
+                valid.replace("<system-out>", "<failure/><system-out>"),
+                valid.replace("<system-out>", "<skipped/><system-out>"),
+                '<testsuite/>',
+            ]
+            for content in invalid:
+                with self.subTest(content=content):
+                    report.write_text(content, encoding="utf-8")
+                    with self.assertRaises(ValueError):
+                        runner.check_report(report, {"ask-unit"})
+            report.write_text(valid, encoding="utf-8")
+            with self.assertRaises(ValueError):
+                runner.check_report(report, {"ask-unit", "ask-triton"})
 
 
 if __name__ == "__main__":

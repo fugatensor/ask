@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """ASK protocol-1 Triton exporter. No Triton import occurs before a request/probe.
 
-This initial adapter deliberately accepts only the tested Triton 3.7.1 CUDA
+This adapter deliberately accepts only the locked Triton CUDA
 pointer ABI: two equally typed data pointers, integer constexprs and two unused scratch
 pointers. It exports code and descriptions, never Python/kernel handles.
 """
@@ -22,12 +22,13 @@ import re
 import sys
 import tempfile
 
-PROTOCOL_VERSION = 1
-ADAPTER_VERSION = "0.7.0"
+_DEPENDENCIES = json.loads(Path(__file__).with_name("dependencies.lock.json").read_text(encoding="utf-8"))
+PROTOCOL_VERSION = _DEPENDENCIES["protocol_version"]
+ADAPTER_VERSION = _DEPENDENCIES["adapter_version"]
 ELEMENT_TYPES = {"*i1": "bool", "*i32": "i32", "*i64": "i64",
                  "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
 STORAGE_BYTES = {"bool": 1, "i32": 4, "i64": 8, "f32": 4, "f16": 2, "bf16": 2}
-SUPPORTED_TRITON_VERSION = "3.7.1"
+SUPPORTED_TRITON_VERSION = _DEPENDENCIES["compiler"]["version"]
 
 
 class WorkerError(Exception):
@@ -72,7 +73,7 @@ def validate_request(request):
                 "fusion must be exactly {enabled: true|false}")
     require(type(request["protocol_version"]) is int and
             request["protocol_version"] == PROTOCOL_VERSION,
-            "only protocol_version=1 is supported", "ProtocolMismatch")
+            f"only protocol_version={PROTOCOL_VERSION} is supported", "ProtocolMismatch")
     source = request["source"]
     require(isinstance(source, str) and 0 < len(source.encode("utf-8")) <= 1024 * 1024,
             "source must be nonempty UTF-8 text no larger than 1 MiB")
@@ -399,7 +400,7 @@ def build_artifact(request, compiled, triton_version, source_order):
     signature = parse_entry_signature(llvm_ir, entry)
     parameters = signature["parameters"]
     require(len(parameters) == len(source_order) + 2,
-            "Triton 3.7.1 ABI must contain data pointers followed by two scratch pointers",
+            f"Triton {SUPPORTED_TRITON_VERSION} ABI must contain data pointers followed by two scratch pointers",
             "UnsupportedEntryABI", "artifact")
     require(all(not p["unused_scratch_attributes"] for p in parameters[:2]) and
             all(p["unused_scratch_attributes"] for p in parameters[2:]),

@@ -1,17 +1,19 @@
 # ASK
 
-ASK 是面向张量框架的底层编译与运行时引擎。上层通过 MLIR `ask` dialect 提交静态计算图与可选的外部 DSL（如 Triton），ASK 完成类型与形状检查、基础图优化、原生 LLVM IR 降级、跨编译器值边界内联融合，并生成 CPU 目标代码或 CUDA `cubin` 交由常驻会话执行。
+ASK 是面向张量框架的底层编译与运行时引擎。上层通过 MLIR `ask` dialect 提交静态计算图与可选的外部 DSL（如 Triton），ASK 完成类型与形状检查、基础图优化、原生 LLVM IR 降级与受支持的跨编译器值边界融合。Host 路径生成供宿主链接调用的 CPU 目标文件；CUDA 路径生成 `cubin`，由常驻设备会话执行。
 
 - **6 种显式类型与确定性数值**：支持 `bool`、`i32`、`i64`、`f32`、`f16`、`bf16` 单基本块静态图、单步最近偶数舍入（RNE）常量与 6×6 显式 `ask.cast`，不做隐式类型提升或隐式广播。
 - **自有 CPU 与自有 CUDA 代码生成**：`core` 构建（`ASK_THIRD_PARTY_COMPILERS=none`）不依赖 Triton、NumPy 或 PyTorch，直接支持常量/类型折叠、死代码消除、多输出逐元素融合，并生成 Host 目标文件或自有 CUDA kernel（支持异构多输入输出、0-D 标量与空张量）。
-- **跨编译器 LLVM 值边界融合**：图中包含可证明的逐元素 Triton 算子（`P → F → Q`）时，通过 [Triton 适配器](adapters/triton/README.md) 导出原生 LLVM IR，利用通用值边界内联器将前后 ASK 计算合入同一条 GPU kernel，并按指令级标志隔离各自的浮点收缩（FMA）与转换规则。
+- **跨编译器 LLVM 值边界融合**：围绕单个逐元素 Triton 算子的非空、单输入单输出、同形状同存储类型图（`P → F → Q`），可通过 [Triton 适配器](adapters/triton/README.md) 和通用值边界内联器合入同一条 GPU kernel，并按指令级标志隔离浮点收缩（FMA）与转换规则。检查失败会报错，没有多 kernel 回退路径。
 - **进程内 SDK、常驻会话与双层缓存**：提供 `nanobind` 进程内编译器入口、`ExecutionSession` 常驻设备内存、`__cuda_array_interface__` 零拷贝接入、异步事件同步，以及磁盘级 LLVM IR / `cubin` 双层持久缓存。
 
 架构与实现说明见 [文档目录](docs/README.md) 和 [核心思想](docs/核心思想.md)。
 
+直接使用已安装的包或从任意位置的源码构建，见 [独立安装](docs/安装.md)。不要求相邻目录存在另一份仓库。
+
 ## 构建与验证
 
-环境要求：C++17 编译器、CMake 3.28+、Ninja、Python 3.10+（含开发头文件）。LLVM/MLIR（`23.0.0git`）与 `nanobind` 的版本和校验值锁定在 [cmake/llvm.lock.json](cmake/llvm.lock.json) 与 [cmake/nanobind.lock.json](cmake/nanobind.lock.json) 中，拉取到 `.deps/` 后 CMake 会自动识别：
+锁定的 SDK 支持 Linux x86-64，构建需要 C++17 编译器、CMake 3.28+、Ninja、Python 3.10+（含开发头文件）。LLVM/MLIR（`23.0.0git`）与 `nanobind` 的版本和校验值锁定在 [cmake/llvm.lock.json](cmake/llvm.lock.json) 与 [cmake/nanobind.lock.json](cmake/nanobind.lock.json) 中，拉取到 `.deps/` 后 CMake 会自动识别：
 
 ```bash
 python3 tools/fetch_deps.py
@@ -34,6 +36,8 @@ ctest --preset all --output-on-failure
 python3 -m pip install .
 ```
 
+默认安装核心构建。包版本统一来自 [`python/ask/_version.py`](python/ask/_version.py)，可通过 `ask.__version__` 查询；Python 包、原生扩展与伴生 CLI 必须配套使用。源码包构建、版本兼容规则和发布边界见 [版本契约与分发产物](docs/02-前端接入与构建配置.md#version-contract)。
+
 使用外部同修订 LLVM/MLIR 安装时，可通过 `-DLLVM_DIR=... -DMLIR_DIR=...`（或 `pip install` 时的 `-Ccmake.define.LLVM_DIR=...`）覆盖，见 [前端接入与构建配置](docs/02-前端接入与构建配置.md#build-workflow)。
 
 ## 示例与接入方式
@@ -46,7 +50,7 @@ python3 -m pip install .
 # 构造 P -> F(Triton) -> Q 图并执行语义/形状检查与外部请求导出
 PYTHONPATH=build/core/python:python python3 examples/framework_frontend.py
 
-# 常量折叠、冗余 cast 消除、多输出逐元素融合及 LLVM IR 导出
+# 常量折叠、死代码消除、多输出融合分组，输出优化后的 ASK IR 与统计报告
 PYTHONPATH=build/core/python:python python3 examples/optimize_frontend.py
 ```
 
@@ -88,7 +92,7 @@ C++ 宿主可通过 `find_package(ASK CONFIG REQUIRED)` 直接构造与准备 `a
 `ctest --preset all` 运行 5 个测试集（`core` 运行前 4 个）：
 
 - `ask-compiler-adapter` / `ask-boundary-inline`：C++ 适配器注册隔离与通用 LLVM 值边界内联单测。
-- `ask-unit`：`tests/test_*.py` 共 7 个纯 CPU 单测模块。
+- `ask-unit`：`tests/test_*.py` 纯 CPU 单元测试。
 - `ask-gpu`：`tests/gpu/test_gpu_{native,triton}.py` 物理 GPU 执行、零拷贝会话与双层缓存验证。
 - `ask-triton`：`adapters/triton/tests/test_*.py` Triton 导出协议、AST 静态融合判定与 LLVM 边界融合测试。
 
@@ -99,6 +103,8 @@ PYTHONPATH=build/core/python:python:tests ASK_OPT=build/core/bin/ask-opt \
   ASK_BOUNDARY_INLINE_BIN=build/core/ask-boundary-inline-test \
   python3 -m unittest discover -s tests -p "test_*.py" -v
 ```
+
+[CI 工作流](.github/workflows/ci.yml)定义 Linux 上的 `core`（Python 3.10/3.13）与 `all`（Python 3.13）构建，执行不允许跳过的 CPU 测试，并验证 sdist → wheel → 隔离安装和 C++ 安装消费。CI 不运行物理 GPU 测试；硬件覆盖与触发方式见 [测试体系](docs/06-工程结构与测试体系.md#continuous-integration)。
 
 ## 文档
 
@@ -111,4 +117,4 @@ PYTHONPATH=build/core/python:python:tests ASK_OPT=build/core/bin/ask-opt \
 | [04. 外部编译器适配与边界内联](docs/04-外部编译器适配与边界内联.md) | `adapters/<id>/` 隔离、导出协议与 ABI v2、通用内联核心与 FMA 隔离 |
 | [05. 常驻运行时与多级缓存](docs/05-常驻运行时与多级缓存.md) | `ExecutionSession`、零拷贝设备张量、异步事件与 IR / `cubin` 缓存 |
 | [06. 工程结构与测试体系](docs/06-工程结构与测试体系.md) | 目录职责、5 个 CTest 测试集与共享多精度数值参考 |
-| [07. FugaTensor 协同与演进路线](docs/07-FugaTensor协同与演进路线.md) | 与 FugaTensor 的职责边界、已实现范围与后续规划 |
+| [07. FugaTensor 协同与演进路线](docs/07-FugaTensor协同与演进路线.md) | 与 FugaTensor 的职责边界、已实现范围与当前限制 |

@@ -8,16 +8,16 @@
 
 ## 1. 模块结构与支持的操作集
 
-每个 MLIR `module` 携带两个模块级版本属性（缺省时由 `prepare` 补齐，不匹配则报错）：
+`prepare` 检查并补齐以下模块属性：
 
-- `ask.schema_version = 1 : i64`
-- `ask.ir_revision = "ask-ir-0.1"`
+- `ask.schema_version = 1 : i64`：ASK IR 的格式版本，当前只接受 `1`。
+- `ask.semantic_revision` / `ask.ir_revision`：非负 `i64` 变更计数，缺省从 `0` 开始，且须小于 `INT64_MAX`。类型细化会增加两项计数；补齐稳定身份或擦除标记等 IR 修改增加 `ir_revision`。它们不是 ASK 软件包版本，也不是固定的兼容性版本字符串。
 
 模块顶层仅允许两类符号声明和单基本块 `func.func` 计算图函数：
 
 | 操作 | 所在层级 | 作用 |
 | --- | --- | --- |
-| `ask.semantics` | Module 顶层 | 声明外部算子的输入/输出类型签名、形状推导规则（`same_as` 或 `fixed`）与副作用属性（如 `effects = "none"`）。 |
+| `ask.semantics` | Module 顶层 | 声明外部算子的输入/输出类型签名、形状推导规则（`same_as` 或 `fixed`）；当前只接受 `effects = "none"`。 |
 | `ask.implementation` | Module 顶层 | 绑定外部编译器 ID（如 `"triton"`）、DSL 源码快照、入口函数名、指针签名、`source_bindings`、`constants`、`options`、`target` 和 `grid`。 |
 | `ask.constant` | `func.func` 内 | 生成指定类型的标量常量（`bool` / `i32` / `i64` / `f32` / `f16` / `bf16`）。 |
 | `ask.splat` | `func.func` 内 | 将标量按静态 `shape` 复制填充为同元素类型的张量。 |
@@ -49,7 +49,7 @@ Python SDK（`python/ask/ir.py`）在编码 `f16`、`bf16`、`f32` 标量常量�
 
 需要低精度存储配 `f32` 中间计算时，上层框架在图中显式插入 `f16 -> f32` 与 `f32 -> f16` 的 `ask.cast`。6×6 转换规则在 CPU 与 GPU 上保持一致：
 
-- **同类型转换**：恒等传递，在高层折叠中简化。
+- **同类型转换**：数值保持不变；常量输入可被高层折叠，运行时输入在 LLVM 降级时直接复用原值。
 - **浮点 ↔ 浮点**：窄化（如 `f32 -> f16`、`f32 -> bf16`）与跨格式（`f16 <-> bf16`）按 IEEE RNE 舍入，超出有限表示范围时溢出为同号 `±inf`，保留 `-0.0` 与 `NaN`。
 - **整数 → 浮点**：将有符号整数按 IEEE RNE 舍入到目标浮点格式。
 - **浮点 → 有符号整数（`i32` / `i64`）**：采用饱和截断（对应 `llvm.fptosi.sat`）——向零截断小数部分，`NaN` 映射为 `0`，超出目标整数上下界的值（含 `±inf`）饱和到 `[INT_MIN, INT_MAX]`，避免原始 `fptosi` 溢出产生 `poison`。
@@ -63,8 +63,8 @@ Python SDK（`python/ask/ir.py`）在编码 `f16`、`bf16`、`f32` 标量常量�
 `compiler.prepare(module)`（`lib/Frontend/Prepare.cpp`）依次执行以下步骤：
 
 1. **校验符号与操作 ID**：模块内显式声明的 `ask.id` 不可重复；`ask.external` 引用的 `@semantics` 和 `@implementation` 必须存在，且端口数量与元素类型一致。
-2. **推导形状快照**：检查逐元素算子的输入输出形状一致，按 `same_as`（跟随指定输入操作数形状）或 `fixed`（使用语义签名中的静态形状）确定 `ask.external` 的输出形状，并在 `report["shapes"]` 中输出各端口形状。
-3. **提取并擦除 `ask.mark`**：收集 `mark_id`、`value_id`、`role`（`value` / `input` / `output`）与 `port_id` 到 `report["trace_records"]`，随后从 IR 中移除 `ask.mark` 并将原值直连下游算子。对准备后的 IR 再次运行 `--prepare` 结果保持不变。
+2. **推导形状快照**：检查逐元素算子的输入输出形状一致，按 `same_as`（跟随指定输入操作数形状）或 `fixed`（使用语义签名中的静态形状）确定 `ask.external` 的输出形状，在 `report["shape_snapshot"]["shape_bindings"]` 中输出张量值的形状，并记录输入特化、语义修订与快照摘要。
+3. **提取并擦除 `ask.mark`**：收集 `mark_id`、`value_id`、`role`（`value` / `input` / `output`）与可选 `port_id` 到 `report["markers"]`，随后从 IR 中移除 `ask.mark` 并将原值直连下游算子。对准备后的 IR 再次运行 `--prepare`，IR 与修订计数保持不变；新的报告不再含已擦除的标记。
 
 <a id="external-declaration"></a>
 
@@ -72,7 +72,7 @@ Python SDK（`python/ask/ir.py`）在编码 `f16`、`bf16`、`f32` 标量常量�
 
 外部算子拆分为两条顶层声明：
 
-- `ask.semantics` 描述图级接口（输入输出秩与 dtype、形状规则、有无副作用），供图校验、死代码消除和端口连接使用。
+- `ask.semantics` 描述图级接口（输入输出秩与 dtype、形状规则及 `effects = "none"`），供图校验和端口连接使用。当前不支持有状态外部算子或 token；高层 DCE 保守保留 `ask.external`。
 - `ask.implementation` 描述具体编译配置（`compiler = "triton"`、DSL 源码、`entry`、`signature`、`source_bindings`、`constants`、`options`、`target`、`grid`）。
 
 拆分后，未启用第三方适配器的 `core` 构建也能验证和准备含 `ask.external` 的图，并在 `report["external_requests"]` 中导出标准化请求；更换目标配置时也无需改动外层图语义。

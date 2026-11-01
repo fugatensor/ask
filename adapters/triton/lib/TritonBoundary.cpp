@@ -1,4 +1,5 @@
 #include "ask/Adapters/TritonBoundary.h"
+#include "TritonVersion.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -86,7 +87,8 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   auto *specializations = artifact.getObject("specializations");
   if (!contract || !payload || !entryName || !producer || !target || !specializations ||
       contract->getString("protocol") != "ask.triton.boundary.v1" ||
-      producer->getString("name") != "triton" || producer->getString("version") != "3.7.1" ||
+      producer->getString("name") != "triton" || producer->getString("version") != ASK_TRITON_COMPILER_VERSION ||
+      producer->getString("adapter_version") != ASK_TRITON_ADAPTER_VERSION ||
       contract->getString("llir_sha256") != digest(*payload) ||
       contract->getString("entry") != entryName)
     return error("missing or inconsistent Triton boundary contract / LLVM digest");
@@ -322,8 +324,9 @@ llvm::Error validateTritonArtifact(const llvm::json::Object &artifact,
   auto *invocation = artifact.getObject("invocation");
   auto source = request.getString("source");
   if (request.getString("compiler") != "triton" || !producer ||
-      producer->getString("name") != "triton" || producer->getString("version") != "3.7.1" ||
-      artifact.getInteger("protocol_version") != 1 || artifact.getString("format") != "llvm-ir" ||
+      producer->getString("name") != "triton" || producer->getString("version") != ASK_TRITON_COMPILER_VERSION ||
+      producer->getString("adapter_version") != ASK_TRITON_ADAPTER_VERSION ||
+      artifact.getInteger("protocol_version") != ASK_TRITON_PROTOCOL_VERSION || artifact.getString("format") != "llvm-ir" ||
       !artifact.getString("payload") || !specializations || !target || !requestedTarget ||
       !invocation || !source || artifact.getString("entry") != request.getString("entry"))
     return error("Triton artifact does not match its pinned producer or source entry");
@@ -399,7 +402,7 @@ llvm::Error finalizeTritonArtifact(llvm::json::Object &artifact,
 
 const CompilerAdapter &tritonCompilerAdapter() {
   static const CompilerAdapter adapter{
-      "triton", 1, &validateTritonArtifact, &prepareTritonFusion, &finalizeTritonArtifact,
+      "triton", ASK_TRITON_PROTOCOL_VERSION, &validateTritonArtifact, &prepareTritonFusion, &finalizeTritonArtifact,
       "worker.py", true};
   return adapter;
 }

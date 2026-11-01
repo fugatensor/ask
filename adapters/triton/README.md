@@ -12,7 +12,7 @@
 | `dependencies.lock.json` / `requirements.lock` | 锁定 `triton==3.7.1`、配套 LLVM 提交哈希（`1f126a6d...`）与 Python 依赖。 |
 | `CMakeLists.txt` | 在 `ASK_THIRD_PARTY_COMPILERS` 选中 `triton` 时检查环境、编译专属 C++ 库、注册 `ask-triton` 测试并安装资源。 |
 | `worker.py` | 校验请求，调用 Triton 公开 API 编译 DSL，提取物理参数 ABI、类型需求与启动配置，原子写出 JSON 产物。 |
-| `fusion.py` | 对 `@triton.jit` 源码做 AST 数据流检查，插入恒等位复制内联汇编标记，并双编译对比标记前后的布局与资源。 |
+| `fusion.py` | 对 `@triton.jit` 源码做 AST 数据流检查并插入恒等位复制内联汇编标记；`worker.py` 负责双编译及标记前后布局、资源的对比。 |
 | `python/__init__.py` | Python 环境探测、Triton 安装指纹计算、请求数值契约构建及 `invocation` v1 旧产物显式迁移（安装为 `ask._adapters.triton`）。 |
 | `include/`、`lib/TritonBoundary.cpp` | 实现 [C++ `CompilerAdapter` 接口](../../include/ask/Adapters/Compiler.h)，校验 LLVM 标记站点的地址与掩码等价性，按原 `F` 策略设置浮点 `contract` 标志。 |
 | `tests/` | `test_worker.py`、`test_python_policy.py`、`test_fusion.py` 与 `test_integration.py`，覆盖导出协议、AST 判定、策略迁移与 `ask-opt --fuse-external` LLVM 融合。 |
@@ -23,6 +23,7 @@
 - **签名与端口类型**：单个 `@triton.jit` 入口，一个逻辑输入指针和一个相同存储类型的逻辑输出指针（`*i1`、`*i32`、`*i64`、`*fp32`、`*fp16`、`*bf16`，对应 ASK 六种基础元素类型，见 [01. ASK IR 与数值语义](../../docs/01-ASK-IR与数值语义.md#types-and-precision)）；特化常量通过 `constants` 传入，源码参数通过 `source_bindings` 映射到逻辑端口。
 - **形状与资源限制**：逐元素导出请求需给定元素总数 `N`（原始导出端口形状为 `[N]`，融合后恢复为外层 ASK 图的多维形状）；`shared`、`global_scratch`、`profile_scratch` 均须为 0，不支持 tensor descriptor 或协作启动。
 - **BF16 检查**：任何 `bf16` 端口或从 `compiled.asm["ttir"]` 类型中识别出的内部 `bf16` 运算，均要求目标至少 `sm_80`，并写入 `required_element_types` 供运行时核对物理 GPU 能力。
+- **图级融合限制**：ASK 外层图还须满足一个函数、一个非空静态张量输入和同形状同存储类型输出、恰好一个 `ask.external`。未通过 AST 或 LLVM 边界证明时返回诊断，不回退到多个 kernel。
 
 ## 从 ASK 调用
 
@@ -67,6 +68,7 @@ build/all/bin/ask-opt graph.mlir --fuse-external \
 ## 产物契约与融合检查
 
 1. **协议与执行契约（`protocol_version = 1` / `invocation.version = 2`）**：
+   - 适配器修订由 `dependencies.lock.json` 的 `adapter_version` 定义（当前 `0.7.0`），worker 与 C++ 边界校验使用同一份锁。它与 ASK 软件包版本、Triton 版本及两项协议版本分别管理；旧适配器修订导出的产物须重新导出。
    - 产物包含文本格式 LLVM IR（`payload`）、`entry_signature`、`port_map`、`invocation`、`codegen`（含 `fp_contract` 与 `ptx_version`）、`required_element_types` 及放在 `producer_metadata` 中的 Triton 私有元数据，不序列化 Python 对象或 GPU 句柄。
    - Triton 3.7.1 自动追加的两个未使用物理 scratch 指针参数经校验后在 `invocation.arguments` 中绑定为 `"null"`，公共 CUDA 层按参数列表传递。
    - 历史 `invocation.version = 1` 产物可通过 `ask._adapters.triton.normalize_legacy_artifact(old_artifact, shape=...)` 显式迁移。

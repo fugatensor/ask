@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from .ir import Module
+from ._version import __version__
 
 
 class CompilerError(RuntimeError):
@@ -48,6 +49,10 @@ class Compiler:
                                     "build/<mode>/python to PYTHONPATH. For the explicit CLI compatibility "
                                     "path, pass Compiler(executable='/path/to/ask-opt').") from exc
             self._native = _native
+            native_version = json.loads(_native.capabilities()).get("ask_version")
+            if native_version != __version__:
+                raise CompilerError(f"ASK Python package {__version__} and native extension "
+                                    f"{native_version!r} have different versions; rebuild/reinstall ASK")
             package = Path(_native.__file__).resolve().parent
             candidates = [package / "_bin" / "ask-opt", package.parent.parent / "bin" / "ask-opt"]
             candidates.extend(parent / "bin" / "ask-opt" for parent in package.parents)

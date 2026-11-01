@@ -15,10 +15,5 @@
     "revision_source": "https://github.com/triton-lang/triton/blob/v3.7.1/cmake/llvm-hash.txt",
     "archive_url_source": "https://github.com/triton-lang/triton/blob/v3.7.1/setup.py#L197-L245",
     "version_source": "https://github.com/llvm/llvm-project/blob/1f126a6dea50d185c0781743a667390037ae88bd/cmake/Modules/LLVMVersion.cmake"
-  },
-  "verified": {
-    "llvm_config_version": "23.0.0git",
-    "triton_3_7_1_original_llvm_ir": "parse-and-verify-passed",
-    "gpu_execution": "passed: Triton/ASK fused LLIR -> llc -> ptxas -> RTX 3080, i32 numerical comparison"
   }
 }

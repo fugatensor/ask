@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.28)
-project(ASK VERSION 0.1.0 LANGUAGES C CXX)
+include(cmake/AskVersion.cmake)
+project(ASK VERSION ${ASK_VERSION} LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
@@ -180,7 +181,7 @@ install(EXPORT ASKCoreTargets NAMESPACE ASK:: DESTINATION ${CMAKE_INSTALL_LIBDIR
 configure_package_config_file(cmake/ASKConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake"
   INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK)
 write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
-  VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
+  VERSION ${PROJECT_VERSION} COMPATIBILITY ExactVersion)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Core)
 install(FILES cmake/llvm.lock.json cmake/nanobind.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)

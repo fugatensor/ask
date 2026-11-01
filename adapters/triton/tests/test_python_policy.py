@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -19,6 +21,25 @@ _numerics, _validate_environment = policy._numerics, policy._validate_environmen
 
 
 class PolicyTests(unittest.TestCase):
+    def test_dependency_contract_change_invalidates_cache_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ("worker.py", "fusion.py", "dependencies.lock.json"):
+                (root / name).write_bytes((ROOT / name).read_bytes())
+            request = {"signature": {"a": "*i32", "b": "*i32"},
+                       "source": "source", "target": {"backend": "cuda", "arch": 80}}
+            environment = CompilerEnvironment("python", str(root / "worker.py"))
+            with patch.object(policy.subprocess, "run", return_value=SimpleNamespace(stdout='{}')), \
+                 patch.dict(os.environ, {}, clear=True):
+                before = policy.create_adapter().cache_identity(request, environment, timeout=1)
+                lock = json.loads((root / "dependencies.lock.json").read_text())
+                lock["adapter_version"] = "0.7.1"
+                (root / "dependencies.lock.json").write_text(json.dumps(lock))
+                after = policy.create_adapter().cache_identity(request, environment, timeout=1)
+            self.assertNotEqual(before["adapter"]["dependencies.lock.json"],
+                                after["adapter"]["dependencies.lock.json"])
+            self.assertEqual(before["adapter"]["worker.py"], after["adapter"]["worker.py"])
+
     def test_python_requirement_and_override_reject_before_probing_or_cache(self):
         adapter = policy.create_adapter()
         with patch.object(policy.subprocess, "run") as run:

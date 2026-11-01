@@ -4,16 +4,30 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "ask-compiler"
-version = "0.1.0"
+dynamic = ["version"]
 description = "ASK native compiler and device runtime with Python bindings"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: C++",
+  "Topic :: Software Development :: Compilers",
+]
+
+[[tool.dynamic-metadata]]
+provider = "scikit_build_core.metadata.regex"
+field = "version"
+input = "python/ask/_version.py"
 
 [tool.scikit-build]
 minimum-version = "1.1"
 build-dir = "build/wheel/{wheel_tag}"
 wheel.packages = ["python/ask"]
 cmake.version = ">=3.28"
+sdist.exclude = [".deps/**", "build/**", "dist/**", ".venv/**", "**/__pycache__/**", "**/*.pyc", "**/*.egg-info/**"]
 
 [tool.scikit-build.cmake.define]
 BUILD_TESTING = "OFF"

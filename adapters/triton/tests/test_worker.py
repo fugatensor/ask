@@ -3,6 +3,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import shutil
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -35,6 +36,21 @@ def compiled(metadata_changes=None, llvm_ir=None, ttir="tensor<128xi32>"):
 
 
 class RequestTests(unittest.TestCase):
+    def test_worker_and_registration_use_the_dependency_contract(self):
+        lock = json.loads((ROOT / "dependencies.lock.json").read_text())
+        registration = json.loads((ROOT / "registration.json").read_text())
+        requirements = [line.strip() for line in (ROOT / "requirements.lock").read_text().splitlines()
+                        if line.strip() and not line.lstrip().startswith("#")]
+        self.assertEqual(worker.ADAPTER_VERSION, lock["adapter_version"])
+        self.assertEqual(worker.SUPPORTED_TRITON_VERSION, lock["compiler"]["version"])
+        self.assertEqual(worker.PROTOCOL_VERSION, registration["protocol_version"])
+        self.assertEqual(requirements, [f"triton=={lock['compiler']['version']}"])
+        artifact = worker.build_artifact(request(), compiled(), worker.SUPPORTED_TRITON_VERSION, ["t", "u"])
+        self.assertEqual(artifact["producer"]["adapter_version"], lock["adapter_version"])
+        # The CUDA invocation is an independent execution schema.
+        self.assertEqual(artifact["protocol_version"], 1)
+        self.assertEqual(artifact["invocation"]["version"], 2)
+
     def test_bool_i64_and_declared_cuda_architectures(self):
         for signature in ("*i1", "*i64"):
             for arch in (70, 75, 80, 86, 89, 90):
@@ -304,6 +320,22 @@ class CommandLineTests(unittest.TestCase):
                   "assert 'triton' not in sys.modules")
         result = subprocess.run([sys.executable, "-S", "-c", script], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_relocated_worker_loads_its_installed_contract(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            for name in ("worker.py", "dependencies.lock.json"):
+                shutil.copyfile(ROOT / name, target / name)
+            lock = json.loads((target / "dependencies.lock.json").read_text())
+            lock["adapter_version"] = "0.7.1"
+            (target / "dependencies.lock.json").write_text(json.dumps(lock))
+            script = ("import runpy, sys; "
+                      f"m=runpy.run_path({str(target / 'worker.py')!r}); "
+                      "assert m['ADAPTER_VERSION'] == '0.7.1'; "
+                      "assert 'triton' not in sys.modules")
+            result = subprocess.run([sys.executable, "-S", "-c", script], cwd=directory,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

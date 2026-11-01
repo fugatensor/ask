@@ -1,10 +1,11 @@
 {
   "schema_version": 1,
-  "adapter_version": "0.3.0",
+  "adapter_version": "0.7.0",
   "protocol_version": 1,
-  "compiler": {"name": "triton", "version": "3.7.1"},
-  "observed_python_version": "3.14.7",
-  "tested_target": {"backend": "cuda", "arch": 80, "warp_size": 32},
+  "compiler": {
+    "name": "triton",
+    "version": "3.7.1"
+  },
   "producer_llvm": {
     "upstream_tag": "v3.7.1",
     "upstream_version": "23.0.0git",
@@ -15,18 +16,6 @@
   "ask_reader": {
     "version": "23.0.0git",
     "revision": "1f126a6dea50d185c0781743a667390037ae88bd",
-    "observed_compatibility": "original LLVM text parsed and verified by opt",
     "sdk_lock": "../../cmake/llvm.lock.json"
-  },
-  "previous_reader_result": {
-    "version": "18.1.8",
-    "observed_compatibility": "rejected at captures(none); no compatibility rewrite performed"
-  },
-  "validation": {
-    "public_api_export": "passed",
-    "gpu_execution": "passed: fresh LLVM-to-PTX-to-cubin on RTX 3080 (sm86)",
-    "native_llvm_fusion": "passed: ASK pre/post helpers linked and inlined into Triton LLIR",
-    "ir_cache": "passed: 31-request extended GPU matrix, 14 hits and 17 misses",
-    "scope": "static contiguous i32 pointwise, two data pointers, N/BLOCK constexprs, num_warps=4 or 8, zero shared/scratch"
   }
 }

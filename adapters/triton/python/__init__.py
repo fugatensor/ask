@@ -72,7 +72,7 @@ class TritonAdapter(CompilerAdapter):
         numerics = _numerics(request)
         worker = Path(environment.worker).resolve()
         adapter = {name: _sha((worker.parent / name).read_bytes())
-                   for name in (worker.name, "fusion.py")}
+                   for name in (worker.name, "fusion.py", "dependencies.lock.json")}
         adapter["python_policy_sha256"] = _sha(Path(__file__).read_bytes())
         try:
             probe = subprocess.run([environment.python, "-c", _FINGERPRINT], capture_output=True,
