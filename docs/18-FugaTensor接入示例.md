@@ -2,7 +2,7 @@
 
 [返回顶层设计](核心思想.md#10-fugatensor-放在哪里) · [框架接入接口](10-上层框架接入.md) · [编译器适配](17-第三方编译器适配与注册.md) · [文档目录](README.md)
 
-首个 FugaTensor 原型位于同级 `fugatensor/` 仓库。用户写张量计算，FugaTensor 记录高层 ASK IR；ASK 负责检查、优化和生成实际执行的代码。
+FugaTensor 位于同级 `fugatensor/` 仓库。用户写张量计算，FugaTensor 先记录独立的 Fuga IR，处理框架层控制流和显式请求的基础 VJP，再把可执行静态部分降成高层 ASK IR。ASK 负责检查、目标优化和生成实际执行的代码。Fuga IR 是跨设备的逻辑表示，基本类型与操作不带 CPU/CUDA 放置；对象模型、region 和转换边界见 [Fuga IR 文档](../../fugatensor/docs/ir/README.md)。
 
 ## 日常代码
 
@@ -20,7 +20,7 @@ y = ft.tensor([10, 20, 30])
 print(calculate(x, y).tolist())  # [22.0, 44.0, 66.0]
 ```
 
-默认 dtype 为 f32、设备为 CPU。首次调用追踪 Python 函数，生成 `ask.add`、`ask.mul` 等操作，再用 ASK 生成本机目标文件并加载。相同形状、dtype 和静态参数的下一次调用直接执行已加载函数；换输入值不会重新追踪。CPU 和自有 CUDA 图都支持多个张量输入与输出。
+默认 dtype 为 f32、设备为 CPU。首次调用追踪 Python 函数，生成 `fuga.add`、`fuga.mul` 等结构化操作，再经显式转换生成 ASK 操作，最后由 ASK 生成本机目标文件并加载。相同形状、dtype 和静态参数的下一次调用直接执行已加载函数；换输入值不会重新追踪。CPU 和自有 CUDA 图都支持多个张量输入与输出。
 
 ## 同一张图在 GPU 上执行
 
@@ -32,7 +32,7 @@ y = ft.tensor([10, 20, 30], device="cuda")
 print(calculate(x, y).tolist())  # [22.0, 44.0, 66.0]
 ```
 
-这里仍是上面的 `calculate`，没有 Triton 代码或 external 节点。FugaTensor 提交相同的基础 ASK 图；ASK 为 GPU 生成索引、边界判断、访存和逐元素计算，再用自己的常驻 Session 执行。`ASK_THIRD_PARTY_COMPILERS=none` 即可使用。过程和依赖见[自有 GPU 降级](19-自有GPU降级.md)。
+这里仍是上面的 `calculate`，没有 Triton 代码或 external 节点。同一基础函数、shape 和 dtype 在 CPU/CUDA 上生成相同 Fuga IR，再提交相同语义的基础 ASK 图。执行阶段选择目标；ASK 为 GPU 生成索引、边界判断、访存和逐元素计算，再用自己的常驻 Session 执行。`ASK_THIRD_PARTY_COMPILERS=none` 即可使用。过程和依赖见[自有 GPU 降级](19-自有GPU降级.md)。
 
 ## 图中的 Triton 算子
 
@@ -60,14 +60,18 @@ x = ft.tensor([1, 2, 3], device="cuda")
 print(mixed(x).tolist())  # [7.0, 9.0, 11.0]
 ```
 
-前后加法是 ASK 操作，`scale` 对应用户内核的 `ask.external`；换成用户写的其他合法算法，仍通过同一注册接口接入。FugaTensor 提交 DSL、语义、端口绑定和固定编译选项；ASK 的 Triton 适配器取得 LLVM IR 并证明值边界，通用内联 Pass 插入 ASK helper，然后重新生成 cubin。FugaTensor 复用 ASK 的常驻 Session 提交设备张量，`tolist()` 等待并下载结果。
+前后加法先成为 Fuga 操作，`scale` 成为保存用户源码的 `fuga.external`；转换后才对应 ASK 加法与 `ask.external`。具体 GPU 架构在这一边界绑定，不写进通用 Fuga 值的类型。换成用户写的其他合法算法，仍通过同一注册接口接入。FugaTensor 提交 DSL、语义、端口绑定和固定编译选项；ASK 的 Triton 适配器取得 LLVM IR 并证明值边界，通用内联 Pass 插入 ASK helper，然后重新生成 cubin。FugaTensor 复用 ASK 的常驻 Session 提交设备张量，`tolist()` 等待并下载结果。独立 Fuga IR 不改变这条原生 LLVM 链接与融合路径。
 
 目前 external 融合入口仍要求一个输入、一个同形状同存储类型输出和一个 external。这个限制只属于外部融合路径；自有 GPU 图可有多个输入和输出，各端口保留自己的形状与类型。fp16/bf16 存储可以在图中显式转为 f32 计算再转回；实际硬件检查沿用 ASK。
 
 ## 配置、测试和检查产物
 
-`ft.configure(device=..., ...)` 或环境变量负责设置 ASK CLI、`llc` 和 `ptxas`；只有使用外部编译器时才需要设置相应 worker。普通张量调用不重复传工具路径。无显式配置时，CPU 采用已安装 ASK 的配套工具。详细命令在 FugaTensor 的 `README.md`，直接可读的创建与计算用例在 `tests/test_quickstart.py`，完整演示为 `examples/jit_demo.py`。
+FugaTensor 的 `python3 tools/bootstrap.py` 默认以 `all` 构建同级 ASK，安装到自己的 `.venv` 并保存运行配置。之后 `.venv/bin/python examples/jit_demo.py --device both` 运行基础 CPU/CUDA 示例，`examples/mixed_triton.py` 运行用户源码与 ASK 运算的混合示例。这是 FugaTensor 的初始化默认值，不修改 ASK 全局默认 `none`。已有环境仍可用 `ft.configure(device=..., ...)` 或环境变量覆盖工具路径。
 
-`function.last_ir` 显示提交给 ASK 的高层图；`last_report` 保留编译报告；`last_artifact_dir` 定位目标文件、LLVM 或 cubin。`cache_info()` 统计 FugaTensor 内存特化缓存，ASK 的 IR 与可执行磁盘缓存仍分别记在 GPU 报告里。CPU 当前没有跨进程持久代码缓存。
+`function.last_fuga_ir` 显示追踪后的 Fuga 图，`last_ask_ir` 显示提交给 ASK 的图，`last_ir` 保留 ASK 文本的兼容含义。编译目录同时保存 `fuga.ir`、`frontend.mlir` 及逐值映射 `fuga-to-ask.json`。`last_report` 保留编译报告；`last_artifact_dir` 定位目标文件、LLVM 或 cubin。`cache_info()` 统计 FugaTensor 内存特化缓存，ASK 的 IR 与可执行磁盘缓存仍分别记在 GPU 报告里。CPU 当前没有跨进程持久代码缓存。
+
+Fuga 的 region 能表达 if/for/while；当前桥接只处理静态条件与有界 for，动态分支和 while 仍会拒绝。基础 VJP 在 Fuga IR 上生成反向图，然后走同一 ASK 执行路径；尚无完整 `Tensor.backward()` 或动态控制流调度器。这些框架层工作不会要求 ASK A 层接收动态控制流。
+
+后续 `ft.fun` 类、`ft.grad` 与嵌套 JIT 的关系见 [Fuga 接口提案](../../fugatensor/docs/ir/04-JIT与自定义梯度提案.md)，这些新增 API 尚未实现。提案让 Fuga 选择正向或反向函数体，再提交静态 ASK 图；外部 DSL 继续经适配器进入原生 LLVM 链接与合法内联流程。
 
 默认运行时由 `ft.shutdown()` 关闭；也可用 `with ft.Engine(...)` 明确管理生命周期。关闭会等待设备工作并清除所属的 JIT 特化。追踪期间不能读取真实张量数据来生成 Python 常量，所有计算输入必须作为参数进入图。
