@@ -49,6 +49,20 @@ class RequestTests(unittest.TestCase):
                 with self.assertRaises(worker.WorkerError):
                     worker.validate_request(value)
 
+    def test_low_precision_pointer_types_and_bf16_hardware_requirement(self):
+        for signature in ("*fp16", "*bf16"):
+            value = request()
+            value["signature"] = {"t": signature, "u": signature}
+            self.assertEqual(worker.validate_request(value), value)
+        value["target"]["arch"] = 75
+        with self.assertRaisesRegex(worker.WorkerError, "bf16 requires.*8.0") as error:
+            worker.validate_request(value)
+        self.assertEqual(error.exception.code, "UnsupportedDType")
+        value["target"]["arch"] = 80
+        value["signature"]["u"] = "*fp16"
+        with self.assertRaisesRegex(worker.WorkerError, "same element type"):
+            worker.validate_request(value)
+
     def test_rejects_boolean_protocol(self):
         value = request()
         value["protocol_version"] = True

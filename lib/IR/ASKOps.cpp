@@ -7,7 +7,7 @@ using namespace mlir;
 
 namespace ask {
 bool isSupportedElementType(Type type) {
-  return type.isSignlessInteger(32) || type.isF32();
+  return type.isSignlessInteger(32) || type.isF32() || type.isF16() || type.isBF16();
 }
 
 bool isSupportedValueType(Type type) {
@@ -44,7 +44,7 @@ static LogicalResult verifyDataTypes(Operation *op, TypeRange types) {
   for (Type type : types)
     if (!isSupportedValueType(type))
       return op->emitOpError()
-             << "supports only i32/f32 scalars and ranked i32/f32 "
+             << "supports only i32/f32/f16/bf16 scalars and ranked i32/f32/f16/bf16 "
                 "tensors without encoding; got "
              << type;
   return success();
@@ -53,20 +53,20 @@ static LogicalResult verifyDataTypes(Operation *op, TypeRange types) {
 LogicalResult ConstantOp::verify() {
   Type type = getResult().getType();
   if (!isSupportedElementType(type))
-    return emitOpError("requires a scalar i32 or f32 result");
+    return emitOpError("requires a scalar i32, f32, f16 or bf16 result");
   auto value = (*this)->getAttrOfType<TypedAttr>("value");
   if (!value || value.getType() != type ||
-      (type.isF32() ? !isa<FloatAttr>(value) : !isa<IntegerAttr>(value)))
+      (isa<FloatType>(type) ? !isa<FloatAttr>(value) : !isa<IntegerAttr>(value)))
     return emitOpError("requires an integer or float 'value' matching the result type");
   return success();
 }
 
 LogicalResult SplatOp::verify() {
   if (!isSupportedElementType(getOperand().getType()))
-    return emitOpError("requires a scalar i32 or f32 operand");
+    return emitOpError("requires a scalar i32, f32, f16 or bf16 operand");
   auto result = dyn_cast<RankedTensorType>(getResult().getType());
   if (!result || !isSupportedValueType(result))
-    return emitOpError("requires a ranked i32/f32 tensor result without encoding");
+    return emitOpError("requires a ranked i32/f32/f16/bf16 tensor result without encoding");
   if (result.getElementType() != getOperand().getType())
     return emitOpError("splat operand and result element types must match");
   auto shape = (*this)->getAttrOfType<DenseI64ArrayAttr>("shape");
@@ -96,7 +96,7 @@ static LogicalResult verifyBinary(Operation *op) {
     if (auto tensor = dyn_cast<RankedTensorType>(type))
       type = tensor.getElementType();
     if (!type.isSignlessInteger(32))
-      return op->emitOpError("overflow is an integer-only attribute; f32 arithmetic uses separate IEEE round-to-nearest operations");
+      return op->emitOpError("overflow is an integer-only attribute; floating arithmetic uses separate IEEE round-to-nearest operations");
     auto value = dyn_cast<StringAttr>(overflow);
     if (!value || value.getValue() != "wrap")
       return op->emitOpError("prototype supports only overflow = \"wrap\"");
@@ -163,8 +163,10 @@ LogicalResult ImplementationOp::verify() {
     auto type = dyn_cast<StringAttr>(item.getValue());
     auto binding = bindings.getAs<StringAttr>(item.getName());
     if (!type || (type.getValue() != "*i32" && type.getValue() != "i32" &&
-                  type.getValue() != "*fp32" && type.getValue() != "fp32"))
-      return emitOpError("signature parameters must be i32/fp32 scalars or *i32/*fp32 pointers");
+                  type.getValue() != "*fp32" && type.getValue() != "fp32" &&
+                  type.getValue() != "*fp16" && type.getValue() != "fp16" &&
+                  type.getValue() != "*bf16" && type.getValue() != "bf16"))
+      return emitOpError("signature parameters must be i32/fp32/fp16/bf16 scalars or their pointer types");
     if (!binding)
       return emitOpError() << "missing string source binding for " << item.getName();
     StringRef text = binding.getValue();
@@ -259,7 +261,8 @@ LogicalResult ExternalOp::verify() {
     auto tensor = dyn_cast<RankedTensorType>(dataType);
     Type elementType = tensor ? tensor.getElementType() : dataType;
     std::string expected = tensor || !input ? "*" : "";
-    expected += elementType.isF32() ? "fp32" : "i32";
+    expected += elementType.isF32() ? "fp32" : elementType.isF16() ? "fp16" :
+                elementType.isBF16() ? "bf16" : "i32";
     if (signature.getAs<StringAttr>(item.getName()).getValue() != expected)
       return emitOpError("source signature is incompatible with the bound data port");
   }
@@ -272,7 +275,7 @@ LogicalResult MarkOp::verify() {
   if (getOperand().getType() != getResult().getType())
     return emitOpError("input and result must have exactly the same type");
   if (!isSupportedValueType(getOperand().getType()))
-    return emitOpError("supports i32/f32 scalars and ranked tensors only");
+    return emitOpError("supports i32/f32/f16/bf16 scalars and ranked tensors only");
   for (StringRef name : {"mark_id", "value_id", "role"})
     if (failed(requireString(*this, name)))
       return failure();

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
 from .types import ScalarType, TensorType, Type, as_type, compatible
-from .numerics import encode_f32
+from .numerics import encode_float
 
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z", re.ASCII)
 
@@ -251,16 +251,17 @@ class Graph:
     def constant(self, value: int | float, *, dtype: str = "i32",
                  id: str | None = None, value_id: str | None = None) -> Value:
         result_type = ScalarType(dtype)
+        dtype = result_type.dtype
         if dtype == "i32":
             if type(value) is not int or not -(2**31) <= value < 2**31:
                 raise ValueError(f"constant must be a signed i32 integer, got {value!r}")
             literal = f"{value} : i32"
         else:
-            encoded = encode_f32(value)
+            encoded = encode_float(value, dtype)
             # MLIR's hex float syntax records the rounded IEEE bits exactly,
             # including signed zero, infinity, and NaN. Decimal reprinting must
-            # never change the selected f32 value on a later parse.
-            literal = f"0x{int.from_bytes(encoded, 'little'):08X} : f32"
+            # never change the selected floating value on a later parse.
+            literal = f"0x{int.from_bytes(encoded, 'little'):0{len(encoded) * 2}X} : {dtype}"
         return self._emit("ask.constant", (), result_type, {"value": literal}, id=id, value_id=value_id)
 
     def splat(self, value: Value, shape: Sequence[int], *, id: str | None = None,

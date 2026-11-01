@@ -67,11 +67,11 @@ Triton 路径使用请求里的 `BLOCK` 和 `num_warps`，保留原来的执行�
 
 DSL 检查沿赋值追踪整数、索引、掩码、指针和已加载值。它接受位置/关键字 mask、局部别名、等价的交换运算，以及能按赋值顺序解释的局部重赋值。索引仍需满足已支持的逻辑关系，但不再要求源码逐句长成示例的样子。
 
-ASK 图接受相同形状的任意 rank 静态 i32 / f32 张量。当前外部 ABI 仍使用连续缓冲区，N 是元素总数；ShapeSnapshot 保留原始多维形状。运行器把逻辑 BLOCK 与物理线程数分别读取，不再混为固定的 128。
+ASK 图接受相同形状的任意 rank 静态 i32 / f32 / f16 / bf16 张量。当前外部 ABI 仍使用连续缓冲区，N 是元素总数；ShapeSnapshot 保留原始多维形状。运行器把逻辑 BLOCK 与物理线程数分别读取，不再混为固定的 128。
 
 ## 5. 哪些能力仍然没有实现
 
-ASK 图、helper 降级、Triton 边界标记和 GPU 缓冲区已经接通 i32 / f32；运行入口按产物 dtype 选择数据编码。通用 LLVM 接口还支持其他整数、浮点和定长向量类型，但这些能力不等于高层图已经支持 f16、bf16、f64 或混合精度。
+ASK 图、helper 降级、Triton 边界标记和 GPU 缓冲区已经接通 i32 / f32 / f16 / bf16；运行入口按产物 dtype 选择数据编码。通用 LLVM 接口还支持其他整数、浮点和定长向量类型，但这些能力不等于高层图已经支持 f64、混合类型 cast 或混合精度累加。
 
 图路径目前仍是一个 external 的单输入、单输出逐元素组合。归约、任意 gather/scatter、跨线程供值、多输出别名以及任意未知 PTX 的访问分析尚未实现；失败时也还没有完整混合图运行时自动调度多个 kernel。这些限制在各自层继续明确报告，不写成通用内联接口的限制。
 
@@ -79,7 +79,7 @@ ASK 图、helper 降级、Triton 边界标记和 GPU 缓冲区已经接通 i32 /
 
 `ask-boundary-inline` 检查普通 LLVM 的多站点、多参数、类型、掩码和失败回滚。`ask-boundary-execution` 将同一结果通过 host `llc` 生成机器码，执行 i32、i64、f32、f64 和向量计算，包含无效分支、整数溢出和浮点特殊值。两个测试都不需要 Triton 或 GPU。
 
-GPU 验证在原例子的基础上增加二维、三维形状、不同 BLOCK/warp 组合、多个 LLVM 边界站点、DSL 别名以及 P/Q 链式算术；`--float` 同时验证 f32 类型链和数值规则：
+GPU 验证使用同一组图覆盖不同 dtype，包含二维、三维形状、不同 BLOCK/warp 组合、多个 LLVM 边界站点、DSL 别名以及 P/Q 链式算术：
 
 ```bash
 # 工具路径与第 12 章相同，使用新的缓存和输出目录。
@@ -90,9 +90,9 @@ PYTHONPATH=python python3 examples/triton_fused_gpu.py \
   --llc .deps/llvm-1f126a6d-ubuntu-x64-1/bin/llc \
   --ptxas /path/to/triton/backends/nvidia/bin/ptxas \
   --cache-dir build/generalized-cache \
-  --output-dir build/generalized-results --extended --float
+  --output-dir build/generalized-results --dtypes i32 f32 f16 bf16 --extended
 ```
 
-该验证同时检查 GPU 输出、冷/热缓存状态和多维 ShapeSnapshot。LLVM 结构合法、融合位置正确和设备数值一致，分别验收。
+该验证同时检查 GPU 输出、冷/热缓存状态和多维 ShapeSnapshot。LLVM 结构合法、融合位置正确和设备数值一致，分别验收。图与数值参考的复用方式见[多精度测试](14-多精度测试.md)。
 
-当前实测通过 47 次融合 GPU 执行，比较 12409 个 i32 和 1374 个 f32 结果，缓存 22 次命中、25 次未命中。BLOCK512/4 warps 的同一 kernel 内联了 8 个边界站点；二维、三维形状、等价的位运算掩码、源码别名与浮点舍入路径均通过。f32 还区分了 ASK 的独立乘加与 F 的 FMA 开关。独立 host 测试验证了其他浮点、整数和向量接口，结果不依赖 Triton 导出。
+当前基础矩阵加低精度专项共通过 110 次融合 GPU 执行，比较 9134 个 i32 / f32 / f16 / bf16 结果，缓存 55 次命中、55 次未命中。覆盖二维、三维形状、4 / 8 warps、多个边界站点、等价的位运算掩码、源码别名和单因素缓存失效。三种浮点格式都区分了 ASK 的独立乘加与 F 的 FMA 开关，详细数量见[GPU 数值验证](12-GPU融合与IR缓存.md#6-如何复现数值验证)。独立 host 测试验证了其他浮点、整数和向量接口，结果不依赖 Triton 导出。

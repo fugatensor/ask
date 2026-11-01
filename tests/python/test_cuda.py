@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "python"))
-from ask.cuda import CUDAError, compile_cuda, execute, execute_i32, _host_buffers
+from ask.cuda import (CUDAError, compile_cuda, execute, execute_i32, _host_buffers,
+                      _decode_output, _check_device_dtype)
 
 
 def artifact(size=10, *, block=128, num_warps=4, dtype="i32"):
@@ -188,6 +189,57 @@ class CUDAContractTests(unittest.TestCase):
         source, _ = _host_buffers([value], 1, "f32")
         self.assertEqual(source[0], float(2**100 + 2**77))
 
+    def test_low_precision_buffers_preserve_bits_and_decode_values(self):
+        for dtype, fraction_bits, minimum in (("f16", 10, 2**-24), ("bf16", 7, 2**-133)):
+            with self.subTest(dtype=dtype):
+                half_ulp = 2**(-fraction_bits - 1)
+                values = [1.0 + half_ulp, 1.0 + 3 * half_ulp, -0.0, minimum,
+                          float("inf"), float("-inf"), float("nan")]
+                source, destination = _host_buffers(values, len(values), dtype)
+                self.assertEqual(ctypes.sizeof(source), len(values) * 2)
+                actual = _decode_output(source, len(values), dtype)
+                self.assertEqual(actual[:2], [1.0, 1.0 + 2**(1 - fraction_bits)])
+                self.assertEqual(math.copysign(1.0, actual[2]), -1.0)
+                self.assertEqual(actual[3], minimum)
+                self.assertEqual(actual[4:6], [float("inf"), float("-inf")])
+                self.assertTrue(math.isnan(actual[6]))
+                self.assertEqual(list(destination), [0] * len(values))
+                self.assertEqual(_decode_output(source, 0, dtype), [])
+
+    def test_bf16_device_support_is_checked_before_context_or_gpu_memory(self):
+        class UnsupportedDriver:
+            def __init__(self):
+                self.calls = []
+
+            def call(self, name, *args):
+                self.calls.append(name)
+                if name == "cuDeviceGetName":
+                    args[0].value = b"test pre-Ampere GPU"
+                self.assert_metadata_only(name)
+
+            @staticmethod
+            def assert_metadata_only(name):
+                if name not in {"cuInit", "cuDeviceGet", "cuDriverGetVersion", "cuDeviceGetName"}:
+                    raise AssertionError("unsupported bf16 reached " + name)
+
+            def attribute(self, device, attribute):
+                return {75: 7, 76: 5}[attribute]
+
+        with tempfile.TemporaryDirectory() as temporary:
+            value = artifact(1, dtype="bf16")
+            codegen = self.compile_fixture(Path(temporary), value)
+            driver = UnsupportedDriver()
+            with patch("ask.cuda._Driver", return_value=driver):
+                with self.assertRaisesRegex(CUDAError, r"bf16 requires hardware support.*7\.5"):
+                    execute(value, codegen, [1.0])
+            self.assertNotIn("cuCtxCreate_v2", driver.calls)
+            self.assertNotIn("cuModuleLoadDataEx", driver.calls)
+            self.assertNotIn("cuMemAlloc_v2", driver.calls)
+            self.assertNotIn("cuLaunchKernel", driver.calls)
+        for capability in ((8, 0), (8, 6), (9, 0)):
+            _check_device_dtype("bf16", *capability, "supported")
+        _check_device_dtype("f16", 7, 5, "no bf16, still has fp16")
+
     def test_invalid_float_input_and_integer_wrapper_reject_before_driver(self):
         for values in ([True], ["1.0"], [1e100], [10**1000]):
             with self.subTest(values=values), patch("ask.cuda._Driver") as driver:
@@ -211,31 +263,32 @@ class CUDAContractTests(unittest.TestCase):
                 driver.assert_not_called()
 
     def test_float_codegen_preserves_raw_and_fused_contraction_policies(self):
-        for fused in (False, True):
-            for enabled in (False, True):
-                with self.subTest(fused=fused, enabled=enabled), tempfile.TemporaryDirectory() as temporary:
-                    value = artifact(1, dtype="f32")
-                    metadata = value["invocation"]["compiler_metadata"]
-                    metadata["enable_fp_fusion"] = enabled
-                    if fused:
-                        value["validation"] = {"stage": "fused_llvm", "llvm_module_verified": True}
-                        value["source_fusion_contract"] = {"dtype": "f32", "numerics": dict(metadata)}
-                        value["fusion"] = {
-                            "ask_numerics": "f32-rne-no-fast-math-no-contract",
-                            "producer_numerics": {
-                                "producer_enable_fp_fusion": enabled, "producer_enable_reflect_ftz": True,
-                                "representation": "original-F-instruction-contract-flags"}}
-                    result = self.compile_fixture(Path(temporary), value)
-                    expected = "on" if fused else "fast" if enabled else "off"
-                    self.assertEqual(result["fp_contract"], expected)
-                    self.assertIn("--fp-contract=" + expected, result["commands"][0])
-                    if fused:
-                        value["fusion"]["producer_numerics"]["producer_enable_fp_fusion"] = not enabled
-                        with patch("ask.cuda.subprocess.run") as compiler:
-                            with self.assertRaisesRegex(CUDAError, "normalization"):
-                                compile_cuda(Path(temporary) / "source.ll", value, Path(temporary) / "bad",
-                                             llc="/test/llc", ptxas="/test/ptxas")
-                            compiler.assert_not_called()
+        for dtype in ("f32", "f16", "bf16"):
+            for fused in (False, True):
+                for enabled in (False, True):
+                    with self.subTest(dtype=dtype, fused=fused, enabled=enabled), tempfile.TemporaryDirectory() as temporary:
+                        value = artifact(1, dtype=dtype)
+                        metadata = value["invocation"]["compiler_metadata"]
+                        metadata["enable_fp_fusion"] = enabled
+                        if fused:
+                            value["validation"] = {"stage": "fused_llvm", "llvm_module_verified": True}
+                            value["source_fusion_contract"] = {"dtype": dtype, "numerics": dict(metadata)}
+                            value["fusion"] = {
+                                "ask_numerics": f"{dtype}-rne-no-fast-math-no-contract",
+                                "producer_numerics": {
+                                    "producer_enable_fp_fusion": enabled, "producer_enable_reflect_ftz": True,
+                                    "representation": "original-F-instruction-contract-flags"}}
+                        result = self.compile_fixture(Path(temporary), value)
+                        expected = "on" if fused else "fast" if enabled else "off"
+                        self.assertEqual(result["fp_contract"], expected)
+                        self.assertIn("--fp-contract=" + expected, result["commands"][0])
+                        if fused:
+                            value["fusion"]["producer_numerics"]["producer_enable_fp_fusion"] = not enabled
+                            with patch("ask.cuda.subprocess.run") as compiler:
+                                with self.assertRaisesRegex(CUDAError, "normalization"):
+                                    compile_cuda(Path(temporary) / "source.ll", value, Path(temporary) / "bad",
+                                                 llc="/test/llc", ptxas="/test/ptxas")
+                                compiler.assert_not_called()
 
     def test_compiler_failure_has_no_success_receipt(self):
         with tempfile.TemporaryDirectory() as temporary:

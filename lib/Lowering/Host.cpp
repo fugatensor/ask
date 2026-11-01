@@ -17,6 +17,7 @@
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Host.h"
 
+#include <algorithm>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -54,11 +55,12 @@ llvm::Expected<uint64_t> elementCount(mlir::Type type) {
     return uint64_t(1);
   auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type);
   if (!tensor || !tensor.hasStaticShape() || !isSupportedValueType(type))
-    return error("host lowering requires concrete ranked i32/f32 tensors or scalars");
+    return error("host lowering requires concrete ranked i32/f32/f16 tensors or scalars");
   if (llvm::is_contained(tensor.getShape(), int64_t(0)))
     return uint64_t(0);
   uint64_t count = 1;
-  constexpr uint64_t limit = uint64_t(std::numeric_limits<int64_t>::max()) / 4;
+  const uint64_t limit = uint64_t(std::numeric_limits<int64_t>::max()) /
+      (tensor.getElementType().getIntOrFloatBitWidth() / 8);
   for (int64_t dimension : tensor.getShape()) {
     if (dimension < 0 || uint64_t(dimension) > limit / count)
       return error("host tensor byte count overflows the supported size range");
@@ -74,8 +76,18 @@ mlir::Type elementType(mlir::Type type) {
 }
 
 llvm::Type *llvmElementType(mlir::Type type, llvm::LLVMContext &context) {
-  return elementType(type).isF32() ? llvm::Type::getFloatTy(context)
-                                   : llvm::Type::getInt32Ty(context);
+  auto element = elementType(type);
+  if (element.isF32()) return llvm::Type::getFloatTy(context);
+  if (element.isF16()) return llvm::Type::getHalfTy(context);
+  if (element.isBF16()) return llvm::Type::getBFloatTy(context);
+  return llvm::Type::getInt32Ty(context);
+}
+
+std::string elementName(mlir::Type type) {
+  std::string text;
+  llvm::raw_string_ostream stream(text);
+  stream << elementType(type);
+  return text;
 }
 
 std::string valueIdentity(mlir::Value value, mlir::func::FuncOp graph) {
@@ -103,7 +115,9 @@ llvm::json::Object describeArgument(mlir::Value value, mlir::func::FuncOp graph,
   return llvm::json::Object{{"argument", int64_t(argument)},
                             {"value_id", valueIdentity(value, graph)},
                             {"kind", tensor ? "tensor" : "scalar"},
-                            {"dtype", elementType(type).isF32() ? "f32" : "i32"},
+                            {"dtype", elementName(type)},
+                            {"element_bytes", int64_t(elementType(type).getIntOrFloatBitWidth() / 8)},
+                            {"minimum_alignment", int64_t(elementType(type).getIntOrFloatBitWidth() / 8)},
                             {"shape", std::move(shape)}};
 }
 
@@ -158,6 +172,8 @@ llvm::Error validateFunction(mlir::func::FuncOp function) {
   if (function.isExternal() || !llvm::hasSingleElement(function.getBody()))
     return error("host lowering requires a defined single-block graph function");
   for (mlir::Type type : function.getArgumentTypes()) {
+    if (elementType(type).isBF16())
+      return error("bf16 requires hardware support; the generic host target does not support bf16 execution");
     auto count = elementCount(type);
     if (!count)
       return count.takeError();
@@ -168,6 +184,8 @@ llvm::Error validateFunction(mlir::func::FuncOp function) {
     if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, mlir::func::ReturnOp>(op))
       return error("host lowering requires prepared constant/splat/add/mul graphs; unsupported operation " + op.getName().getStringRef());
     for (mlir::Type type : op.getResultTypes()) {
+      if (elementType(type).isBF16())
+        return error("bf16 requires hardware support; the generic host target does not support bf16 execution");
       auto count = elementCount(type);
       if (!count)
         return count.takeError();
@@ -320,7 +338,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
           if (mlir::isa<mlir::RankedTensorType>(current.getType())) {
             auto *element = llvmElementType(current.getType(), context);
             auto *address = builder.CreateGEP(element, argument->second, index, "input.address");
-            computed = builder.CreateAlignedLoad(element, address, llvm::Align(4), "input");
+            computed = builder.CreateAlignedLoad(element, address, llvm::Align(elementType(current.getType()).getIntOrFloatBitWidth() / 8), "input");
             ++inputLoads;
           } else {
             computed = argument->second;
@@ -359,7 +377,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         llvm::Value *computed = emit(returned.getOperand(outputIndex));
         llvm::Value *output = function->getArg(graph.getNumArguments() + outputIndex);
         auto *address = builder.CreateGEP(computed->getType(), output, index, "output.address");
-        builder.CreateAlignedStore(computed, address, llvm::Align(4));
+        builder.CreateAlignedStore(computed, address, llvm::Align(computed->getType()->getScalarSizeInBits() / 8));
       }
       llvm::Value *next = builder.CreateAdd(index, builder.getInt64(1), "next");
       index->addIncoming(next, body);
@@ -367,10 +385,15 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       builder.SetInsertPoint(after);
     }
     builder.CreateRetVoid();
+    unsigned bufferAlignment = 1;
+    for (auto type : graph.getArgumentTypes())
+      bufferAlignment = std::max(bufferAlignment, elementType(type).getIntOrFloatBitWidth() / 8);
+    for (auto type : graph.getResultTypes())
+      bufferAlignment = std::max(bufferAlignment, elementType(type).getIntOrFloatBitWidth() / 8);
     functions.push_back(llvm::json::Object{
         {"name", graph.getSymName().str()}, {"calling_convention", "c"},
         {"inputs", std::move(inputs)}, {"outputs", std::move(outputs)},
-        {"layout", "contiguous_row_major"}, {"minimum_alignment", 4},
+        {"layout", "contiguous_row_major"}, {"minimum_alignment", int64_t(bufferAlignment)},
         {"requires_disjoint_outputs", true}, {"outputs_must_not_alias_inputs", true},
         {"lowering", llvm::json::Object{
             {"statistics_stage", "host_lowering"},

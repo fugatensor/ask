@@ -91,11 +91,21 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
       contract->getString("entry") != entryName)
     return error("missing or inconsistent Triton boundary contract / LLVM digest");
   auto dtype = contract->getString("dtype");
-  if (dtype != "i32" && dtype != "f32")
+  llvm::Type *valueType;
+  llvm::StringRef constraints;
+  if (dtype == "i32") {
+    valueType = llvm::Type::getInt32Ty(m.getContext());
+    constraints = "=r,r,l,r,r";
+  } else if (dtype == "f32") {
+    valueType = llvm::Type::getFloatTy(m.getContext());
+    constraints = "=f,r,f,l,r";
+  } else if (dtype == "f16" || dtype == "bf16") {
+    valueType = dtype == "f16" ? llvm::Type::getHalfTy(m.getContext())
+                                : llvm::Type::getBFloatTy(m.getContext());
+    constraints = "=h,r,h,l,r";
+  } else {
     return error("unsupported Triton boundary dtype");
-  llvm::Type *valueType = dtype == "f32" ? llvm::Type::getFloatTy(m.getContext())
-                                        : llvm::Type::getInt32Ty(m.getContext());
-  llvm::StringRef constraints = dtype == "f32" ? "=f,r,f,l,r" : "=r,r,l,r,r";
+  }
   uint64_t elementBytes = m.getDataLayout().getTypeStoreSize(valueType).getFixedValue();
   auto *proof = contract->getObject("proof");
   if (!proof || proof->getInteger("input_loads") != 1 || proof->getInteger("output_stores") != 1)
@@ -148,15 +158,17 @@ bindTritonBoundaries(llvm::Module &m, const llvm::json::Object &artifact) {
   m.setTargetTriple(llvm::Triple("nvptx64-nvidia-cuda"));
 
   TritonBoundaries result;
-  if (dtype == "f32") {
+  if (dtype != "i32") {
     result.valueArgument = 1;
     result.addressArgument = 2;
     result.indexArgument = 0;
   }
   llvm::SmallVector<llvm::CallInst *> *sites[] = {&result.inputs, &result.outputs};
-  std::string asmText[] = {"// ASK_BOUNDARY_INPUT_V1\nmov.b32 $0, $",
-                           "// ASK_BOUNDARY_OUTPUT_V1\nmov.b32 $0, $"};
-  for (auto &text : asmText) text += std::to_string(result.valueArgument + 1) + ";";
+  std::string asmText[] = {"// ASK_BOUNDARY_INPUT_V1\nmov.b",
+                           "// ASK_BOUNDARY_OUTPUT_V1\nmov.b"};
+  for (auto &text : asmText)
+    text += std::to_string(elementBytes * 8) + " $0, $" +
+            std::to_string(result.valueArgument + 1) + ";";
   for (auto &bb : *entry) for (auto &instruction : bb) {
     auto *call = llvm::dyn_cast<llvm::CallInst>(&instruction);
     if (!call || !call->isInlineAsm()) continue;

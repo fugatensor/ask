@@ -45,7 +45,8 @@ LogicalResult checkSize(Operation *owner, Type type) {
     return success();
   uint64_t elements = 1;
   // The prototype uses signed 64-bit byte counts in its external descriptions.
-  constexpr uint64_t maxElements = uint64_t(std::numeric_limits<int64_t>::max()) / 4;
+  const uint64_t maxElements = uint64_t(std::numeric_limits<int64_t>::max()) /
+      (tensor.getElementType().getIntOrFloatBitWidth() / 8);
   for (int64_t extent : tensor.getShape()) {
     if (extent < 0 || uint64_t(extent) > maxElements / elements)
       return owner->emitError("tensor byte count exceeds the prototype's signed 64-bit size range");
@@ -221,7 +222,7 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
     for (auto [index, argument] : llvm::enumerate(function.getArguments())) {
       if (!isSupportedValueType(argument.getType()) || !isConcrete(argument.getType()))
         return function.emitOpError() << "input " << index
-             << " requires a concrete ranked i32/f32 tensor or scalar; result constraints cannot supply unknown input dimensions";
+             << " requires a concrete ranked i32/f32/f16/bf16 tensor or scalar; result constraints cannot supply unknown input dimensions";
       if (failed(checkSize(function, argument.getType())))
         return failure();
       auto declaredId = function.getArgAttrOfType<StringAttr>(index, "ask.value_id");

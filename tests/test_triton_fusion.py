@@ -9,6 +9,9 @@ import tempfile
 
 driver, python, worker = sys.argv[1:]
 root = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(root / "tests"), str(root / "python")]
+from support.pointwise import build_module
+
 source = (root / "tests/ir/pipeline.mlir").read_text()
 
 with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
@@ -115,10 +118,7 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
 
     # f32 uses typed pointer metadata and float LLVM marker values. The
     # pointer-only CUDA entry ABI stays identical to the integer case.
-    float_graph = source.replace("i32", "f32").replace("*f32", "*fp32").replace(
-        "value = 1 : f32", "value = 1.0 : f32").replace(
-        "value = 3 : f32", "value = 3.0 : f32").replace(
-        ', overflow = "wrap"', "").replace("x * 2", "x * 1.25 + 0.1")
+    float_graph = build_module(10, dtype="f32", factor=1.25, external_offset=0.1).to_mlir()
     floating = fuse("float", float_graph)
     float_ir = (floating / "fused.ll").read_text()
     float_helpers = (floating / "exports/ask.helpers.ll").read_text()
@@ -150,8 +150,8 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     bad["fusion_contract"]["numerics"]["enable_fp_fusion"] = False
     replay("float-numerical-policy", bad, "numerical policy", float_graph)
 
-    no_contract_graph = float_graph.replace("options = {num_warps = 4 : i64}",
-                                           "options = {num_warps = 4 : i64, enable_fp_fusion = false}")
+    no_contract_graph = build_module(10, dtype="f32", factor=1.25, external_offset=0.1,
+                                     enable_fp_fusion=False).to_mlir()
     no_contract = fuse("float-no-contract", no_contract_graph)
     no_contract_ir = (no_contract / "fused.ll").read_text()
     assert "fmul float" in no_contract_ir and "fadd float" in no_contract_ir
@@ -162,6 +162,35 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
     replay("float-disabled-contraction-flag", bad, "despite enable_fp_fusion=false", no_contract_graph)
 
+    # One typed graph builder is also used by host and GPU numerical matrices.
+    # Low-precision boundary types and byte strides are verified independently
+    # of the numerical GPU checks; a four-byte address must not pass for fp16.
+    for dtype, llvm_type in (("f16", "half"), ("bf16", "bfloat")):
+        low_graph = build_module(10, dtype=dtype, factor=1.25, external_offset=0.1).to_mlir()
+        lowered = fuse(dtype, low_graph)
+        low_ir = (lowered / "fused.ll").read_text()
+        low_helpers = (lowered / "exports/ask.helpers.ll").read_text()
+        low_artifact = json.loads((lowered / "exports/external-0.artifact.json").read_text())
+        low_report = json.loads((lowered / "report.json").read_text())
+        assert low_report["fusion"]["dtype"] == dtype
+        assert f"fadd {llvm_type}" in low_helpers and "contract" not in low_helpers
+        assert "ASK_BOUNDARY" not in low_ir
+        assert all(port["element_type"] == dtype for port in low_artifact["port_map"])
+        bad = copy.deepcopy(low_artifact)
+        assert f"getelementptr {llvm_type}" in bad["payload"]
+        bad["payload"] = bad["payload"].replace(f"getelementptr {llvm_type}", "getelementptr i32")
+        bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
+        replay(dtype + "-wrong-byte-stride", bad, "element index", low_graph)
+        bad = copy.deepcopy(low_artifact)
+        bad["port_map"][0]["element_type"] = "f32"
+        replay(dtype + "-wrong-port-type", bad, "port element type", low_graph)
+        bad = copy.deepcopy(low_artifact)
+        bad["payload"], changed = re.subn(
+            rf'("=h,r,h,l,r"\(i32 %[^,]+, ){llvm_type} %[^,]+', r'\1i16 0', bad["payload"])
+        assert changed
+        bad["fusion_contract"]["llir_sha256"] = hashlib.sha256(bad["payload"].encode()).hexdigest()
+        replay(dtype + "-wrong-marker-type", bad, "malformed ASK boundary marker", low_graph)
+
     # BLOCK > physical threads creates two value sites per logical boundary.
     # N=19 also makes one masked lane group normalize to a sign-bit expression.
     multiple = source.replace("tensor<10xi32>", "tensor<19xi32>").replace(
@@ -171,4 +200,4 @@ with tempfile.TemporaryDirectory(prefix="ask-native-fusion-") as directory:
     multi_report = json.loads((multi / "report.json").read_text())
     assert multi_report["fusion"]["removed_boundary_markers"] == 4
     assert "ASK_BOUNDARY" not in (multi / "fused.ll").read_text()
-    print("Native LLVM fusion verified for i32/f32, producer contraction, equivalent masks and multiple sites; inconsistent requests rejected")
+    print("Native LLVM fusion verified for i32/f32/f16/bf16, producer contraction, equivalent masks and multiple sites; inconsistent requests rejected")

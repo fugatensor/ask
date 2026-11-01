@@ -14,6 +14,9 @@ ROOT = Path(__file__).resolve().parents[1]
 DRIVER = str(Path(sys.argv.pop(1)).resolve())
 sys.path.insert(0, str(ROOT / "python"))
 from ask import Module, ScalarType, TensorType
+from ask.numerics import encode_float, decode_float
+sys.path.insert(0, str(ROOT / "tests"))
+from support.pointwise import build_module, input_values, expected_values, numerically_equal, DTYPES
 
 
 def run(*args, source=None):
@@ -190,6 +193,61 @@ define void @f() {
                     else:
                         self.assertEqual(struct.pack("f", actual), struct.pack("f", expected))
                 self.assertEqual(scalar_out.value, -2 ** -23)
+
+    def test_shared_pointwise_graph_across_host_precisions(self):
+        if not json.loads(run("--capabilities").stdout)["host_codegen"]:
+            self.skipTest("host backend disabled")
+        cc = shutil.which("cc")
+        self.assertIsNotNone(cc)
+        shape, count = (2, 8), 16
+        # This builder is also used by the GPU precision matrix. The operation
+        # graph is identical; dtype controls only types and numerical encoding.
+        for dtype in DTYPES:
+            module = build_module(shape=shape, dtype=dtype, external=False)
+            prepared = run("-", "--prepare", source=module.to_mlir())
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            with self.subTest(dtype=dtype), tempfile.TemporaryDirectory() as directory:
+                path = Path(directory)
+                if dtype == "bf16":
+                    for mode in ("--emit-llvm", "--emit-object"):
+                        output = path / "unsupported"
+                        rejected = run("-", mode, "-o", output, source=module.to_mlir())
+                        self.assertNotEqual(rejected.returncode, 0)
+                        self.assertIn("bf16 requires hardware support", rejected.stderr)
+                        self.assertFalse(output.exists())
+                    continue
+                values = input_values(count, dtype)
+                expected = expected_values(values, 1, 2, dtype=dtype, external=False)
+                storage_type = {"i32": ctypes.c_int32, "f32": ctypes.c_float,
+                                "f16": ctypes.c_uint16}[dtype]
+                storage = storage_type * count
+                encoded = ([int.from_bytes(encode_float(value, dtype), "little") for value in values]
+                           if dtype == "f16" else values)
+                for optimize in (False, True):
+                    obj, library_path, report = path / f"{optimize}.o", path / f"{optimize}.so", path / f"{optimize}.json"
+                    arguments = ["-", "--emit-object", "-o", obj, "--report-json", report]
+                    if optimize:
+                        arguments.append("--optimize")
+                    emitted = run(*arguments, source=module.to_mlir())
+                    self.assertEqual(emitted.returncode, 0, emitted.stderr)
+                    linked = subprocess.run([cc, "-shared", str(obj), "-o", str(library_path)],
+                                            text=True, capture_output=True)
+                    self.assertEqual(linked.returncode, 0, linked.stderr)
+                    library = ctypes.CDLL(str(library_path))
+                    function = library.pipeline
+                    function.argtypes = [ctypes.POINTER(storage_type)] * 2
+                    function.restype = None
+                    inputs, outputs = storage(*encoded), storage()
+                    function(inputs, outputs)
+                    actual = ([decode_float(value.to_bytes(2, "little"), dtype) for value in outputs]
+                              if dtype == "f16" else list(outputs))
+                    self.assertTrue(numerically_equal(actual, expected, dtype), (dtype, actual, expected))
+                    abi = json.loads(report.read_text())["abi"]["functions"][0]
+                    width = ctypes.sizeof(storage_type)
+                    self.assertEqual(abi["minimum_alignment"], width)
+                    self.assertTrue(all(port["dtype"] == dtype and port["element_bytes"] == width
+                                        and port["minimum_alignment"] == width
+                                        for port in abi["inputs"] + abi["outputs"]))
 
     def test_float_type_mismatch_and_integer_only_options_are_rejected(self):
         source = '''module {

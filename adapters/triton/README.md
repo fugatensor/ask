@@ -6,13 +6,18 @@ patch Triton, replace compiler stages, invoke private hooks, or launch a kernel.
 The core communicates with this Python process; importing the worker module alone
 does not import Triton.
 
-The first tested configuration is deliberately narrow:
+The currently tested configuration is:
 
 - Triton 3.7.1; observed Python 3.14.7.
 - CUDA `arch=80`, `warp_size=32`, requested `num_warps=4` or `8`.
-- One `@triton.jit` entry, two `*i32` data pointers, integer `tl.constexpr` values.
+- One `@triton.jit` entry, two matching `*i32`, `*fp32`, `*fp16`, or `*bf16` data pointers, integer `tl.constexpr` values.
 - One logical input and one logical output, with explicit source parameter bindings.
 - No shared, global scratch, profile scratch, tensor descriptors, or cooperative resources.
+
+`fp16` uses the ASK spelling `f16`; `bf16` remains distinct despite the same
+two-byte storage size. A bf16 target below sm80 is rejected before compilation.
+The CUDA runner also checks the actual selected device before context creation
+or launch; a supported export target is not proof of device support.
 
 Other configurations fail explicitly. Supporting another compiler version requires
 checking its physical ABI and updating the tests, not merely removing the version
@@ -93,7 +98,7 @@ the older reader.
 ## Optional boundary tracing
 
 An additional request field `"fusion": {"enabled": true}` asks the adapter to
-validate a one-load/one-store pointwise i32 dataflow and insert two logical
+validate a one-load/one-store pointwise typed dataflow and insert two logical
 identity traces through public `tl.inline_asm_elementwise`. Local aliases,
 reassignments, equivalent affine arithmetic and positional/keyword arguments
 are accepted without prescribing a single source template. It compares the
@@ -105,6 +110,15 @@ count is `num_warps * 32`; it need not equal BLOCK. Each logical identity may
 lower to multiple LLVM calls, so the contract records actual `marker_count`
 for each boundary. All sites are bound before using the compiler-independent
 [LLVM value inliner](../../include/ask/LLIR/Inline.h).
+
+Markers preserve LLVM `float`, `half`, or `bfloat` values directly. The 16-bit
+formats use `mov.b16`; 32-bit formats use `mov.b32`. No precision conversion is
+introduced by tracing. Address validation uses the actual element byte width.
+The producer's optional `enable_fp_fusion` setting is recorded and normalized
+onto F's own instructions before inserting separately rounded ASK helpers.
+
+Native and GPU tests share one graph builder across i32/f32/f16/bf16, with an
+independent exact arithmetic oracle. See [multi-precision tests](../../docs/14-多精度测试.md).
 
 The response includes `instrumented_source` and a versioned `fusion_contract`
 bound to original source, instrumented source and exact LLVM content hashes.

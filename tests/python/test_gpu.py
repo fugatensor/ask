@@ -26,6 +26,14 @@ class GPUEntryTests(unittest.TestCase):
         self.assertEqual(floating["rounding"], "roundTiesToEven")
         self.assertFalse(floating["fast_math"])
         self.assertFalse(floating["contraction"])
+        descriptors = [integer, floating]
+        for signature, dtype in (("*fp16", "f16"), ("*bf16", "bf16")):
+            descriptor = _numerics({"signature": {"a": signature, "b": signature}})
+            self.assertEqual(descriptor["element_type"], dtype)
+            self.assertEqual(descriptor["operation_result_type"], dtype)
+            self.assertEqual(descriptor["rounding"], "roundTiesToEven")
+            self.assertNotIn(descriptor, descriptors)
+            descriptors.append(descriptor)
         for signature in ({"a": "*i32", "b": "*fp32"}, {"a": "*fp64", "b": "*fp64"}):
             with self.assertRaises(CompilerError):
                 _numerics({"signature": signature})

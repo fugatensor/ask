@@ -2,7 +2,7 @@
 """ASK protocol-1 Triton exporter. No Triton import occurs before a request/probe.
 
 This initial adapter deliberately accepts only the tested Triton 3.7.1 CUDA
-SM80 ABI: two i32/f32 data pointers, integer constexprs and two unused scratch
+SM80 ABI: two i32/f32/f16/bf16 data pointers, integer constexprs and two unused scratch
 pointers. It exports code and descriptions, never Python/kernel handles.
 """
 
@@ -23,8 +23,8 @@ import sys
 import tempfile
 
 PROTOCOL_VERSION = 1
-ADAPTER_VERSION = "0.4.0"
-ELEMENT_TYPES = {"*i32": "i32", "*fp32": "f32"}
+ADAPTER_VERSION = "0.5.0"
+ELEMENT_TYPES = {"*i32": "i32", "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
 SUPPORTED_TRITON_VERSION = "3.7.1"
 SUPPORTED_TARGET = {"backend": "cuda", "arch": 80, "warp_size": 32}
 
@@ -86,9 +86,15 @@ def validate_request(request):
             "initial adapter requires exactly two named data-pointer parameters",
             "UnsupportedSignature")
     require(all(isinstance(v, str) and v in ELEMENT_TYPES for v in signature.values()),
-            "adapter supports *i32 or *fp32 data pointers", "UnsupportedSignature")
+            "adapter supports *i32, *fp32, *fp16 or *bf16 data pointers", "UnsupportedSignature")
     require(len(set(signature.values())) == 1,
             "input and output data pointers must have the same element type", "UnsupportedSignature")
+    if "*bf16" in signature.values():
+        target = request["target"]
+        require(target.get("backend") == "cuda" and type(target.get("arch")) is int
+                and target["arch"] >= 80,
+                "bf16 requires a CUDA target with compute capability 8.0 or newer",
+                "UnsupportedDType")
     bindings = request["source_bindings"]
     require(set(bindings) == set(signature),
             "source_bindings must cover exactly the data-pointer signature")

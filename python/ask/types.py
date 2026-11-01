@@ -4,12 +4,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-_DTYPES = frozenset({"i32", "f32"})
+_DTYPES = frozenset({"i32", "f32", "f16", "bf16"})
 
 
 def _dtype(value: str) -> str:
+    value = "f16" if value == "fp16" else value
     if not isinstance(value, str) or value not in _DTYPES:
-        raise ValueError(f"ASK supports i32 and f32, got {value!r}")
+        raise ValueError(f"ASK supports i32, f32, f16 and bf16, got {value!r}")
     return value
 
 
@@ -18,7 +19,7 @@ class ScalarType:
     dtype: str = "i32"
 
     def __post_init__(self) -> None:
-        _dtype(self.dtype)
+        object.__setattr__(self, "dtype", _dtype(self.dtype))
 
     def __str__(self) -> str:
         return self.dtype
@@ -30,7 +31,7 @@ class TensorType:
     dtype: str = "i32"
 
     def __post_init__(self) -> None:
-        _dtype(self.dtype)
+        object.__setattr__(self, "dtype", _dtype(self.dtype))
         try:
             shape = tuple(self.shape)
         except TypeError as exc:

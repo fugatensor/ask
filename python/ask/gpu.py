@@ -30,12 +30,16 @@ def _numerics(request):
     if not isinstance(signature, dict) or len(signature) != 2:
         raise CompilerError("CUDA fusion requires two explicitly typed data pointers")
     types = list(signature.values())
-    if any(value not in ("*i32", "*fp32") for value in types) or types[0] != types[1]:
-        raise CompilerError("CUDA fusion requires matching i32 or f32 data-pointer types")
+    dtypes = {"*i32": "i32", "*fp32": "f32", "*fp16": "f16", "*bf16": "bf16"}
+    if any(value not in dtypes for value in types) or types[0] != types[1]:
+        raise CompilerError("CUDA fusion requires matching i32/f32/f16/bf16 data-pointer types")
     if types[0] == "*i32":
         return {"element_type": "i32", "arithmetic": "wrap-modulo-2^32"}
-    return {"element_type": "f32", "arithmetic": "ieee754-binary32",
-            "rounding": "roundTiesToEven", "fast_math": False, "contraction": False}
+    dtype = dtypes[types[0]]
+    return {"element_type": dtype, "arithmetic": {"f32": "ieee754-binary32",
+            "f16": "ieee754-binary16", "bf16": "bfloat16"}[dtype],
+            "rounding": "roundTiesToEven", "fast_math": False, "contraction": False,
+            "operation_result_type": dtype}
 
 
 def _validate_environment():
@@ -127,7 +131,7 @@ def compile_graph(compiler, module, *, cache_dir, output_dir, triton_python,
         raise CompilerError(f"cannot fingerprint the selected Triton installation: {exc}") from exc
     request = requests[0]
     key = {
-        "schema_version": 1, "pipeline_version": "ask.triton.typed-boundary.v2",
+        "schema_version": 1, "pipeline_version": "ask.triton.typed-boundary.v3",
         "graph": _sha(source.encode()), "dsl": _sha(request["source"].encode()),
         "config": {"request": {k: v for k, v in request.items() if k != "source"},
                    "environment_sha256": _sha(_json(dict(os.environ)))},

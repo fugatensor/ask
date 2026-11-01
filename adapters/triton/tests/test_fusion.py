@@ -43,6 +43,22 @@ def float_request():
 
 
 class BoundarySourceTests(unittest.TestCase):
+    def test_low_precision_markers_copy_sixteen_bits_without_promoting_values(self):
+        for dtype, signature, tl_type in (("f16", "*fp16", "tl.float16"),
+                                         ("bf16", "*bf16", "tl.bfloat16")):
+            with self.subTest(dtype=dtype):
+                value = float_request()
+                value["signature"] = {name: signature for name in value["signature"]}
+                source, contract = fusion.instrument(worker.validate_request(value))
+                self.assertEqual(contract["dtype"], dtype)
+                self.assertIn(f"tl.cast(value * 1.25 + 0.1, {tl_type})", source)
+                self.assertNotIn("tl.float32", source)
+                for role in ("input", "output"):
+                    self.assertEqual(contract[role]["constraints"], "=h,r,h,l,r")
+                    self.assertIn("mov.b16 $0, $2;", contract[role]["marker_asm"])
+                    self.assertEqual(contract[role]["arguments"],
+                                     {"index": 0, "value": 1, "address": 2, "mask": 3})
+
     def test_float_trace_preserves_values_and_store_conversion(self):
         value = float_request()
         source, contract = fusion.instrument(worker.validate_request(value))
@@ -148,7 +164,7 @@ def scale2(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
         source, contract = fusion.instrument(worker.validate_request(value))
         self.assertIn("read_at", source)
         self.assertIn("value * 2", source)
-        self.assertEqual(contract["proof"]["source_subset"], "affine-pointwise-typed-v3")
+        self.assertEqual(contract["proof"]["source_subset"], "affine-pointwise-typed-v4")
         self.assertEqual(contract["shape"], [10])
 
     def test_index_need_not_have_a_specific_local_variable(self):
@@ -250,6 +266,39 @@ def scale2(t, u, N: tl.constexpr, BLOCK: tl.constexpr):
 
 @unittest.skipUnless(PYTHON, "set ASK_TEST_TRITON_PYTHON for real trace exports")
 class RealBoundaryExportTests(unittest.TestCase):
+    def test_f16_bf16_export_preserves_low_precision_values_and_layout(self):
+        with tempfile.TemporaryDirectory(prefix="ask-lowp-boundary-export-") as directory:
+            directory = Path(directory)
+            for dtype, signature, llvm_type in (("f16", "*fp16", "half"),
+                                               ("bf16", "*bf16", "bfloat")):
+                for fp_fusion in (True, False):
+                    with self.subTest(dtype=dtype, fp_fusion=fp_fusion):
+                        value = float_request()
+                        value["signature"] = {name: signature for name in value["signature"]}
+                        value["constants"] = {"N": 257, "BLOCK": 512}
+                        value["grid"] = [1, 1, 1]
+                        value["fixed_options"]["enable_fp_fusion"] = fp_fusion
+                        source = directory / "request.json"
+                        output = directory / "artifact.json"
+                        source.write_text(json.dumps(value))
+                        result = subprocess.run([PYTHON, str(ROOT / "worker.py"), "--request", str(source),
+                                                 "--output", str(output)], text=True,
+                                                capture_output=True, timeout=180)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        artifact = json.loads(output.read_text())
+                        contract = artifact["fusion_contract"]
+                        self.assertEqual(contract["dtype"], dtype)
+                        self.assertEqual(contract["numerics"]["enable_fp_fusion"], fp_fusion)
+                        self.assertTrue(contract["proof"]["layout"]["matched_uninstrumented_baseline"])
+                        self.assertEqual([p["element_type"] for p in artifact["port_map"]], [dtype, dtype])
+                        self.assertIn(f"call {llvm_type} asm sideeffect", artifact["payload"])
+                        self.assertIn('"=h,r,h,l,r"', artifact["payload"])
+                        self.assertIn(f"getelementptr {llvm_type}", artifact["payload"])
+                        self.assertIn(f"fmul {llvm_type}", artifact["payload"])
+                        self.assertIn(f"fadd {llvm_type}", artifact["payload"])
+                        self.assertNotIn("fpext", artifact["payload"])
+                        self.assertGreater(contract["input"]["marker_count"], 1)
+
     def test_f32_trace_keeps_float_registers_layout_and_producer_numerics(self):
         with tempfile.TemporaryDirectory(prefix="ask-float-boundary-export-") as directory:
             directory = Path(directory)

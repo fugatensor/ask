@@ -85,6 +85,8 @@ llvm::Expected<llvm::Function *> helper(llvm::Module &m, llvm::StringRef name,
   llvm::Type *scalarType;
   if (elementType.isSignlessInteger(32)) scalarType = b.getInt32Ty();
   else if (elementType.isF32()) scalarType = b.getFloatTy();
+  else if (elementType.isF16()) scalarType = b.getHalfTy();
+  else if (elementType.isBF16()) scalarType = b.getBFloatTy();
   else return error("unsupported ASK helper element type");
   auto *f = llvm::Function::Create(llvm::FunctionType::get(scalarType, {scalarType}, false),
                                   llvm::GlobalValue::ExternalLinkage, name, m);
@@ -109,8 +111,10 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
     return error("fusion requires one static tensor input and one output in one block");
   auto type = mlir::dyn_cast<mlir::RankedTensorType>(func.getArgument(0).getType());
   if (!type || !type.hasStaticShape() || !isSupportedElementType(type.getElementType()))
-    return error("ASK graph lowering requires a static i32 or f32 tensor");
-  llvm::StringRef dtype = type.getElementType().isF32() ? "f32" : "i32";
+    return error("ASK graph lowering requires a static i32, f32, f16 or bf16 tensor");
+  auto elementType = type.getElementType();
+  llvm::StringRef dtype = elementType.isF32() ? "f32" : elementType.isF16() ? "f16" :
+                          elementType.isBF16() ? "bf16" : "i32";
   int64_t n = 1;
   for (int64_t dim : type.getShape()) {
     if (dim == 0 || dim > INT64_MAX / n)
@@ -215,7 +219,8 @@ fuseExternal(mlir::ModuleOp graph, const llvm::json::Object &artifact,
       {"external_op", external->getAttrOfType<mlir::StringAttr>("ask.id").getValue().str()},
       {"entry", entryName->str()}, {"inlined_helpers", static_cast<int64_t>(sites.size())},
       {"dtype", dtype},
-      {"ask_numerics", dtype == "f32" ? "f32-rne-no-fast-math-no-contract" : "i32-wrap"},
+      {"ask_numerics", dtype == "i32" ? std::string("i32-wrap") :
+                       (dtype + "-rne-no-fast-math-no-contract").str()},
       {"producer_numerics", std::move(*numerics)},
       {"removed_boundary_markers", static_cast<int64_t>(sites.size())},
       {"helper_functions", 2}, {"boundary_inliner", "ask.llvm.value-boundary.v1"},

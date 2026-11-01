@@ -13,14 +13,15 @@ import json
 from pathlib import Path
 import subprocess
 
-from .numerics import round_f32
+from .numerics import decode_float, encode_float, round_float
 
 
 class CUDAError(RuntimeError):
     pass
 
 
-_STORAGE_TYPES = {"i32": ctypes.c_int32, "f32": ctypes.c_float}
+_STORAGE_TYPES = {"i32": ctypes.c_int32, "f32": ctypes.c_float,
+                  "f16": ctypes.c_uint16, "bf16": ctypes.c_uint16}
 
 
 def _require(condition, message):
@@ -94,7 +95,7 @@ def _contract(artifact):
         _require(type(index) is int and 0 <= index < 2 and binding == data_bindings[index]
                  and binding not in port_types, "logical port and invocation argument mappings disagree")
         _require(isinstance(dtype, str) and dtype in _STORAGE_TYPES,
-                 "CUDA buffers currently support i32 and f32 element types")
+                 "CUDA buffers support i32, f32, f16 and bf16 element types")
         port_types[binding] = dtype
     dtype = port_types["input:0"]
     _require(port_types["output:0"] == dtype,
@@ -126,9 +127,9 @@ def _contract(artifact):
 def _host_buffers(values, size, dtype):
     """Convert Python scalars once at the boundary, using the IR element type.
 
-    f32 inputs round to binary32 here, before any graph operation runs. Explicit
+    Floating inputs round to their declared width before graph operations. Explicit
     infinities, NaNs and signed zero are accepted. A finite value outside the
-    representable f32 range is rejected instead of silently becoming infinity.
+    representable dtype range is rejected instead of silently becoming infinity.
     """
     _require(isinstance(values, (list, tuple)) and len(values) == size,
              "input length must equal the artifact's explicit N specialization")
@@ -137,27 +138,46 @@ def _host_buffers(values, size, dtype):
                  "input values must be signed i32 integers")
     else:
         _require(all(type(value) in (int, float) for value in values),
-                 "f32 input values must be Python int or float scalars")
+                 f"{dtype} input values must be Python int or float scalars")
         rounded = []
         for value in values:
             try:
-                rounded.append(round_f32(value))
+                rounded.append(round_float(value, dtype) if dtype == "f32" else
+                               int.from_bytes(encode_float(value, dtype), "little"))
             except (ValueError, TypeError, OverflowError) as exc:
-                raise CUDAError(f"invalid f32 input value: {exc}") from exc
+                raise CUDAError(f"invalid {dtype} input value: {exc}") from exc
         values = rounded
     storage = _STORAGE_TYPES[dtype] * max(size, 1)
     return storage(*values), storage()
 
 
+def _decode_output(storage, size, dtype):
+    if dtype in ("f16", "bf16"):
+        return [decode_float(int(bits).to_bytes(2, "little"), dtype)
+                for bits in storage[:size]]
+    return list(storage)[:size]
+
+
+def _check_device_dtype(dtype, major, minor, name):
+    # NVIDIA CUDA Programming Guide, Supported Floating-Point Types:
+    # BF16 requires compute capability 8.0 or later. This is checked against
+    # the selected physical device before creating a context or loading code.
+    # https://docs.nvidia.com/cuda/cuda-programming-guide/05-appendices/mathematical-functions.html
+    if dtype == "bf16":
+        _require(major >= 8,
+                 f"bf16 requires hardware support (CUDA compute capability >= 8.0); "
+                 f"selected device {name!r} has {major}.{minor}. No emulation fallback is enabled")
+
+
 def _fp_contract(artifact, dtype):
     """Keep F's backend contraction setting without applying it to ASK ops."""
-    if dtype != "f32":
+    if dtype == "i32":
         return "on"
     metadata = artifact["invocation"].get("compiler_metadata")
     _require(isinstance(metadata, dict)
              and type(metadata.get("enable_fp_fusion")) is bool
              and type(metadata.get("enable_reflect_ftz")) is bool,
-             "f32 code generation requires the producer's explicit numerical settings")
+             "floating code generation requires the producer's explicit numerical settings")
     enabled = metadata["enable_fp_fusion"]
     if "fusion" not in artifact and "source_fusion_contract" not in artifact:
         # Triton's raw LLIR leaves this setting to its LLVM backend. There are
@@ -169,7 +189,7 @@ def _fp_contract(artifact, dtype):
     _require(isinstance(fusion, dict) and isinstance(validation, dict)
              and validation.get("stage") == "fused_llvm"
              and validation.get("llvm_module_verified") is True,
-             "f32 fused code generation requires a verified fusion receipt")
+             "floating fused code generation requires a verified fusion receipt")
     normalized = fusion.get("producer_numerics")
     provenance = artifact.get("source_fusion_contract", {}).get("numerics")
     _require(isinstance(normalized, dict) and isinstance(provenance, dict)
@@ -178,8 +198,8 @@ def _fp_contract(artifact, dtype):
              and normalized.get("producer_enable_reflect_ftz") is metadata["enable_reflect_ftz"]
              and provenance.get("enable_fp_fusion") is enabled
              and provenance.get("enable_reflect_ftz") is metadata["enable_reflect_ftz"]
-             and fusion.get("ask_numerics") == "f32-rne-no-fast-math-no-contract",
-             "f32 fusion numerical normalization does not match the producer settings")
+             and fusion.get("ask_numerics") == f"{dtype}-rne-no-fast-math-no-contract",
+             "floating fusion numerical normalization does not match the producer settings")
     return "on"
 
 
@@ -328,6 +348,7 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
     name = ctypes.create_string_buffer(256)
     driver.call("cuDeviceGetName", name, len(name), device)
     major, minor = driver.attribute(device, 75), driver.attribute(device, 76)
+    _check_device_dtype(dtype, major, minor, name.value.decode())
     # Cubin compatibility for ordinary sm_80 targets is within the same major
     # family with an equal or newer minor revision; do not assume across-major.
     _require(major == 8 and minor >= 0, "sm_80 cubin requires a compatible compute capability 8.x device")
@@ -379,7 +400,7 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
         driver.call("cuLaunchKernel", function, *grid, *invocation["block"], 0, None, addresses, None)
         driver.call("cuCtxSynchronize")
         driver.call("cuMemcpyDtoH_v2", host_output, allocations[1], ctypes.sizeof(host_output))
-        return {"output": list(host_output)[:size], "entry": entry, "element_type": dtype,
+        return {"output": _decode_output(host_output, size, dtype), "entry": entry, "element_type": dtype,
                 "device": {"ordinal": device_ordinal, "name": name.value.decode(),
                            "compute_capability": [major, minor], "driver_version": driver_version.value},
                 "grid": grid, "block": invocation["block"],

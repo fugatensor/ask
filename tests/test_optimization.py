@@ -49,28 +49,31 @@ class OptimizationTests(unittest.TestCase):
                          result.report["input_shape_snapshot"]["semantic_revision"] + 1)
 
     def test_float_folding_rounds_each_operation_without_algebraic_identities(self):
-        module = Module()
-        graph = module.graph("rounding", inputs={}, results=[ScalarType("f32")])
-        product = graph.mul(graph.constant(1.0 + 2 ** -23, dtype="f32"),
-                            graph.constant(1.0 - 2 ** -23, dtype="f32"))
-        graph.return_(graph.add(product, graph.constant(-1.0, dtype="f32")))
-        optimized = self.compiler.optimize(module)
-        self.assertEqual(optimized.report["optimization"]["constant_folds"], 2)
-        self.assertIn("value = 0.000000e+00 : f32", optimized.ir)
-        self.assertNotIn('"ask.add"', optimized.ir)
-        self.assertNotIn('"ask.mul"', optimized.ir)
-        repeated = self.compiler.optimize(optimized.ir)
-        self.assertEqual(repeated.ir, optimized.ir)
+        for dtype, fraction_bits in [("f32", 23), ("f16", 10), ("bf16", 7)]:
+            with self.subTest(dtype=dtype):
+                module = Module()
+                graph = module.graph("rounding", inputs={}, results=[ScalarType(dtype)])
+                product = graph.mul(graph.constant(1.0 + 2 ** -fraction_bits, dtype=dtype),
+                                    graph.constant(1.0 - 2 ** -fraction_bits, dtype=dtype))
+                graph.return_(graph.add(product, graph.constant(-1.0, dtype=dtype)))
+                optimized = self.compiler.optimize(module)
+                self.assertEqual(optimized.report["optimization"]["constant_folds"], 2)
+                self.assertIn(f"value = 0.000000e+00 : {dtype}", optimized.ir)
+                self.assertNotIn('"ask.add"', optimized.ir)
+                self.assertNotIn('"ask.mul"', optimized.ir)
+                repeated = self.compiler.optimize(optimized.ir)
+                self.assertEqual(repeated.ir, optimized.ir)
 
-        dynamic = Module()
-        graph = dynamic.graph("identity", inputs={"x": ScalarType("f32")},
-                              results=[ScalarType("f32"), ScalarType("f32")])
-        zero = graph.constant(0.0, dtype="f32")
-        graph.return_(graph.add(graph.inputs["x"], zero), graph.mul(graph.inputs["x"], zero))
-        result = self.compiler.optimize(dynamic)
-        self.assertIn('"ask.add"', result.ir)  # x + 0 changes the sign of -0.
-        self.assertIn('"ask.mul"', result.ir)  # NaN/Inf * 0 cannot become 0.
-        self.assertEqual(result.report["optimization"]["constant_folds"], 0)
+                dynamic = Module()
+                graph = dynamic.graph("identity", inputs={"x": ScalarType(dtype)},
+                                      results=[ScalarType(dtype), ScalarType(dtype)])
+                zero = graph.constant(0.0, dtype=dtype)
+                graph.return_(graph.add(graph.inputs["x"], zero), graph.mul(graph.inputs["x"], zero))
+                result = self.compiler.optimize(dynamic)
+                self.assertIn('"ask.add"', result.ir)  # x + 0 changes the sign of -0.
+                self.assertIn('"ask.mul"', result.ir)  # NaN/Inf * 0 cannot become 0.
+                self.assertEqual(result.report["optimization"]["constant_folds"], 0)
+
 
     def test_markers_do_not_keep_dead_computations_alive(self):
         module = Module()

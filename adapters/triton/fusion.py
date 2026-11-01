@@ -1,6 +1,6 @@
 """Trace-only instrumentation for the first provable Triton fusion boundary.
 
-The accepted source has one guarded i32/f32 load, pure pointwise arithmetic, and
+The accepted source has one guarded i32/f32/f16/bf16 load, pure pointwise arithmetic, and
 one store using the same index and mask. This module never decodes Triton's
 memory inline assembly. ASK's LLVM pass validates the identity trace calls.
 """
@@ -19,7 +19,9 @@ INPUT_ASM = "// ASK_BOUNDARY_INPUT_V1\nmov.b32 $0, $1;"
 OUTPUT_ASM = "// ASK_BOUNDARY_OUTPUT_V1\nmov.b32 $0, $1;"
 CONSTRAINTS = "=r,r,l,r,r"
 VALUE_TYPES = {"*i32": ("i32", "tl.int32", CONSTRAINTS),
-               "*fp32": ("f32", "tl.float32", "=f,r,f,l,r")}
+               "*fp32": ("f32", "tl.float32", "=f,r,f,l,r"),
+               "*fp16": ("f16", "tl.float16", "=h,r,h,l,r"),
+               "*bf16": ("bf16", "tl.bfloat16", "=h,r,h,l,r")}
 MAX_ELEMENTS = 2147483520
 ALLOWED_TRITON_ENVIRONMENT = frozenset({
     "TRITON_CACHE_DIR", "TRITON_HOME", "TRITON_ALWAYS_COMPILE",
@@ -118,8 +120,8 @@ class _Dataflow:
             require(-(2**31) <= number < 2**31, "literal must fit signed i32")
             return _linear(constant=number)
         if isinstance(node, ast.Constant) and type(node.value) is float:
-            require(self.dtype == "f32" and math.isfinite(node.value),
-                    "floating literals require f32 data and a finite value")
+            require(self.dtype != "i32" and math.isfinite(node.value),
+                    "floating literals require floating data and a finite value")
             return ("float", node.value)
         if isinstance(node, ast.Name):
             require(node.id in self.names, "unknown or forward local reference: " + node.id)
@@ -198,7 +200,7 @@ def _trace(value, address, index, mask, asm, dtype, constraints, *, store=False)
         # stored value even when F's expression has a different numeric type.
         value = ast.Call(func=_expression("tl.cast"), args=[value, _expression(dtype)], keywords=[])
     operands = [value, copy.deepcopy(address), copy.deepcopy(index), mask_i32]
-    if dtype == "tl.float32":
+    if dtype != "tl.int32":
         # Triton's public inline-asm broadcaster uses the first argument as
         # its type exemplar and rejects comparing a pointer with a float.
         # A leading integer index permits both without casting either value.
@@ -239,13 +241,15 @@ def instrument(request):
     signature = request["signature"]
     require(signature.get(input_name) in VALUE_TYPES and
             signature.get(input_name) == signature.get(output_name),
-            "fusion requires matching *i32 or *fp32 data pointers")
+            "fusion requires matching *i32, *fp32, *fp16 or *bf16 data pointers")
     dtype, triton_dtype, constraints = VALUE_TYPES[signature[input_name]]
     input_asm, output_asm = INPUT_ASM, OUTPUT_ASM
     arguments = {"value": 0, "address": 1, "index": 2, "mask": 3}
-    if dtype == "f32":
+    if dtype != "i32":
         input_asm, output_asm = (text.replace("$1", "$2") for text in (INPUT_ASM, OUTPUT_ASM))
         arguments = {"index": 0, "value": 1, "address": 2, "mask": 3}
+    if dtype in ("f16", "bf16"):
+        input_asm, output_asm = (text.replace("mov.b32", "mov.b16") for text in (input_asm, output_asm))
     tree = ast.parse(request["source"])
     function = next(item for item in tree.body if isinstance(item, ast.FunctionDef))
     require(function.returns is None and not getattr(function, "type_params", []),
@@ -312,7 +316,7 @@ def instrument(request):
         "instrumented_source_sha256": hashlib.sha256(source.encode()).hexdigest(),
         "input": {**boundary(input_name, "input:0", input_asm), "other": 0},
         "output": boundary(output_name, "output:0", output_asm),
-        "proof": {"source_subset": "affine-pointwise-typed-v3", "input_loads": 1,
+        "proof": {"source_subset": "affine-pointwise-typed-v4", "input_loads": 1,
                   "output_stores": 1, "same_index": True, "same_mask": True,
                   "no_pointer_escape": True, "only_output_store_has_effect": True,
                   "requires_disjoint_input_output": True,

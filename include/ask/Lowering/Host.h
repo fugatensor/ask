@@ -7,7 +7,8 @@
 #include <memory>
 
 namespace ask {
-// Contiguous, disjoint i32/f32 tensor ABI. Call prepareModule before lowering.
+// Contiguous, disjoint i32/f32/f16 tensor ABI. Call prepareModule before lowering.
+// The generic host target rejects bf16; it must not silently emulate unsupported hardware.
 llvm::Expected<std::unique_ptr<llvm::Module>>
 lowerToHostLLVM(mlir::ModuleOp module, llvm::LLVMContext &context,
                 llvm::json::Object &abiReport);
