@@ -10,9 +10,12 @@ import ctypes
 import ctypes.util
 import hashlib
 import json
+import os
 from pathlib import Path
 import subprocess
+import tempfile
 
+from .cache import IRCache
 from .numerics import decode_float, encode_float, round_float
 
 
@@ -223,12 +226,27 @@ def _fp_contract(artifact, dtype):
     return "on"
 
 
-def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
-    """Compile the exact supplied LLVM bytes to a new cubin; never reuse Triton binaries.
+_CODEGEN_CACHE_VERSION = "ask.cuda.executable.v1"
+
+
+def _codegen_tool(path):
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise CUDAError(f"cannot fingerprint CUDA compiler tool {path}: {exc}") from exc
+    return {"path": str(path), "sha256": digest.hexdigest()}
+
+
+def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=None):
+    """Compile supplied LLVM bytes, optionally reusing ASK's verified disk artifacts.
 
     llc and ptxas are explicit executable paths. No target or launch policy is
-    selected here. The target architecture and launch dimensions come from the
-    producer artifact rather than a runtime-selected scheduling policy.
+    selected here. A cache hit skips both tools; it still validates the complete
+    artifact and materializes PTX, cubin and a receipt in the requested directory.
+    No Triton-produced binary is reused. Cache counters describe this request.
     """
     entry, invocation, _, dtype = _contract(artifact)
     arch = artifact["target"]["arch"]
@@ -246,31 +264,85 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas):
     receipt = output_directory / "codegen.json"
     _require(not any(path.exists() for path in (ptx, cubin, receipt)),
              "codegen destination already contains artifacts; use a fresh directory")
-    commands = [
-        [str(llc), "-march=nvptx64", f"-mcpu=sm_{arch}", "-mattr=+ptx80", "--fp-contract=" + fp_contract,
-         str(llvm_ir), "-o", str(ptx)],
-        [str(ptxas), f"--gpu-name=sm_{arch}", "-v", str(ptx), "-o", str(cubin)],
-    ]
-    logs = []
-    for command in commands:
-        try:
-            result = subprocess.run(command, capture_output=True, text=True, timeout=120)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise CUDAError(f"code generation failed: {exc}") from exc
-        if result.returncode:
-            raise CUDAError(f"code generation failed ({result.returncode}): {' '.join(command)}\n"
-                            + result.stdout + result.stderr)
-        logs.append(result.stdout + result.stderr)
+    options = [["-march=nvptx64", f"-mcpu=sm_{arch}", "-mattr=+ptx80", "--fp-contract=" + fp_contract],
+               [f"--gpu-name=sm_{arch}", "-v"]]
+
+    def commands_for(directory):
+        return [[str(llc), *options[0], str(llvm_ir), "-o", str(directory / "kernel.ptx")],
+                [str(ptxas), *options[1], str(directory / "kernel.ptx"), "-o", str(directory / "kernel.cubin")]]
+
+    tools = {"llc": _codegen_tool(llc), "ptxas": _codegen_tool(ptxas)} if cache_dir is not None else None
+
+    def build():
+        # Failed tool invocations never leave an apparently complete local
+        # result or publish a cache entry. Only finished bytes leave staging.
+        with tempfile.TemporaryDirectory(prefix="ask-cuda-codegen-") as temporary:
+            staging = Path(temporary)
+            logs = []
+            for command in commands_for(staging):
+                try:
+                    result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    raise CUDAError(f"code generation failed: {exc}") from exc
+                if result.returncode:
+                    raise CUDAError(f"code generation failed ({result.returncode}): {' '.join(command)}\n"
+                                    + result.stdout + result.stderr)
+                logs.append(result.stdout + result.stderr)
+            _require(llvm_ir.read_bytes() == source, "LLVM input changed during compilation")
+            if tools is not None:
+                _require(tools == {"llc": _codegen_tool(llc), "ptxas": _codegen_tool(ptxas)},
+                         "CUDA compiler tool changed during compilation")
+            return {"kernel.ptx": (staging / "kernel.ptx").read_bytes(),
+                    "kernel.cubin": (staging / "kernel.cubin").read_bytes(),
+                    "build.json": json.dumps({"compiler_logs": logs}, sort_keys=True).encode()}
+
+    if cache_dir is None:
+        built = build()
+        stats = {"key": None, "status": "disabled", "reason": "not_configured",
+                 "counters": {"requests": 0, "hits": 0, "misses": 0, "invalid": 0, "builds": 1}}
+    else:
+        # Reuse IRCache's process/thread locks, byte checksums, atomic publish
+        # and corrupt-entry recovery. Its key vocabulary also describes this
+        # later compilation stage: graph is LLVM, no DSL remains to compile.
+        key = {
+            "schema_version": 1, "pipeline_version": _CODEGEN_CACHE_VERSION,
+            "graph": {"llvm_sha256": _digest(source)}, "dsl": None,
+            "config": {"artifact_sha256": _artifact_digest(artifact), "options": options,
+                       "environment_sha256": _digest(json.dumps(dict(os.environ), sort_keys=True).encode())},
+            "llvm_revision": "binary-sha256:" + tools["llc"]["sha256"],
+            "producer": artifact.get("producer", {}),
+            "adapter": {"codegen_sha256": _digest(Path(__file__).read_bytes())},
+            "tools": tools, "target": artifact["target"],
+            "shape": artifact["specializations"],
+            "numerics": {"fp_contract": fp_contract, "required_element_types": sorted(required)},
+        }
+        built, stats = IRCache(cache_dir).get_or_create(key, build)
     _require(llvm_ir.read_bytes() == source, "LLVM input changed during compilation")
+    if tools is not None:
+        _require(tools == {"llc": _codegen_tool(llc), "ptxas": _codegen_tool(ptxas)},
+                 "CUDA compiler tool changed during cache access")
+    logs = json.loads(built["build.json"])["compiler_logs"]
     result = {"schema_version": 1, "entry": entry, "arch": arch, "element_type": dtype,
               "fp_contract": fp_contract,
               "artifact_sha256": _artifact_digest(artifact),
               "llvm_ir": str(llvm_ir), "llvm_sha256": _digest(source),
-              "ptx": str(ptx), "ptx_sha256": _digest(ptx.read_bytes()),
-              "cubin": str(cubin), "cubin_sha256": _digest(cubin.read_bytes()),
-              "commands": commands, "compiler_logs": logs,
+              "ptx": str(ptx), "ptx_sha256": _digest(built["kernel.ptx"]),
+              "cubin": str(cubin), "cubin_sha256": _digest(built["kernel.cubin"]),
+              "commands": commands_for(output_directory), "compiler_logs": logs,
+              "commands_role": "reproduction", "compiler_invocations": 0 if stats["status"] == "hit" else 2,
+              "executable_cache": stats,
               "invocation": invocation, "original_triton_binary_used": False}
-    receipt.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+    created = []
+    try:
+        for path, payload in ((ptx, built["kernel.ptx"]), (cubin, built["kernel.cubin"]),
+                              (receipt, (json.dumps(result, indent=2, sort_keys=True) + "\n").encode())):
+            with path.open("xb") as stream:
+                created.append(path)
+                stream.write(payload)
+    except BaseException:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise
     return result
 
 

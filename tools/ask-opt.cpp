@@ -1,5 +1,6 @@
 #include "ask/BuildConfig.h"
 #include "ask/Frontend/Prepare.h"
+#include "ask/Frontend/Compiler.h"
 #include "ask/IR/ASKDialect.h"
 #include "ask/IR/ASKOps.h"
 #include "ask/LLIR/Import.h"
@@ -64,51 +65,6 @@ Error writeJSON(StringRef path, const json::Value &value) {
   raw_string_ostream stream(contents);
   stream << formatv("{0:2}\n", value);
   return writeText(path, contents);
-}
-
-json::Value attrJSON(mlir::Attribute attr) {
-  if (auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr)) {
-    json::Object value;
-    for (auto item : dict) value[item.getName().strref()] = attrJSON(item.getValue());
-    return value;
-  }
-  if (auto str = mlir::dyn_cast<mlir::StringAttr>(attr)) return str.getValue();
-  if (auto boolean = mlir::dyn_cast<mlir::BoolAttr>(attr)) return boolean.getValue();
-  if (auto number = mlir::dyn_cast<mlir::IntegerAttr>(attr)) return number.getInt();
-  if (auto array = mlir::dyn_cast<mlir::DenseI64ArrayAttr>(attr)) {
-    json::Array value;
-    for (int64_t item : array.asArrayRef()) value.push_back(item);
-    return value;
-  }
-  if (auto array = mlir::dyn_cast<mlir::ArrayAttr>(attr)) {
-    json::Array value;
-    for (auto item : array) value.push_back(attrJSON(item));
-    return value;
-  }
-  std::string text;
-  raw_string_ostream stream(text);
-  attr.print(stream);
-  return text;
-}
-
-json::Array externalRequests(mlir::ModuleOp module) {
-  json::Array requests;
-  module.walk([&](ask::ExternalOp op) {
-    auto impl = op.resolveImplementation();
-    json::Object request{{"protocol_version", 1}};
-    for (StringRef key : {"source", "entry", "signature", "source_bindings",
-                          "constants", "target", "grid"})
-      if (auto attr = impl->getAttr(key)) request[key] = attrJSON(attr);
-    request["fixed_options"] = impl->getAttr("options")
-        ? attrJSON(impl->getAttr("options")) : json::Value(json::Object{});
-    if (fuseExternal) request["fusion"] = json::Object{{"enabled", true}};
-    request["compiler"] = attrJSON(impl->getAttr("compiler"));
-    request["op_id"] = attrJSON(op->getAttr("ask.id"));
-    request["function"] = op->getParentOfType<mlir::func::FuncOp>().getSymName();
-    request["implementation"] = attrJSON(impl->getAttr("sym_name"));
-    requests.push_back(std::move(request));
-  });
-  return requests;
 }
 
 Error validateExport(const json::Object &artifact, const json::Object &request) {
@@ -216,21 +172,7 @@ int main(int argc, char **argv) {
   InitLLVM init(argc, argv);
   cl::ParseCommandLineOptions(argc, argv, "ASK framework frontend and native LLVM driver\n");
   if (capabilities) {
-    json::Array compilers;
-    if (ASK_WITH_TRITON) compilers.push_back("triton");
-    json::Value result = json::Object{
-        {"schema_version", 1}, {"ask_version", ASK_VERSION}, {"llvm_version", ASK_LLVM_VERSION},
-        {"llvm_revision", ASK_LLVM_REVISION},
-        {"third_party_compilers", std::move(compilers)}, {"prepare", true},
-        {"native_llvm_import", true}, {"host_codegen", bool(ASK_WITH_HOST)},
-        {"ir_optimization", true}, {"elementwise_fusion", true}, {"llvm_optimization", true},
-        {"external_export", bool(ASK_WITH_TRITON)}, {"gpu_execution", bool(ASK_WITH_TRITON)},
-        {"triton_llir_fusion", bool(ASK_WITH_TRITON)}, {"cuda_execution_via_python", bool(ASK_WITH_TRITON)},
-        {"supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
-        {"explicit_cast", true}, {"mixed_precision", true},
-        {"host_bf16_hardware_supported", bool(ASK_WITH_HOST) && ask::nativeHostSupportsBF16()},
-        {"host_supported_element_types", ASK_WITH_HOST ? json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"} : json::Array{}},
-        {"gpu_supported_element_types", ASK_WITH_TRITON ? json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"} : json::Array{}}};
+    json::Value result = ask::compilerCapabilities();
     outs() << formatv("{0:2}\n", result);
     return 0;
   }
@@ -279,7 +221,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     report["phase"] = optimize ? "optimized" : "prepared";
-    report["external_requests"] = externalRequests(*module);
+    report["external_requests"] = ask::externalRequests(*module, fuseExternal);
   }
   if (exportExternal || fuseExternal) {
     std::string executable = sys::fs::getMainExecutable(argv[0], reinterpret_cast<void *>(&main));

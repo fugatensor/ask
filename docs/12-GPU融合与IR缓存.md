@@ -81,15 +81,15 @@ print(execution["output"])
 print(kernel.cache["status"], kernel.cache["counters"])
 ```
 
-Python SDK 本身不导入 Triton 或 CUDA。显式调用编译入口时先检查构建允许清单，`none` 构建在读缓存、启动 worker 前就拒绝请求。`run` 才加载 CUDA driver；无需 PyTorch、NumPy 或 CUDA Python 包。
+Python SDK 本身不导入 Triton 或 CUDA。显式调用编译入口时先检查构建允许清单，`none` 构建在读缓存、启动 worker 前就拒绝请求。`run` 或创建 `ExecutionSession` 时才加载 CUDA driver；无需 PyTorch、NumPy 或 CUDA Python 包。
 
 `kernel.run(values)` 从产物读取 dtype，选择对应的 1 / 2 / 4 / 8 字节编码。调用方无需挑选另一套执行函数。例如 `TensorType(shape, "bf16")` 配合 `graph.constant(value, dtype="bf16")`，Triton 签名写 `*bf16`；fp16 可写 `TensorType(shape, "fp16")`，会规范为 ASK `f16`，对应 Triton `*fp16`。完整类型规则见[框架接入](10-上层框架接入.md#dtype-path)。
 
-图中任何值使用 bf16，包括 f32 输入、bf16 中间值、f32 输出的情况，运行前都先读取实际设备的 compute capability；major 小于 8 就抛出带设备名称和能力版本的 `CUDAError`，发生在 context 创建、模块加载、设备分配和 launch 之前。缓存命中不能跳过这项检查。导出器和 ASK 代码生成也拒绝低于 sm80 的 bf16 编译目标。普通图按请求架构生成 PTX / cubin，不固定为 sm80。后端不认识目标、实际硬件缺少 bf16、cubin 不兼容分别报告，不静默改成 f32。
+图中任何值使用 bf16，包括 f32 输入、bf16 中间值、f32 输出的情况，运行前都先读取实际设备的 compute capability；major 小于 8 就抛出带设备名称和能力版本的 `CUDAError`，同步 `run` 在创建 context 前检查；常驻 Session 在接收 bf16 张量或内核时检查，拒绝相应分配、加载或启动。缓存命中不能跳过这项检查。导出器和 ASK 代码生成也拒绝低于 sm80 的 bf16 编译目标。普通图按请求架构生成 PTX / cubin，不固定为 sm80。后端不认识目标、实际硬件缺少 bf16、cubin 不兼容分别报告，不静默改成 f32。
 
-`--capabilities` 中的 `gpu_execution` / `cuda_execution_via_python` 描述本构建是否启用了这条 SDK 路径，不是 GPU 探测结果。`ask-opt` 本身没有 launch 命令，实际工具和设备是否可用由编译、运行时检查。
+`--capabilities` 中的 `gpu_execution` / `cuda_execution_via_python` 描述运行接口是否存在，不是 GPU 探测结果。基础运行时在 `none` 中也能加载独立产物；编译 Triton DSL 的许可另由 `triton_llir_fusion` / `external_export` 表示。`ask-opt` 本身没有 launch 命令，实际工具和设备是否可用由编译、运行时检查。
 
-代码生成记录 LLVM / PTX / cubin 摘要。运行器核对输入 LLVM、调用产物和 cubin 的摘要，检查启动描述、设备能力，并查询加载后 kernel 的参数 ABI 和资源。每次调用分配输入、输出，在独立 CUDA context 中启动并同步后读取结果，最后释放资源。提交失败会报告错误并清理，不自动重放。它还不是框架共享 stream、异步事件或零拷贝张量运行时。
+代码生成记录 LLVM / PTX / cubin 摘要。运行器核对输入 LLVM、调用产物和 cubin 的摘要，检查启动描述、设备能力，并查询加载后 kernel 的参数 ABI 和资源。兼容入口 `kernel.run(values)` 每次分配输入、输出，在独立 CUDA context 中启动并同步后读取结果。重复执行应使用 `kernel.prepare(session)` 和设备张量：模块、stream 与缓冲区常驻，`submit` 只入队，返回 Event；支持从 CUDA Array Interface 接入已有连续张量。提交失败不自动重放。资源所有权与跨 stream 顺序见[第 16 章](16-Python绑定与常驻运行时.md)。
 
 只想查看 LLVM 融合结果时，可用原生入口：
 
@@ -109,7 +109,7 @@ CLI 导出并融合，不启动 GPU，也不访问持久缓存。`--export-exter
 
 键包含原始 ASK 图和 DSL 的内容摘要、完整固定配置、输入形状及形状规则、目标、dtype 及其数值规则、流水线版本、LLVM revision、ASK 可执行文件、worker/边界适配器、选中的 Python、llc、ptxas 的内容摘要。Triton 安装包中的源码、libtriton、libdevice 等文件也按内容计算摘要；只看版本号不够。环境变量整体计算摘要，报告不保存变量明文。
 
-每次调用先重新检查图和当前依赖，再查缓存。命中后跳过 Triton 导出和 LLVM 融合，继续用缓存中的 `fused.ll` 重新生成 PTX/cubin。因此 `hit` 指 **ASK 的融合 IR 命中**，不表示 Triton 自身缓存命中，也不表示复用了旧 GPU 二进制。
+每次调用先重新检查图和当前依赖，再查 IR 缓存。IR 命中后跳过 Triton 导出和 LLVM 融合；接着查询 `cache_dir/executables` 中的可执行产物缓存。后者命中后直接复用已检查的 PTX/cubin，跳过 `llc/ptxas`。`kernel.cache` 仍只统计 IR，`kernel.codegen["executable_cache"]` 和报告的同名字段单独统计机器码缓存；不能只看一个 hit 就断言两层都命中。键、发布和加载规则见[第 16 章](16-Python绑定与常驻运行时.md#4-三种缓存分别省什么)。
 
 首版融合禁止 `TRITON_KERNEL_OVERRIDE`、自定义 libdevice/ptxas 路径、编译插件等环境覆盖，因为仅记录路径不能说明文件内容是否变化，也不能保证被替换的代码仍对应 DSL 证明。检查发生在缓存读取前，worker 同样检查。允许的 Triton 环境项仅为 `TRITON_CACHE_DIR`、`TRITON_HOME`、`TRITON_ALWAYS_COMPILE`、`TRITON_KERNEL_DUMP`、`TRITON_DUMP_DIR`、`TRITON_DISABLE_LINE_INFO`。
 

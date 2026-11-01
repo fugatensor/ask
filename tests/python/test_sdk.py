@@ -257,14 +257,14 @@ class ClientProtocolTests(unittest.TestCase):
     def test_native_diagnostics_are_retained(self):
         with patch("ask.compiler.subprocess.run", return_value=subprocess.CompletedProcess([], 1, "", "bad shape")):
             with self.assertRaises(CompilerError) as caught:
-                Compiler().prepare("module {}")
+                Compiler("ask-opt").prepare("module {}")
         self.assertEqual(caught.exception.returncode, 1)
         self.assertEqual(caught.exception.diagnostics, "bad shape")
 
     def test_native_crash_is_reported_as_a_signal(self):
         with patch("ask.compiler.subprocess.run", return_value=subprocess.CompletedProcess([], -11, "", "stack trace")):
             with self.assertRaisesRegex(CompilerError, "signal 11") as caught:
-                Compiler().prepare("module {}")
+                Compiler("ask-opt").prepare("module {}")
         self.assertEqual(caught.exception.returncode, -11)
 
     def test_missing_compiler_is_not_emulated(self):
@@ -275,12 +275,12 @@ class ClientProtocolTests(unittest.TestCase):
     def test_capabilities_requires_a_json_object(self):
         with patch("ask.compiler.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "[]", "")):
             with self.assertRaises(CompilerError):
-                Compiler().capabilities()
+                Compiler("ask-opt").capabilities()
 
     def test_success_exit_without_artifacts_is_an_error(self):
         with patch("ask.compiler.subprocess.run", return_value=subprocess.CompletedProcess([], 0, "", "")):
             with self.assertRaises(CompilerError):
-                Compiler().prepare("module {}")
+                Compiler("ask-opt").prepare("module {}")
 
 
 @unittest.skipUnless(os.environ.get("ASK_OPT"), "set ASK_OPT to run real native compiler tests")

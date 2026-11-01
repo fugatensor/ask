@@ -1,16 +1,20 @@
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core==1.1.1", "nanobind==3.1.0"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "ask-compiler"
 version = "0.1.0"
-description = "Standard-library Python client for the ASK MLIR compiler"
+description = "ASK native compiler and device runtime with Python bindings"
 requires-python = ">=3.10"
 dependencies = []
 
-[tool.setuptools]
-package-dir = {"" = "python"}
+[tool.scikit-build]
+minimum-version = "1.1"
+build-dir = "build/wheel/{wheel_tag}"
+wheel.packages = ["python/ask"]
+cmake.version = ">=3.28"
 
-[tool.setuptools.packages.find]
-where = ["python"]
+[tool.scikit-build.cmake.define]
+BUILD_TESTING = "OFF"
+ASK_THIRD_PARTY_COMPILERS = "none"

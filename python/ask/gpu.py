@@ -96,6 +96,11 @@ class CUDAKernel:
     report: dict
     cache: dict
 
+    def prepare(self, session):
+        """Validate and load once for repeated asynchronous device execution."""
+        from .executable import PreparedCUDAKernel
+        return PreparedCUDAKernel(self, session)
+
     def run(self, values, *, device_ordinal=0, driver_library=None):
         """Execute the fused cubin using the artifact's dtype for both buffers."""
         return execute(self.artifact, self.codegen, values,
@@ -104,10 +109,10 @@ class CUDAKernel:
 
 def compile_graph(compiler, module, *, cache_dir, output_dir, triton_python,
                   triton_worker, llc, ptxas):
-    """Cache fused LLVM IR; generate a fresh PTX/cubin for each explicit request.
+    """Cache fused LLVM IR and ASK-generated PTX/cubin in separate namespaces.
 
-    Cache hits bypass Triton export and ASK fusion, not graph validation or
-    GPU code generation. Tensor values are runtime inputs and never cache keys.
+    Graph validation precedes cache access. Executable hits also skip llc and
+    ptxas. Tensor values are runtime inputs and never cache keys.
     """
     caps = compiler.capabilities()
     if "triton" not in caps.get("third_party_compilers", []) or not caps.get("triton_llir_fusion"):
@@ -174,7 +179,9 @@ def compile_graph(compiler, module, *, cache_dir, output_dir, triton_python,
     report = json.loads(artifacts["report.json"])
     report["ir_cache"] = stats
     report["ir_cache_key_inputs"] = key
-    (destination / "report.json").write_bytes(_json(report) + b"\n")
     codegen = compile_cuda(destination / "fused.ll", fused, destination / "codegen",
-                           llc=tools["llc"]["path"], ptxas=tools["ptxas"]["path"])
+                           llc=tools["llc"]["path"], ptxas=tools["ptxas"]["path"],
+                           cache_dir=Path(cache_dir) / "executables")
+    report["executable_cache"] = codegen["executable_cache"]
+    (destination / "report.json").write_bytes(_json(report) + b"\n")
     return CUDAKernel(fused, codegen, report, stats)

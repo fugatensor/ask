@@ -16,6 +16,33 @@ if(NOT ASK_TARGET_BACKENDS STREQUAL "none" AND NOT ASK_TARGET_BACKENDS STREQUAL 
   message(FATAL_ERROR "This draft implements ASK_TARGET_BACKENDS=none or host; requested '${ASK_TARGET_BACKENDS}'")
 endif()
 
+# Native Python bindings are part of every ASK build, including none.
+find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nanobind.lock.json" ASK_NANOBIND_LOCK)
+string(JSON ASK_NANOBIND_VERSION GET "${ASK_NANOBIND_LOCK}" version)
+string(JSON ASK_NANOBIND_DIRECTORY GET "${ASK_NANOBIND_LOCK}" directory)
+if(NOT nanobind_DIR)
+  execute_process(COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    RESULT_VARIABLE ASK_NANOBIND_QUERY_STATUS OUTPUT_VARIABLE ASK_NANOBIND_CMAKE_DIR
+    ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
+  if(ASK_NANOBIND_QUERY_STATUS EQUAL 0)
+    set(nanobind_DIR "${ASK_NANOBIND_CMAKE_DIR}")
+  elseif(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.deps/${ASK_NANOBIND_DIRECTORY}/cmake/nanobind-config.cmake")
+    set(nanobind_DIR "${CMAKE_CURRENT_SOURCE_DIR}/.deps/${ASK_NANOBIND_DIRECTORY}/cmake")
+  else()
+    message(FATAL_ERROR "ASK requires nanobind ${ASK_NANOBIND_VERSION} in every build. Run python3 tools/fetch_nanobind.py or install the locked build dependencies into the selected Python environment.")
+  endif()
+endif()
+find_package(nanobind CONFIG REQUIRED)
+file(STRINGS "${nanobind_DIR}/../include/nanobind/nanobind.h" ASK_NANOBIND_HEADER_VERSION REGEX "^#define NB_VERSION_(MAJOR|MINOR|PATCH) ")
+foreach(part MAJOR MINOR PATCH)
+  string(REGEX MATCH "#define NB_VERSION_${part} ([0-9]+)" unused "${ASK_NANOBIND_HEADER_VERSION}")
+  set(ASK_NB_${part} "${CMAKE_MATCH_1}")
+endforeach()
+if(NOT "${ASK_NB_MAJOR}.${ASK_NB_MINOR}.${ASK_NB_PATCH}" VERSION_EQUAL ASK_NANOBIND_VERSION)
+  message(FATAL_ERROR "nanobind headers do not match cmake/nanobind.lock.json (${ASK_NANOBIND_VERSION})")
+endif()
+
 # LLVM and MLIR must come from the pinned SDK used by the tested producer.
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/llvm.lock.json" ASK_LLVM_LOCK)
 string(JSON ASK_LLVM_CMAKE_VERSION GET "${ASK_LLVM_LOCK}" cmake_version)
@@ -59,10 +86,11 @@ set(ASK_WITH_HOST 0)
 if(ASK_TARGET_BACKENDS STREQUAL "host")
   set(ASK_WITH_HOST 1)
 endif()
+string(SHA256 ASK_BUILD_ID "${CMAKE_CURRENT_BINARY_DIR};${PROJECT_VERSION};${ASK_LLVM_REVISION};${ASK_ENABLED_COMPILERS};${ASK_WITH_HOST};${Python_SOABI}")
 configure_file(cmake/BuildConfig.h.in generated/ask/BuildConfig.h @ONLY)
 
 add_library(ask_core STATIC
-  lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp
+  lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp lib/Frontend/Compiler.cpp
   lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/LLIR/Inline.cpp
   lib/Adapters/TritonBoundary.cpp lib/Lowering/Host.cpp
   lib/Transforms/Optimize.cpp)
@@ -88,6 +116,38 @@ add_executable(ask-opt tools/ask-opt.cpp)
 target_link_libraries(ask-opt PRIVATE ASK::Core)
 set_target_properties(ask-opt PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
 
+add_library(ask_runtime STATIC lib/Runtime/CUDA.cpp)
+add_library(ASK::Runtime ALIAS ask_runtime)
+set_target_properties(ask_runtime PROPERTIES EXPORT_NAME Runtime POSITION_INDEPENDENT_CODE ON)
+target_compile_features(ask_runtime PUBLIC cxx_std_17)
+target_include_directories(ask_runtime PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_link_libraries(ask_runtime PRIVATE ${CMAKE_DL_LIBS})
+
+nanobind_add_module(_native NB_STATIC bindings/compiler.cpp bindings/compiler_bridge.cpp bindings/runtime.cpp)
+target_link_libraries(_native PRIVATE ASK::Core ASK::Runtime)
+# LLVM is built without RTTI, but nanobind's own bound runtime classes require it.
+# The bridge keeps LLVM headers/types in a separate no-RTTI translation unit.
+set_source_files_properties(bindings/compiler.cpp bindings/runtime.cpp PROPERTIES
+  COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-frtti>")
+set_target_properties(_native PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/python/ask")
+# A complete build-tree package, also usable alongside source via extend_path.
+file(GLOB ASK_PYTHON_SOURCES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/python/ask/*.py")
+foreach(source IN LISTS ASK_PYTHON_SOURCES)
+  get_filename_component(name "${source}" NAME)
+  configure_file("${source}" "${CMAKE_CURRENT_BINARY_DIR}/python/ask/${name}" COPYONLY)
+endforeach()
+if(SKBUILD)
+  set(ASK_PYTHON_INSTALL_DIR "ask")
+  install(TARGETS ask-opt RUNTIME DESTINATION ask/_bin COMPONENT Core)
+else()
+  set(ASK_PYTHON_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages/ask")
+endif()
+install(TARGETS _native LIBRARY DESTINATION "${ASK_PYTHON_INSTALL_DIR}" COMPONENT Core)
+install(DIRECTORY python/ask/ DESTINATION "${ASK_PYTHON_INSTALL_DIR}" COMPONENT Core FILES_MATCHING PATTERN "*.py")
+install(TARGETS ask_runtime EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
+
 install(TARGETS ask_core EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
 install(TARGETS ask-opt RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Core)
 install(DIRECTORY include/ask DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT Core)
@@ -99,33 +159,35 @@ write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.c
   VERSION ${PROJECT_VERSION} COMPATIBILITY SameMajorVersion)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Core)
-install(FILES cmake/llvm.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
+install(FILES cmake/llvm.lock.json cmake/nanobind.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 
 if(BUILD_TESTING)
-  find_package(Python3 COMPONENTS Interpreter REQUIRED)
   add_executable(ask-boundary-inline-test tests/test_boundary_inline.cpp)
   target_link_libraries(ask-boundary-inline-test PRIVATE ASK::Core)
   add_test(NAME ask-boundary-inline COMMAND ask-boundary-inline-test)
-  add_test(NAME ask-boundary-execution COMMAND "${Python3_EXECUTABLE}"
+  add_test(NAME ask-boundary-execution COMMAND "${Python_EXECUTABLE}"
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_boundary_execution.py"
     "$<TARGET_FILE:ask-boundary-inline-test>" "${LLVM_TOOLS_BINARY_DIR}")
-  add_test(NAME ask-python COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/tests/python" -v)
-  set_tests_properties(ask-python PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_SOURCE_DIR}/python;ASK_OPT=$<TARGET_FILE:ask-opt>")
-  add_test(NAME ask-native COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native.py" "$<TARGET_FILE:ask-opt>")
-  add_test(NAME ask-optimization COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_optimization.py" "$<TARGET_FILE:ask-opt>")
-  add_test(NAME ask-fusion COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fusion.py" "$<TARGET_FILE:ask-opt>")
-  add_test(NAME ask-llir-optimization COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_llir_optimization.py" "$<TARGET_FILE:ask-opt>")
+  add_test(NAME ask-python COMMAND "${Python_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/tests/python" -v)
+  set_tests_properties(ask-python PROPERTIES ENVIRONMENT "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/python;ASK_OPT=$<TARGET_FILE:ask-opt>;ASK_NATIVE_REQUIRED=1")
+  add_test(NAME ask-native COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_native.py" "$<TARGET_FILE:ask-opt>")
+  add_test(NAME ask-optimization COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_optimization.py" "$<TARGET_FILE:ask-opt>")
+  add_test(NAME ask-fusion COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fusion.py" "$<TARGET_FILE:ask-opt>")
+  add_test(NAME ask-llir-optimization COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_llir_optimization.py" "$<TARGET_FILE:ask-opt>")
   set_tests_properties(ask-llir-optimization PROPERTIES ENVIRONMENT "ASK_LLVM_TOOLS_DIR=${LLVM_TOOLS_BINARY_DIR}")
-  add_test(NAME ask-build-selection COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_build_selection.py")
-  add_test(NAME ask-fetch-llvm COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fetch_llvm.py")
-  add_test(NAME ask-triton-worker COMMAND "${Python3_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/tests" -v)
+  add_test(NAME ask-build-selection COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_build_selection.py")
+  add_test(NAME ask-fetch-nanobind COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fetch_nanobind.py")
+  add_test(NAME ask-fetch-llvm COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_fetch_llvm.py")
+  add_test(NAME ask-triton-worker COMMAND "${Python_EXECUTABLE}" -m unittest discover -s "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/tests" -v)
   if(ASK_WITH_TRITON)
     set_tests_properties(ask-triton-worker PROPERTIES ENVIRONMENT "ASK_TEST_TRITON_PYTHON=${ASK_TRITON_PYTHON_EXECUTABLE}")
-    add_test(NAME ask-triton-pipeline COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_pipeline.py"
+    add_test(NAME ask-triton-pipeline COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_pipeline.py"
       "$<TARGET_FILE:ask-opt>" "${ASK_TRITON_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/worker.py")
-    add_test(NAME ask-triton-fusion COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_fusion.py"
+    add_test(NAME ask-triton-fusion COMMAND "${Python_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_triton_fusion.py"
       "$<TARGET_FILE:ask-opt>" "${ASK_TRITON_PYTHON_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/adapters/triton/worker.py")
   endif()
 endif()
 message(STATUS "ASK compiler selection: '${ASK_THIRD_PARTY_COMPILERS}' -> [${ASK_ENABLED_COMPILERS}]")
 message(STATUS "ASK target backends: ${ASK_TARGET_BACKENDS}; LLVM/MLIR ${LLVM_PACKAGE_VERSION}")
+
+message(STATUS "ASK native Python: ${Python_EXECUTABLE} (${Python_SOABI}); nanobind ${ASK_NANOBIND_VERSION}")
