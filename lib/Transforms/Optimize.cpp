@@ -34,7 +34,7 @@ std::string valueId(Value value) {
 }
 
 bool isKnownPure(Operation *op) {
-  return isa<ConstantOp, SplatOp, CastOp, AddOp, MulOp>(op);
+  return isa<ConstantOp, SplatOp, CastOp, ReshapeOp, AddOp, MulOp>(op);
 }
 
 bool namesPort(StringRef port, Operation *op) {
@@ -173,10 +173,10 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
                               op.getAttrOfType<TypedAttr>("value"));
         continue;
       }
-      if (auto splat = dyn_cast<SplatOp>(op)) {
-        auto known = constants.find(splat.getOperand());
+      if (isa<SplatOp, ReshapeOp>(op)) {
+        auto known = constants.find(op.getOperand(0));
         if (known != constants.end())
-          constants.try_emplace(splat.getResult(), known->second);
+          constants.try_emplace(op.getResult(0), known->second);
         continue;
       }
       if (!isa<CastOp, AddOp, MulOp>(op))
@@ -292,7 +292,7 @@ llvm::json::Array planFusion(ModuleOp module, bool enabled, bool &changed) {
         auto type = dyn_cast<RankedTensorType>(op.getResult(0).getType());
         if (!type)
           continue; // Scalar arithmetic may occur between tensor operations.
-        if (!type.hasStaticShape() || !isa<SplatOp, CastOp, AddOp, MulOp>(op)) {
+        if (!type.hasStaticShape() || !isa<SplatOp, CastOp, ReshapeOp, AddOp, MulOp>(op)) {
           finish();
           continue;
         }

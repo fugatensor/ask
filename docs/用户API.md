@@ -42,6 +42,8 @@ module attributes {ask.schema_version = 1 : i64} {
 
 支持 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 拼写为 `i1`。类型转换与广播必须显式表达；设备执行前所有形状须为具体值。`tensor<f32>` 是单元素 0-D 张量，仍通过指针传递；Host 标量 `f32` 输入按值传递。图语义、舍入与溯源规则见 [ASK IR](01-ASK-IR与数值语义.md)。
 
+形状变化使用 `ask.reshape`，例如 `"ask.reshape"(%x) {shape = array<i64: 2, 2>} : (tensor<4xi32>) -> tensor<2x2xi32>`。输入输出元素类型和总数必须一致，保持连续元素次序；目标形状中的 `-1` 须先由调用方解析。该操作属于自有图计算，外部 kernel 接收到的端口形状保持为 `2×2`。
+
 <a id="compiler-api"></a>
 
 ## 3. 编译接口
@@ -71,7 +73,7 @@ auto [cudaIR, cudaReport] = ask::codegenJSON(source, "cuda-llvm", "", 86);
 auto [unused, hostReport] = ask::codegenJSON(source, "host-object", "increment.o");
 ```
 
-各次请求使用独立 MLIR context，可以并发调用。失败抛出 `std::runtime_error`，包含原生诊断；不会启动另一条编译路径掩盖错误。完整可运行调用见 [compiler.cpp](../examples/cpp/compiler.cpp)。
+各次请求使用独立 MLIR context，可以并发调用。失败抛出 `std::runtime_error`，包含原生诊断；不会启动另一条编译路径掩盖错误。接口回归由[编译器测试](../tests/cpp/compiler.cpp)验证。
 
 <a id="execution-api"></a>
 
@@ -119,7 +121,7 @@ outputs.front()->copyToHost(result, sizeof(result));
 
 缓冲区字节数由编译报告中的具体形状与元素类型计算，不能凭裸指针猜测。输入允许共享存储；不同逻辑输出不得覆盖其它公开端口。计划明确表达的输入别名或重复输出必须绑定同一存储。所有端口检查完成后才启动 kernel。
 
-传 `graph=true` 使用 CUDA Graph replay：首次为工作区实例化 graph，后续复用时更新 kernel 的输入输出地址。拓扑、kernel、形状与启动配置固定，地址可变化。每个在途调用使用独立工作区和 graph 实例，完成后复用中间缓冲区和事件。普通顺序提交与 graph 使用同一套绑定、校验和资源保活；驱动能力不足或调用失败直接报错。可运行的双步骤 graph 示例见 [cpp-runtime/main.cpp](../examples/cpp-runtime/main.cpp)。
+传 `graph=true` 使用 CUDA Graph replay：首次为工作区实例化 graph，后续复用时更新 kernel 的输入输出地址。拓扑、kernel、形状与启动配置固定，地址可变化。每个在途调用使用独立工作区和 graph 实例，完成后复用中间缓冲区和事件。普通顺序提交与 graph 使用同一套绑定、校验和资源保活；驱动能力不足或调用失败直接报错。多步骤数值、资源寿命与 graph 复用由[运行时测试](../tests/cpp/runtime.cpp)验证。
 
 <a id="external-api"></a>
 

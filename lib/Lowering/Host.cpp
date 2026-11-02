@@ -169,8 +169,8 @@ llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
                       ? mlir::dyn_cast<mlir::RankedTensorType>(op.getResult(0).getType())
                       : mlir::RankedTensorType();
     if (!name || name.getValue().empty() || !tensor || !tensor.hasStaticShape() ||
-        !mlir::isa<SplatOp, AddOp, MulOp, CastOp>(op))
-      return error("ask.fusion_group requires a nonempty string on a static tensor splat/add/mul/cast");
+        !mlir::isa<SplatOp, AddOp, MulOp, CastOp, ReshapeOp>(op))
+      return error("ask.fusion_group requires a nonempty string on a static tensor splat/add/mul/cast/reshape");
     llvm::StringRef id = name.getValue();
     if (active != id) {
       if (!active.empty()) closedGroups.insert(active);
@@ -203,8 +203,8 @@ llvm::Error validateFunction(mlir::func::FuncOp function, bool supportsBF16) {
   for (mlir::Operation &op : function.front()) {
     if (mlir::isa<ExternalOp>(op))
       return error("host lowering cannot compile ask.external; export its DSL through the selected compiler separately");
-    if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, mlir::func::ReturnOp>(op))
-      return error("host lowering requires prepared constant/splat/add/mul/cast graphs; unsupported operation " + op.getName().getStringRef());
+    if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, ReshapeOp, mlir::func::ReturnOp>(op))
+      return error("host lowering requires prepared constant/splat/add/mul/cast/reshape graphs; unsupported operation " + op.getName().getStringRef());
     for (mlir::Type type : op.getResultTypes()) {
       if (elementType(type).isBF16() && !supportsBF16)
         return error("bf16 requires hardware support; this native CPU does not report a supported BF16 instruction feature");
@@ -378,7 +378,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
             else
               computed = llvm::ConstantFP::get(
                   context, constant->getAttrOfType<mlir::FloatAttr>("value").getValue());
-          } else if (mlir::isa<SplatOp>(producer)) {
+          } else if (mlir::isa<SplatOp, ReshapeOp>(producer)) {
             computed = emit(producer->getOperand(0));
           } else if (mlir::isa<CastOp>(producer)) {
             computed = llir::createNumericCast(builder, emit(producer->getOperand(0)),

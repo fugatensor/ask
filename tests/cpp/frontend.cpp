@@ -5,13 +5,12 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Verifier.h"
-#include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
 int main(int argc, char **argv) {
   bool optimize = argc == 2 && llvm::StringRef(argv[1]) == "--optimize";
   if (argc > 1 && !optimize) {
-    llvm::errs() << "usage: ask-frontend-example [--optimize]\n";
+    llvm::errs() << "usage: ask-core-test [--optimize]\n";
     return 1;
   }
   mlir::DialectRegistry registry;
@@ -61,7 +60,22 @@ int main(int argc, char **argv) {
                             : ask::prepareModule(*prepared, report)))
     return 1;
 
-  prepared->print(llvm::outs());
-  llvm::outs() << "\n" << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(report)));
+  if (!report.getObject("shape_snapshot") ||
+      (optimize && !report.getObject("optimization"))) {
+    llvm::errs() << "missing preparation or optimization report\n";
+    return 1;
+  }
+  if ((*module)->hasAttr("ask.ir_revision") ||
+      !(*prepared)->hasAttr("ask.ir_revision")) {
+    llvm::errs() << "preparing the clone modified the original graph\n";
+    return 1;
+  }
+  auto result = prepared->lookupSymbol<mlir::func::FuncOp>("main");
+  if (!result || result.getFunctionType() != function.getFunctionType() ||
+      mlir::failed(mlir::verify(*prepared))) {
+    llvm::errs() << "preparation changed the public function signature\n";
+    return 1;
+  }
+  llvm::outs() << "native graph preparation and report contracts passed\n";
   return 0;
 }

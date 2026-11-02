@@ -30,7 +30,7 @@ find_package(ASK CONFIG REQUIRED COMPONENTS Compiler Runtime)
 target_link_libraries(my_framework PRIVATE ASK::Compiler ASK::Runtime)
 ```
 
-## 示例与测试
+## 测试
 
 ```bash
 build/core/bin/ask-opt --capabilities
@@ -43,7 +43,7 @@ cmake --build --preset core
 ctest --preset core --output-on-failure
 ```
 
-默认 CTest 包含 `ask-core` 与 `ask-compiler`；显式启用 GPU 后增加 `ask-runtime`。独立消费示例见 [编译门面](examples/cpp/compiler.cpp)、[底层 MLIR 接口](examples/cpp/frontend.cpp)与[原生 CUDA 计划](examples/cpp-runtime/main.cpp)。
+默认 CTest 包含 `ask-core` 与 `ask-compiler`；显式启用 GPU 后增加 `ask-runtime`。断言与测试输入位于 `tests/`，SDK 独立消费验证也由该目录提供；示例代码写在[用户 API 文档](docs/用户API.md)中。测试入口与覆盖范围见[测试体系](docs/06-工程结构与测试体系.md)。
 
 Python 集成、数值矩阵、外部 worker 与 FugaTensor JIT 测试位于调用方的 [tests/backend](../fugatensor/tests/backend)。缺少工具或驱动而跳过的测试不能作为对应功能通过的证据。
 

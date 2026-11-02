@@ -86,8 +86,8 @@ llvm::Error validateFunction(mlir::func::FuncOp graph,
   for (mlir::Operation &op : graph.front()) {
     if (mlir::isa<ExternalOp>(op))
       return error("ASK-owned CUDA lowering cannot compile ask.external; provide an external executable through an execution plan");
-    if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, mlir::func::ReturnOp>(op))
-      return error("CUDA lowering requires prepared constant/splat/add/mul/cast graphs; unsupported operation " + op.getName().getStringRef());
+    if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, ReshapeOp, mlir::func::ReturnOp>(op))
+      return error("CUDA lowering requires prepared constant/splat/add/mul/cast/reshape graphs; unsupported operation " + op.getName().getStringRef());
     for (auto type : op.getResultTypes())
       if (auto failure = checkType(type)) return failure;
     if (mlir::isa<AddOp, MulOp>(op) &&
@@ -223,7 +223,7 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
           if (auto integer = constant->getAttrOfType<mlir::IntegerAttr>("value"))
             computed = llvm::ConstantInt::get(context, integer.getValue());
           else computed = llvm::ConstantFP::get(context, constant->getAttrOfType<mlir::FloatAttr>("value").getValue());
-        } else if (mlir::isa<SplatOp>(producer)) {
+        } else if (mlir::isa<SplatOp, ReshapeOp>(producer)) {
           computed = emit(producer->getOperand(0));
         } else if (mlir::isa<CastOp>(producer)) {
           computed = llir::createNumericCast(builder, emit(producer->getOperand(0)),

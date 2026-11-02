@@ -56,6 +56,17 @@ public:
   ASK_NO_MEMORY_EFFECTS
 };
 
+class ReshapeOp final
+    : public mlir::Op<ReshapeOp, mlir::OpTrait::OneOperand,
+                      mlir::OpTrait::OneResult, mlir::OpTrait::ZeroRegions,
+                      mlir::OpTrait::ZeroSuccessors,
+                      mlir::MemoryEffectOpInterface::Trait> {
+public:
+  ASK_OP_COMMON("ask.reshape");
+  ASK_SINGLE_RESULT
+  ASK_NO_MEMORY_EFFECTS
+};
+
 class AddOp final
     : public mlir::Op<AddOp, mlir::OpTrait::NOperands<2>::Impl,
                       mlir::OpTrait::OneResult, mlir::OpTrait::ZeroRegions,

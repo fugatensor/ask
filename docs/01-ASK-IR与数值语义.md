@@ -23,10 +23,19 @@
 | `ask.splat` | `func.func` 内 | 将标量按静态 `shape` 复制填充为同元素类型的张量。 |
 | `ask.add` / `ask.mul` | `func.func` 内 | 同形状、同元素类型的逐元素加/乘；不支持 `bool` 直接算术，整数采用二补数回绕（`overflow = "wrap"`）。 |
 | `ask.cast` | `func.func` 内 | 保持标量或张量形状不变，显式转换元素类型（支持全部 6×6 方向）。 |
+| `ask.reshape` | `func.func` 内 | 保持元素类型、元素总数和连续行主序次序，显式改变张量形状；支持 0-D 和空张量。 |
 | `ask.mark` | `func.func` 内 | 追踪透传标记，记录逻辑值身份（`value_id`）或端口绑定（`port_id`），在 `prepare` 提取报告后擦除。 |
 | `ask.external` | `func.func` 内 | 引用一对 `@semantics` 与 `@implementation` 符号，表示第三方编译器负责的外部算子节点。 |
 
 图内不支持 `func.call` 跨函数调用或动态控制流 region；函数输入形状在进入 `prepare` 时须为静态具体维度（非 `?`），张量总字节数不超过有符号 64 位整数上限。
+
+`ask.reshape` 用 `shape` 属性给出目标具体形状，结果类型可暂含 `?`，由 `prepare` 细化。例如将四个元素改为二维排列：
+
+```mlir
+%matrix = "ask.reshape"(%flat) {shape = array<i64: 2, 2>} : (tensor<4xf32>) -> tensor<2x2xf32>
+```
+
+`shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，用户接口见 [FugaTensor reshape](../../fugatensor/docs/API/01-张量与数据交换.md#reshape)。reshape 不做类型转换、广播或元素重排，外部 kernel 的端口保持 reshape 后的真实形状。自有降级在逐元素循环内直接复用输入值；公开输出仍遵循独立缓冲区契约，不承诺返回与输入共享存储的 view。
 
 <a id="types-and-precision"></a>
 
@@ -63,7 +72,7 @@
 `compiler.prepare(module)`（`lib/Frontend/Prepare.cpp`）依次执行以下步骤：
 
 1. **校验符号与操作 ID**：模块内显式声明的 `ask.id` 不可重复；`ask.external` 引用的 `@semantics` 和 `@implementation` 必须存在，且端口数量与元素类型一致。
-2. **推导形状快照**：检查逐元素算子的输入输出形状一致，按 `same_as`（跟随指定输入操作数形状）或 `fixed`（使用语义签名中的静态形状）确定 `ask.external` 的输出形状，在 `report["shape_snapshot"]["shape_bindings"]` 中输出张量值的形状，并记录输入特化、语义修订与快照摘要。
+2. **推导形状快照**：检查逐元素算子的输入输出形状一致、reshape 前后元素数相同，按 `same_as`（跟随指定输入操作数形状）或 `fixed`（使用语义签名中的静态形状）确定 `ask.external` 的输出形状，在 `report["shape_snapshot"]["shape_bindings"]` 中输出张量值的形状，并记录输入特化、语义修订与快照摘要。
 3. **提取并擦除 `ask.mark`**：收集 `mark_id`、`value_id`、`role`（`value` / `input` / `output`）与可选 `port_id` 到 `report["markers"]`，随后从 IR 中移除 `ask.mark` 并将原值直连下游算子。对准备后的 IR 再次运行 `--prepare`，IR 与修订计数保持不变；新的报告不再含已擦除的标记。
 
 <a id="external-declaration"></a>

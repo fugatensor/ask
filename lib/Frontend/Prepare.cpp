@@ -89,6 +89,13 @@ LogicalResult inferOperation(Operation *op, bool &changed) {
     }
     return refine(op, 0, inferred, changed);
   }
+  if (auto reshape = dyn_cast<ReshapeOp>(op)) {
+    auto input = cast<RankedTensorType>(reshape.getOperand().getType());
+    auto shape = op->getAttrOfType<DenseI64ArrayAttr>("shape");
+    if (failed(refine(op, 0, RankedTensorType::get(shape.asArrayRef(), input.getElementType()), changed)))
+      return failure();
+    return reshape.verify();
+  }
   if (isa<AddOp, MulOp>(op)) {
     Type lhs = op->getOperand(0).getType();
     Type rhs = op->getOperand(1).getType();
@@ -213,8 +220,8 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
     for (Operation &op : function.front()) {
       if (isa<func::ReturnOp>(op))
         continue;
-      if (!isa<ConstantOp, SplatOp, CastOp, AddOp, MulOp, ExternalOp, MarkOp>(op))
-        return op.emitOpError("unsupported graph operation; initial subset is constant, splat, cast, add, mul, external, and mark");
+      if (!isa<ConstantOp, SplatOp, CastOp, ReshapeOp, AddOp, MulOp, ExternalOp, MarkOp>(op))
+        return op.emitOpError("unsupported graph operation; supported subset is constant, splat, cast, reshape, add, mul, external, and mark");
       auto id = op.getAttrOfType<StringAttr>("ask.id");
       if (op.hasAttr("ask.id") && (!id || id.getValue().empty()))
         return op.emitOpError("ask.id must be a nonempty string");

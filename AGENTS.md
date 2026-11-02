@@ -6,6 +6,7 @@
 2. 第三方 SDK（`.deps/`）、构建产物（`build/`、`dist/`、`*.egg-info/`）、Python 虚拟环境（`.venv/`）和缓存不纳入 Git；保留依赖锁文件（`cmake/*.lock.json`）及获取脚本（`tools/fetch_deps.py`）。
 3. 文档使用自然直接的中文说明设计原因、模块配合与支持边界，避免空泛套话、AI 式过渡语和跨篇重复。
 4. 代码与文档保持同步：只把已落地的能力写成当前行为；修改接口、构建参数、语义规则或目录结构时，同步更新文档、示例及双向链接锚点。
+5. 用户示例写在文档中，展示合法调用；测试代码位于 `tests/`，保留行为与数值断言，不把测试入口称作示例。算子实现属于生产模块，测试直接调用公开接口。
 
 ---
 
@@ -36,7 +37,7 @@
   - 拉取依赖使用 `python3 tools/fetch_deps.py`（支持 `--only llvm`）。`CMakeLists.txt` 根据 `cmake/llvm.lock.json` 自动识别 `.deps/` 下的 LLVM/MLIR：
     - 核心构建与测试：`cmake --preset core && cmake --build --preset core && ctest --preset core --output-on-failure`
 - **测试组织**：
-  - 默认原生 CTest 为 `ask-core`、`ask-compiler`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`。
+  - 原生测试源码位于 `tests/cpp/`，默认 CTest 为 `ask-core`、`ask-compiler`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`。
   - Python 集成与通用后端测试位于 FugaTensor `tests/backend/`，第三方编译器专属测试也由调用方维护。新增数值与多精度测试优先复用调用方现有独立参考与 `plan_matrix`，避免重复实现。
   - SDK 使用 `cmake --install build/core --prefix /path/to/ask-sdk` 安装；验证独立消费 Compiler/Runtime 时不依赖 LLVM 开发 SDK，消费 Core 时使用锁定 SDK。
   - 因缺少 `ASK_OPT`、GPU 驱动或编译工具而 `skipped` 的测试不能视作功能验证通过。

@@ -3,7 +3,7 @@
 #include <array>
 #include <iostream>
 
-// Runtime-only example: no Python, LLVM SDK or local CUDA compiler is needed.
+// Runtime contract test: no Python, LLVM SDK or local CUDA compiler is needed.
 // The driver compiles this PTX when the resident kernel is first loaded.
 int main() {
   try {

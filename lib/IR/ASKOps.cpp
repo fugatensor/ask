@@ -5,6 +5,7 @@
 #include "llvm/ADT/StringSwitch.h"
 
 #include <cmath>
+#include <limits>
 
 using namespace mlir;
 
@@ -116,6 +117,46 @@ LogicalResult CastOp::verify() {
   for (StringRef name : {"rounding", "overflow", "fastmath", "fastmathFlags"})
     if ((*this)->hasAttr(name))
       return emitOpError("cast uses fixed ASK numerical rules; unsupported override: ") << name;
+  return success();
+}
+
+LogicalResult ReshapeOp::verify() {
+  auto input = dyn_cast<RankedTensorType>(getOperand().getType());
+  auto result = dyn_cast<RankedTensorType>(getResult().getType());
+  if (!input || !result || !isSupportedValueType(input) || !isSupportedValueType(result))
+    return emitOpError("requires ranked supported tensor operands/results without encoding");
+  if (input.getElementType() != result.getElementType())
+    return emitOpError("reshape preserves the element type");
+  auto shape = (*this)->getAttrOfType<DenseI64ArrayAttr>("shape");
+  if (!shape || shape.size() != result.getRank())
+    return emitOpError("requires a dense i64 'shape' matching the result rank");
+  for (auto [extent, declared] : llvm::zip(shape.asArrayRef(), result.getShape())) {
+    if (extent < 0)
+      return emitOpError("reshape requires nonnegative concrete dimensions; infer -1 before submitting IR");
+    if (!ShapedType::isDynamic(declared) && declared != extent)
+      return emitOpError("shape conflicts with the declared result type");
+  }
+  auto count = [&](llvm::ArrayRef<int64_t> dimensions) -> FailureOr<uint64_t> {
+    if (llvm::is_contained(dimensions, int64_t(0))) return uint64_t(0);
+    uint64_t elements = 1;
+    const uint64_t limit = uint64_t(std::numeric_limits<int64_t>::max()) / elementByteWidth(input);
+    for (int64_t extent : dimensions) {
+      if (uint64_t(extent) > limit / elements) {
+        emitOpError("reshape tensor byte count exceeds the signed 64-bit size range");
+        return failure();
+      }
+      elements *= uint64_t(extent);
+    }
+    return elements;
+  };
+  auto outputCount = count(shape.asArrayRef());
+  if (failed(outputCount)) return failure();
+  if (input.hasStaticShape()) {
+    auto inputCount = count(input.getShape());
+    if (failed(inputCount)) return failure();
+    if (*inputCount != *outputCount)
+      return emitOpError("reshape preserves the number of elements");
+  }
   return success();
 }
 
