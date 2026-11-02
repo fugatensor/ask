@@ -13,7 +13,7 @@ ASK 只交付 C++ SDK 与 `ask-opt`，不交付 Python 包或绑定。FugaTensor
 
 ## 构建、安装与验证
 
-默认 SDK 面向 Linux x86-64，使用 LLVM/MLIR 23.1.4 稳定发行版。构建需要 C++17、CMake 3.28+、Ninja；LLVM 与 MLIR 必须来自同一套受支持的 23.1.x SDK。[依赖记录](cmake/llvm.lock.json)固定默认下载的版本与摘要以便复现，不要求跟随 Triton 的 LLVM 提交。依赖获取脚本使用 Python 标准库，库本身不依赖 Python。
+默认 SDK 面向 Linux x86-64，使用 LLVM/MLIR 23.1.4 稳定发行版。构建需要 C++17、CMake 3.28+、Ninja；LLVM 与 MLIR 必须来自同一套受支持的 23.1.x SDK。[依赖记录](cmake/llvm.lock.json)固定默认下载的版本与摘要以便复现。ASK 构建不需要 Triton，第三方编译环境由上层框架按需配置。依赖获取脚本使用 Python 标准库，库本身不依赖 Python。
 
 ```bash
 python3 tools/fetch_deps.py
