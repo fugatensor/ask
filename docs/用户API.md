@@ -2,7 +2,7 @@
 
 返回核心思想：[构建与进程内接入](核心思想.md#ask-frontend-build) · 相关细节：[安装](安装.md) · [外部编译器接入](外部编译器适配接入规范.md) · [常驻运行时](常驻运行时与多级缓存.md)
 
-本文描述 ASK 的公开 C++ 接口。推荐接入示例是 [FugaTensor](../../fugatensor/README.md)：它提供 Tensor API、自动组图和自动微分，原生扩展直接链接这里的 Compiler 与 Runtime 共享库。Python 用法见 [FugaTensor API](../../fugatensor/docs/API/README.md)。
+ASK 的 C++ 接口分为编译器和运行时。接入示例见 [FugaTensor](../../fugatensor/README.md)，其原生扩展链接 Compiler 与 Runtime；Python 用法见 [FugaTensor API](../../fugatensor/docs/API/README.md)。
 
 <a id="api-entrypoints"></a>
 
@@ -19,13 +19,13 @@ target_link_libraries(my_framework PRIVATE ASK::Compiler ASK::Runtime)
 | 设备缓冲区、kernel、计划、CUDA Graph、事件 | `ask/Runtime/CUDA.h`，链接 `ASK::Runtime` |
 | 直接构造或变换 MLIR | `ask/Frontend/Compiler.h` 等，链接 `ASK::Core` 并准备与 ASK 实际构建版本匹配的 LLVM/MLIR SDK |
 
-Compiler 与 Runtime 的公开接口不包含 LLVM、MLIR 或 Python 类型，消费这两个组件无需安装 LLVM 开发头文件。代码生成库内部使用 LLVM；CUDA runtime 按需加载驱动。编译请求和 GPU 执行均为同进程调用。
+Compiler 与 Runtime 使用标准 C++ 类型，编译和 GPU 提交在进程内完成。代码生成库内部调用 LLVM，CUDA runtime 按需加载驱动。
 
 <a id="graph-api"></a>
 
 ## 2. 提交 ASK 图
 
-Compiler 接收高层 ASK MLIR 文本。调用方可以生成文本，也可以通过 Core 的 MLIR API 构造模块。Fuga IR 保持独立，在 FugaTensor 的边界层降级后提交。
+Compiler 接收 ASK MLIR 文本，调用方可直接生成文本，或通过 Core 的 MLIR API 构图。FugaTensor 先将 Fuga IR 降级为 ASK IR，再提交编译。
 
 下面是 `y = x + 1` 的静态图：
 
@@ -40,9 +40,9 @@ module attributes {ask.schema_version = 1 : i64} {
 }
 ```
 
-支持 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 拼写为 `i1`。类型转换与广播必须显式表达；设备执行前所有形状须为具体值。`tensor<f32>` 是单元素 0-D 张量，仍通过指针传递；Host 标量 `f32` 输入按值传递。图语义、舍入与溯源规则见 [ASK IR](ASK-IR与数值语义.md)。
+类型包括 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 写作 `i1`。类型转换用 `ask.cast`，标量填充用 `ask.splat`，执行前所有形状须确定。`tensor<f32>` 是通过指针传递的单元素 0-D 张量；Host 标量 `f32` 输入按值传递。舍入和溯源规则见 [ASK IR](ASK-IR与数值语义.md)。
 
-形状变化使用 `ask.reshape`，例如 `"ask.reshape"(%x) {shape = array<i64: 2, 2>} : (tensor<4xi32>) -> tensor<2x2xi32>`。输入输出元素类型和总数必须一致，保持连续元素次序；目标形状中的 `-1` 须先由调用方解析。该操作属于自有图计算，外部 kernel 接收到的端口形状保持为 `2×2`。
+形状变化使用 `ask.reshape`，例如 `"ask.reshape"(%x) {shape = array<i64: 2, 2>} : (tensor<4xi32>) -> tensor<2x2xi32>`。输入输出保持相同元素类型、总数和连续次序；目标形状中的 `-1` 须先由调用方解析。外部 kernel 会接收变换后的 `2×2` 端口。
 
 <a id="compiler-api"></a>
 
@@ -73,7 +73,7 @@ auto [cudaIR, cudaReport] = ask::codegenJSON(source, "cuda-llvm", "", 86);
 auto [unused, hostReport] = ask::codegenJSON(source, "host-object", "increment.o");
 ```
 
-各次请求使用独立 MLIR context，可以并发调用。失败抛出 `std::runtime_error`，包含原生诊断；不会启动另一条编译路径掩盖错误。接口回归由[编译器测试](../tests/cpp/compiler.cpp)验证。
+各请求使用独立 MLIR context，支持并发调用。失败抛出带原生诊断的 `std::runtime_error`。接口验证见[编译器测试](../tests/cpp/compiler.cpp)。
 
 <a id="execution-api"></a>
 
@@ -119,34 +119,34 @@ std::int32_t result[4];
 outputs.front()->copyToHost(result, sizeof(result));
 ```
 
-缓冲区字节数由编译报告中的具体形状与元素类型计算，不能凭裸指针猜测。输入允许共享存储；不同逻辑输出不得覆盖其它公开端口。计划明确表达的输入别名或重复输出必须绑定同一存储。所有端口检查完成后才启动 kernel。
+缓冲区字节数按编译报告中的形状和元素类型计算。输入允许共享存储；不同逻辑输出须与其它公开端口分离。计划中的输入别名和重复输出须绑定同一存储。全部端口通过检查后才启动 kernel。
 
-传 `graph=true` 使用 CUDA Graph replay：首次为工作区实例化 graph，后续复用时更新 kernel 的输入输出地址。拓扑、kernel、形状与启动配置固定，地址可变化。每个在途调用使用独立工作区和 graph 实例，完成后复用中间缓冲区和事件。普通顺序提交与 graph 使用同一套绑定、校验和资源保活；驱动能力不足或调用失败直接报错。多步骤数值、资源寿命与 graph 复用由[运行时测试](../tests/cpp/runtime.cpp)验证。
+传 `graph=true` 使用 CUDA Graph replay：首次为工作区实例化 graph，后续更新 kernel 的输入输出地址后复用。拓扑、kernel、形状和启动配置固定，地址可变化。在途调用各用独立工作区和 graph 实例，完成后复用中间缓冲区和事件。顺序提交和 graph 共用参数绑定、校验及资源管理；驱动能力不足或调用失败会报错。验证见[运行时测试](../tests/cpp/runtime.cpp)。
 
 <a id="external-api"></a>
 
 ## 5. 第三方 kernel 与外部存储
 
-ASK 不导入第三方 DSL，也不融合第三方 LLVM。调用方的薄适配器提供 cubin/PTX、入口、端口契约和启动描述，再通过 `load` 与 `prepareProgram` 接入。高层 `ask.external` 的语义声明与实现请求由编译器验证，`partitionJSON` 将每个外部节点分成独立步骤；自有区域仍可融合。
+适配器提供 cubin/PTX、入口、端口和启动配置，通过 `load` 与 `prepareProgram` 接入。编译器检查 `ask.external` 的声明，`partitionJSON` 将每个外部节点分为独立步骤，自有区域内部继续融合。
 
-worker 请求、产物 schema 与冻结标量类型见[外部适配规范](外部编译器适配接入规范.md)。worker 启动、工具链环境、磁盘缓存和图到原生程序的安装由调用方管理；FugaTensor 已提供这层编排，不要求 ASK 持有 Python 解释器。
+worker 请求、产物格式和标量类型见[外部适配规范](外部编译器适配接入规范.md)。调用方负责 worker、工具环境、磁盘缓存和原生程序准备，FugaTensor 已提供相应实现。
 
-借用外部设备指针时，调用方必须让实际存储所有者活到完成事件之后。`importBuffer` 的引用只保活 ASK 包装对象，不能替代外部框架的所有权。使用 `session->waitForExternalStream(producerStream)` 建立生产者依赖；外部框架再次访问该缓冲区前，也须等待 ASK 完成或建立等价依赖。
+借用外部设备指针时，调用方须保留实际存储所有者直到完成事件结束；`importBuffer` 仅持有 ASK 包装对象。使用 `session->waitForExternalStream(producerStream)` 等待生产者，外部框架再次访问缓冲区前也须等待 ASK 完成或建立等价依赖。
 
 <a id="artifact-api"></a>
 
 ## 6. 原始字节、资源寿命与缓存
 
-`DeviceBuffer` 提供 `pointer()`、`size()`、`readonly()`；`copyFromHost(pointer, bytes)` 与 `copyToHost(pointer, bytes)` 按原始存储字节批量复制，大小必须完全一致，主机导出地址须可写。`copyToHost()` 的无参形式返回 `std::string` 字节。复制返回前等待会话工作，不做 dtype 或字节序转换。
+`DeviceBuffer` 提供 `pointer()`、`size()`、`readonly()`；`copyFromHost(pointer, bytes)` 与 `copyToHost(pointer, bytes)` 批量复制原始字节，大小须完全一致，主机导出地址须可写。无参 `copyToHost()` 返回 `std::string` 字节。复制返回前等待会话工作。
 
-会话保留待完成事件，事件保留程序、参数缓冲区和工作区。丢弃调用方持有的程序或事件不会提前释放在途资源；已完成工作区和事件句柄可以复用，旧事件对象仍维持已完成状态。`run` 不覆盖调用方仍持有的旧结果。
+会话保留待完成事件，事件保留程序、参数缓冲区和工作区，直到设备工作结束。完成后的工作区和事件句柄可复用，旧事件对象保持已完成状态，调用方持有的旧结果继续使用原存储。
 
-编译缓存与包序列化由调用方维护，原生共享库不要求某个 Python 缓存实现。保存编译产物时应保留目标、端口与参数 ABI、启动配置及内容摘要；加载之前仍须验证完整契约。执行计划 JSON v1 见[图切分与计划](图切分与多Kernel执行计划.md#plan-v1)。
+调用方保存编译产物及其目标、端口和参数 ABI、启动配置、内容摘要，并在加载时校验。执行计划 JSON v1 见[图切分与计划](图切分与多Kernel执行计划.md#plan-v1)。
 
 <a id="errors-and-limits"></a>
 
 ## 7. 错误与边界
 
-编译 facade 抛出 `std::runtime_error`，设备层抛出 `ask::runtime::CUDAError`。失败不会静默切换计算路径。设备实际启动失败可能发生在前序步骤已经提交之后，此时运行时等待已提交工作结束再释放引用并传播错误，不提供 GPU 事务回滚。
+编译接口抛出 `std::runtime_error`，设备层抛出 `ask::runtime::CUDAError`。启动失败时，前序步骤可能已提交；运行时等待这些工作结束，再释放引用并传播错误，设备写入不回滚。
 
-当前计划为静态连续缓冲区、单 stream 的普通 kernel 调度，不表达动态形状、多 stream 或数据依赖控制流。CUDA Graph 是提交优化，不改变张量运算语义或第三方融合边界。Python 用户 API 与框架级控制流属于 FugaTensor。
+当前计划支持静态连续缓冲区和单 stream 的普通 kernel 调度；动态形状、多 stream 和数据依赖控制流不在支持范围内。FugaTensor 负责 Python API 和框架级控制流，CUDA Graph 用于减少计划提交开销。

@@ -6,14 +6,14 @@
 
 ## 1. 两个仓库的职责
 
-推荐以 [FugaTensor](../../fugatensor/README.md) 了解 ASK 的完整接入方式，用户用法见 [API](../../fugatensor/docs/API/README.md)。ASK 独立交付 C++ SDK，FugaTensor 构建时链接 `ASK::Compiler` 与 `ASK::Runtime`，并将共享库装入自己的 wheel。Python 用户 API 和原生绑定只有 FugaTensor 一份；ASK 不依赖 FugaTensor。消费这两个 SDK 组件不读取 ASK 源码或 LLVM SDK。安装方式见 [ASK 安装](安装.md#framework-install)与 [FugaTensor 安装](../../fugatensor/docs/安装.md)。
+推荐以 [FugaTensor](../../fugatensor/README.md) 作为 ASK 接入示例。它提供 [Python API](../../fugatensor/docs/API/README.md)，扩展链接 ASK C++ 库，wheel 携带编译器和运行时共享库。构建步骤见 [ASK 安装](安装.md#framework-install)和 [FugaTensor 安装](../../fugatensor/docs/安装.md)。
 
 | 关注点 | FugaTensor | ASK |
 | --- | --- | --- |
 | 用户 API 与微分 | Tensor、自动组图、`ft.fun`、前向/反向规则与求值触发。 | 静态图接口与编译执行。 |
 | 控制流与 IR | Fuga IR 表达区域和函数边界；静态展开或按需执行后提交 ASK 图。 | 单基本块、形状具体的 MLIR `ask` 图，自有计算降级到 LLVM。 |
-| 外部编译器 | 保存 DSL 源码，维护 Triton worker、依赖锁和编译选项；调用 worker、校验产物与维护磁盘缓存。 | 维护请求/产物协议，生成标准化请求，检查原生启动 ABI。 |
-| 执行 | 选择后端、管理上层 Tensor 引用与求值边界，经薄原生桥提交完整计划。 | 生成 CPU/CUDA 自有代码、切分计划、管理显存与事件、单 stream 提交和 CUDA Graph replay。 |
+| 外部编译器 | 保存源码和编译配置，运行 worker，校验并缓存产物。 | 生成编译请求，检查产物和启动参数。 |
+| 执行 | 选择后端，管理 Tensor 引用，触发求值并提交计划。 | 生成自有代码，切分计划，管理显存、事件和 CUDA Graph。 |
 | 溯源 | 输出 `fuga-to-ask.json` 映射，见 [降级到 ASK](../../fugatensor/docs/ir/降级到ASK.md)。 | 保留稳定节点/值身份，提取 `ask.mark` 并关联分区报告。 |
 
 <a id="implemented-scope"></a>
@@ -26,7 +26,7 @@
 - 外部 cubin/PTX 接入与协议 v2；调用方运行 worker，每个外部节点是独立计划步骤。
 - 原生常驻会话、设备缓冲区、整计划提交、异步事件与资源复用、CUDA Graph replay；FugaTensor 在此基础上提供 CAI 借用、磁盘缓存和可迁移多 kernel 编译包。
 
-复杂外部算法由上层实现。例如 [attention API](../../fugatensor/docs/API/attention.md) 的算法、梯度和适用条件由 FugaTensor 维护，ASK 只处理其端口、编译产物和步骤依赖。
+[attention](../../fugatensor/docs/API/attention.md) 是一个例子：FugaTensor 提供算法和反向规则，ASK 调度对应的 kernel。
 
 <a id="roadmap"></a>
 
@@ -34,11 +34,9 @@
 
 | 边界 | 当前行为 |
 | --- | --- |
-| 第三方融合 | 不合并第三方与 ASK 自有代码，也不合并多个外部 kernel；跨步骤通过显存连接。 |
+| 第三方融合 | 每个外部 kernel 独立执行，跨步骤通过显存连接。 |
 | 调度 | 静态计划、单 stream 顺序提交或 Graph replay；各未完成提交拥有独立 workspace，没有图内动态条件/循环或多 stream 并发计划。 |
 | 操作集 | 自有算子没有归约、轴广播或矩阵乘；`splat` 仅将标量填充到指定静态形状。 |
 | 外部 ABI | 静态连续张量、六种张量类型、指针与按值标量、固定普通 launch；没有非空 scratch 或描述符启动支持。 |
 | 副作用 | `ask.semantics` 只接受 `effects = "none"`，没有状态 token。 |
 | 互操作 | CAI 不承载 `bf16`，没有 DLPack 接口。 |
-
-这些是实现边界，不代表已排定的发布计划。
