@@ -14,17 +14,9 @@ concurrency:
 
 jobs:
   build:
-    name: ${{ matrix.preset }} / Python ${{ matrix.python }} / CPU
+    name: Native C++ / CPU
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - preset: core
-            python: '3.10'
-          - preset: core
-            python: '3.13'
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
       CTEST_PARALLEL_LEVEL: '1'
@@ -32,64 +24,49 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           persist-credentials: false
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
-        with:
-          python-version: ${{ matrix.python }}
-      - name: Install system build dependencies
+      - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y g++ zlib1g-dev libxml2-dev
-      - name: Install build tools
-        run: python -m pip install cmake==3.31.6 ninja==1.11.1.4 build==1.3.0 'tomli==2.3.0; python_version < "3.11"'
-      - name: Check source metadata
-        run: python tools/check_metadata.py
+          sudo apt-get install --no-install-recommends -y g++ cmake ninja-build zlib1g-dev libxml2-dev
+      - name: Check dependency tooling
+        run: python3 -m unittest discover -s tests -p test_tooling.py -v
       - name: Cache the locked LLVM archive
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: .deps/*.tar.gz
           key: ${{ runner.os }}-${{ runner.arch }}-llvm-${{ hashFiles('cmake/llvm.lock.json') }}
-      - name: Fetch and verify dependencies
-        run: python tools/fetch_deps.py
+      - name: Fetch and verify LLVM
+        run: python3 tools/fetch_deps.py
       - name: Configure and build
         run: |
-          cmake --preset "${{ matrix.preset }}" -DPython_EXECUTABLE="$(command -v python)"
-          cmake --build --preset "${{ matrix.preset }}"
-      - name: Run CPU suites and reject skipped coverage
+          cmake --preset core
+          cmake --build --preset core
+      - name: Run native CPU suites
+        run: python3 tools/run_ci_tests.py --build-dir build/core
+      - name: Install and consume the native SDK
         run: |
-          python tools/run_ci_tests.py --build-dir "build/${{ matrix.preset }}"
-      - name: Install and consume the C++ package
-        if: matrix.preset == 'core' && matrix.python == '3.13'
-        run: |
-          sdk="$(python -c 'import json, pathlib; print((pathlib.Path(".deps") / json.load(open("cmake/llvm.lock.json"))["directory"]).resolve())')"
+          sdk="$(python3 -c 'import json, pathlib; print((pathlib.Path(".deps") / json.load(open("cmake/llvm.lock.json"))["directory"]).resolve())')"
           cmake --install build/core --prefix "$RUNNER_TEMP/ask-install"
-          cmake -S examples/cpp -B "$RUNNER_TEMP/ask-consumer" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install;$sdk"
-          cmake --build "$RUNNER_TEMP/ask-consumer"
-          "$RUNNER_TEMP/ask-consumer/ask-frontend-example" --optimize
-      - name: Build sdist and then wheel from sdist
-        if: matrix.preset == 'core'
-        run: |
-          sdk="$(python -c 'import json, pathlib; print((pathlib.Path(".deps") / json.load(open("cmake/llvm.lock.json"))["directory"]).resolve())')"
-          python -m build --outdir dist \
-            -Ccmake.define.LLVM_DIR="$sdk/lib/cmake/llvm" \
-            -Ccmake.define.MLIR_DIR="$sdk/lib/cmake/mlir"
-          python tools/check_metadata.py --dist-dir dist
-      - name: Install and execute the core wheel in isolation
-        if: matrix.preset == 'core'
-        run: |
-          python -m venv "$RUNNER_TEMP/ask-wheel-env"
-          "$RUNNER_TEMP/ask-wheel-env/bin/python" -m pip install --no-deps dist/*.whl
-          "$RUNNER_TEMP/ask-wheel-env/bin/python" -I tools/smoke_wheel.py
-      - name: Keep test reports and package artifacts
+          cmake -S examples/cpp -B "$RUNNER_TEMP/ask-core-consumer" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install;$sdk"
+          cmake --build "$RUNNER_TEMP/ask-core-consumer"
+          "$RUNNER_TEMP/ask-core-consumer/ask-frontend-example" --optimize
+          cmake -S examples/cpp -B "$RUNNER_TEMP/ask-compiler-consumer" -G Ninja \
+            -DASK_EXAMPLE_CORE=OFF -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_LLVM=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_MLIR=TRUE
+          cmake --build "$RUNNER_TEMP/ask-compiler-consumer"
+          "$RUNNER_TEMP/ask-compiler-consumer/ask-compiler-example" "$RUNNER_TEMP/native.o"
+          cmake -S examples/cpp-runtime -B "$RUNNER_TEMP/ask-runtime-consumer" -G Ninja \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install" \
+            -DCMAKE_DISABLE_FIND_PACKAGE_LLVM=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_MLIR=TRUE
+          cmake --build "$RUNNER_TEMP/ask-runtime-consumer"
+      - name: Keep native test reports
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: ask-${{ matrix.preset }}-py${{ matrix.python }}
+          name: ask-native-tests
           path: |
-            build/${{ matrix.preset }}/ci-tests.xml
-            build/${{ matrix.preset }}/Testing/Temporary/LastTest.log
-            dist/*.tar.gz
-            dist/*.whl
+            build/core/ci-tests.xml
+            build/core/Testing/Temporary/LastTest.log
           if-no-files-found: ignore
           retention-days: 7

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -22,23 +21,18 @@ def check_report(path: Path, expected: set[str]) -> None:
         if (case.get("status") != "run"
                 or any(case.find(tag) is not None for tag in ("failure", "error", "skipped"))):
             raise ValueError(f"CTest suite did not pass: {name}")
-        output = case.findtext("system-out", "")
-        # CTest considers a unittest process successful even when all its tests
-        # are skipped. Do not let absent native tools or the compiler pass this gate.
-        if re.search(r"\bskipped=[1-9]\d*|\.\.\. skipped ", output):
-            raise ValueError(f"CTest suite contains skipped Python tests: {name}")
-        if name == "ask-unit" and not re.search(
-                r"^Ran [1-9]\d* tests? in .+$", output, re.MULTILINE):
-            raise ValueError(f"CTest suite did not run Python tests: {name}")
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
+    parser.add_argument("--cuda", action="store_true", help="also require the hardware CUDA runtime suite")
     args = parser.parse_args(argv)
     build_dir = args.build_dir.resolve()
     report = build_dir / "ci-tests.xml"
-    expected = {"ask-unit"}
+    expected = {"ask-core", "ask-compiler"}
+    if args.cuda:
+        expected.add("ask-runtime")
     report.unlink(missing_ok=True)
     result = subprocess.run([
         "ctest", "--test-dir", str(build_dir), "--verbose", "--no-tests=error",
@@ -52,7 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, ET.ParseError) as exc:
         print(f"CI test coverage check failed: {exc}", file=sys.stderr)
         return 1
-    print(f"Verified {len(expected)} CPU CTest suites without skipped tests; GPU execution was not requested.")
+    print(f"Verified {len(expected)} native CTest suites without skipped tests.")
     return 0
 
 

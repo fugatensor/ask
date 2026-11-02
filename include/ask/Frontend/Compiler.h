@@ -27,6 +27,23 @@ llvm::Expected<PreparedSource> prepareSource(
     llvm::StringRef source, bool optimize = false,
     const OptimizationOptions &options = {});
 
+enum class CodegenTarget { HostLLVM, HostObject, CUDALLVM };
+struct CodegenOptions {
+  CodegenTarget target = CodegenTarget::HostLLVM;
+  bool optimize = true;
+  OptimizationOptions optimization;
+  unsigned architecture = 0;
+  unsigned blockSize = 128;
+  unsigned ptxVersion = 80;
+  // Required only for HostObject. Other modes return LLVM assembly in ir.
+  std::string outputPath;
+};
+
+// Parse, prepare/optimize and lower in one context. Native callers and the CLI
+// share this entry; no Python object or companion executable is involved.
+llvm::Expected<PreparedSource> codegenSource(
+    llvm::StringRef source, const CodegenOptions &options);
+
 struct PartitionOptions {
   bool optimize = true;
   OptimizationOptions optimization;

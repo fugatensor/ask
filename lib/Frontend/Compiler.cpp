@@ -4,6 +4,7 @@
 #include "ask/IR/ASKDialect.h"
 #include "ask/IR/ASKOps.h"
 #include "ask/Lowering/Host.h"
+#include "ask/Lowering/CUDA.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/Verifier.h"
@@ -11,6 +12,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/IR/Metadata.h"
 
 namespace ask {
 namespace {
@@ -146,25 +148,26 @@ llvm::json::Object compilerCapabilities() {
       {"external_execution", true}, {"external_formats", json::Array{"cubin", "ptx"}},
       {"gpu_execution", true},
       {"cuda_lowering", true}, {"cuda_graph_codegen", true},
-      {"cuda_execution_via_python", true},
+      {"native_execution_plan", true}, {"cuda_graph_replay", true},
       {"supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
       {"explicit_cast", true}, {"mixed_precision", true},
       {"host_bf16_hardware_supported", bool(ASK_WITH_HOST) && nativeHostSupportsBF16()},
       {"host_supported_element_types", ASK_WITH_HOST ? json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"} : json::Array{}},
       {"gpu_supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
-      {"python_bindings", "nanobind"}, {"python_bindings_enabled", true},
-      {"nanobind_version", ASK_NANOBIND_VERSION}, {"python_abi", ASK_PYTHON_SOABI},
-      {"native_prepare", true}, {"native_cuda_runtime", true}, {"device_tensors", true},
+      {"compiler_interface", "c++"}, {"python_bindings_enabled", false},
+      {"native_prepare", true}, {"native_codegen", true}, {"native_cuda_runtime", true}, {"device_tensors", true},
       {"async_execution", true}, {"executable_cache", true}};
 }
 
-llvm::Expected<PreparedSource> prepareSource(llvm::StringRef source, bool optimize,
-                                           const OptimizationOptions &options) {
+namespace {
+template <typename Emit>
+llvm::Expected<PreparedSource> processSource(llvm::StringRef source, bool optimize,
+                                           const OptimizationOptions &options, Emit emit) {
   mlir::DialectRegistry registry;
   registry.insert<ASKDialect, mlir::func::FuncDialect>();
   mlir::MLIRContext context(registry);
   llvm::SourceMgr sources;
-  sources.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBufferCopy(source, "<ask-python>"), llvm::SMLoc());
+  sources.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBufferCopy(source, "<ask-source>"), llvm::SMLoc());
   std::string diagnostics;
   llvm::raw_string_ostream diagnosticStream(diagnostics);
   mlir::SourceMgrDiagnosticHandler handler(sources, &context, diagnosticStream);
@@ -177,9 +180,58 @@ llvm::Expected<PreparedSource> prepareSource(llvm::StringRef source, bool optimi
     return llvm::createStringError(llvm::inconvertibleErrorCode(), diagnostics);
   result.report["phase"] = optimize ? "optimized" : "prepared";
   result.report["external_requests"] = externalRequests(*module, &result.floatPaths);
-  llvm::raw_string_ostream stream(result.ir);
-  module->print(stream);
-  stream << '\n';
+  if (auto error = emit(*module, result)) return std::move(error);
   return result;
+}
+} // namespace
+
+llvm::Expected<PreparedSource> prepareSource(llvm::StringRef source, bool optimize,
+                                           const OptimizationOptions &options) {
+  return processSource(source, optimize, options, [](mlir::ModuleOp module, PreparedSource &result) -> llvm::Error {
+    llvm::raw_string_ostream stream(result.ir);
+    module.print(stream);
+    stream << '\n';
+    return llvm::Error::success();
+  });
+}
+
+llvm::Expected<PreparedSource> codegenSource(llvm::StringRef source,
+                                           const CodegenOptions &options) {
+  using namespace llvm;
+  if (options.target == CodegenTarget::HostObject && options.outputPath.empty())
+    return createStringError(inconvertibleErrorCode(), "host object generation requires an output path");
+  if (options.target != CodegenTarget::CUDALLVM && !ASK_WITH_HOST)
+    return createStringError(inconvertibleErrorCode(), "host code generation was disabled at build time");
+  return processSource(source, options.optimize, options.optimization,
+      [&](mlir::ModuleOp module, PreparedSource &result) -> Error {
+    LLVMContext context;
+    json::Object artifact, lowering, abi;
+    auto lowered = options.target == CodegenTarget::CUDALLVM
+        ? lowerToCUDALLVM(module, context,
+                         {options.architecture, options.blockSize, options.ptxVersion}, artifact, lowering)
+        : lowerToHostLLVM(module, context, abi);
+    if (!lowered) return lowered.takeError();
+    // Frozen tensor shapes travel with LLVM IR; pointers never reconstruct them.
+    auto snapshot = reportJSON(*result.report.get("shape_snapshot"));
+    (*lowered)->getOrInsertNamedMetadata("ask.shape_snapshot")->addOperand(
+        MDNode::get(context, MDString::get(context, snapshot)));
+    if (options.target == CodegenTarget::HostObject) {
+      if (auto error = emitHostObject(**lowered, options.outputPath)) return error;
+    } else {
+      raw_string_ostream stream(result.ir);
+      (*lowered)->print(stream, nullptr);
+    }
+    if (options.target == CodegenTarget::CUDALLVM) {
+      artifact["payload"] = result.ir;
+      artifact["shape_snapshot"] = *result.report.get("shape_snapshot");
+      result.report["cuda_artifact"] = std::move(artifact);
+      result.report["cuda_lowering"] = std::move(lowering);
+      result.report["phase"] = "cuda_llvm";
+    } else {
+      result.report["abi"] = std::move(abi);
+      result.report["phase"] = options.target == CodegenTarget::HostObject ? "host_object" : "host_llvm";
+    }
+    return Error::success();
+  });
 }
 } // namespace ask

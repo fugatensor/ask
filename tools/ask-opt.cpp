@@ -5,8 +5,6 @@
 #include "ask/IR/ASKOps.h"
 #include "ask/LLIR/Import.h"
 #include "ask/LLIR/Optimize.h"
-#include "ask/Lowering/Host.h"
-#include "ask/Lowering/CUDA.h"
 #include "ask/Transforms/Optimize.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
@@ -18,7 +16,6 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
-#include "llvm/IR/Metadata.h"
 
 using namespace llvm;
 namespace {
@@ -115,6 +112,26 @@ int main(int argc, char **argv) {
       if (auto error = writeJSON(reportPath, json::Value(std::move(report)))) return fail(toString(std::move(error)));
     return 0;
   }
+  if (emitLLVM || emitObject || emitCUDALLVM) {
+    if (emitObject && output == "-") return fail("--emit-object requires -o FILE");
+    ask::CodegenOptions options;
+    options.target = emitCUDALLVM ? ask::CodegenTarget::CUDALLVM
+        : emitObject ? ask::CodegenTarget::HostObject : ask::CodegenTarget::HostLLVM;
+    options.optimize = optimize;
+    options.optimization = {!noConstantFold, !noDCE, !noFusion};
+    options.architecture = cudaArch;
+    options.blockSize = cudaBlockSize;
+    options.ptxVersion = cudaPTXVersion;
+    if (emitObject) options.outputPath = output;
+    auto result = ask::codegenSource((*buffer)->getBuffer(), options);
+    if (!result) return fail(toString(result.takeError()));
+    if (!emitObject)
+      if (auto error = writeText(output, result->ir)) return fail(toString(std::move(error)));
+    if (!reportPath.empty())
+      if (auto error = writeJSON(reportPath, json::Value(std::move(result->report)), result->floatPaths))
+        return fail(toString(std::move(error)));
+    return 0;
+  }
   mlir::DialectRegistry registry;
   registry.insert<ask::ASKDialect, mlir::func::FuncDialect>();
   mlir::MLIRContext context(registry);
@@ -124,7 +141,7 @@ int main(int argc, char **argv) {
   if (!module || mlir::failed(mlir::verify(*module))) return 1;
   json::Object report{{"schema_version", 1}, {"phase", "verified"}};
   ask::JSONFloatPaths floatPaths;
-  if (prepare || optimize || emitLLVM || emitObject || emitCUDALLVM) {
+  if (prepare || optimize) {
     if (optimize) {
       ask::OptimizationOptions options;
       options.foldConstants = !noConstantFold;
@@ -139,53 +156,9 @@ int main(int argc, char **argv) {
   }
   std::string result;
   raw_string_ostream stream(result);
-  if (emitCUDALLVM) {
-    LLVMContext llvmContext;
-    json::Object artifact, lowering;
-    ask::CUDALoweringOptions options;
-    options.architecture = cudaArch;
-    options.blockSize = cudaBlockSize;
-    options.ptxVersion = cudaPTXVersion;
-    auto lowered = ask::lowerToCUDALLVM(*module, llvmContext, options, artifact, lowering);
-    if (!lowered) return fail(toString(lowered.takeError()));
-    std::string snapshotText;
-    raw_string_ostream snapshotStream(snapshotText);
-    snapshotStream << formatv("{0}", *report.get("shape_snapshot"));
-    (*lowered)->getOrInsertNamedMetadata("ask.shape_snapshot")->addOperand(
-        MDNode::get(llvmContext, MDString::get(llvmContext, snapshotText)));
-    (*lowered)->print(stream, nullptr);
-    artifact["payload"] = result;
-    artifact["shape_snapshot"] = *report.get("shape_snapshot");
-    report["cuda_artifact"] = std::move(artifact);
-    report["cuda_lowering"] = std::move(lowering);
-    report["phase"] = "cuda_llvm";
-  } else if (emitLLVM || emitObject) {
-    if (!ASK_WITH_HOST) return fail("host code generation was disabled at build time");
-    LLVMContext llvmContext;
-    json::Object abi;
-    auto lowered = ask::lowerToHostLLVM(*module, llvmContext, abi);
-    if (!lowered) return fail(toString(lowered.takeError()));
-    report["abi"] = std::move(abi);
-    // Frozen high-level shape information travels with the LLVM artifact.
-    // Pointers are never used to reconstruct tensor shapes.
-    std::string snapshotText;
-    raw_string_ostream snapshotStream(snapshotText);
-    snapshotStream << formatv("{0}", *report.get("shape_snapshot"));
-    (*lowered)->getOrInsertNamedMetadata("ask.shape_snapshot")->addOperand(
-        MDNode::get(llvmContext, MDString::get(llvmContext, snapshotText)));
-    report["phase"] = emitObject ? "host_object" : "host_llvm";
-    if (emitObject) {
-      if (output == "-") return fail("--emit-object requires -o FILE");
-      if (auto error = ask::emitHostObject(**lowered, output)) return fail(toString(std::move(error)));
-    } else {
-      (*lowered)->print(stream, nullptr);
-    }
-  } else {
-    module->print(stream);
-    stream << '\n';
-  }
-  if (!emitObject)
-    if (auto error = writeText(output, result)) return fail(toString(std::move(error)));
+  module->print(stream);
+  stream << '\n';
+  if (auto error = writeText(output, result)) return fail(toString(std::move(error)));
   if (!reportPath.empty())
     if (auto error = writeJSON(reportPath, json::Value(std::move(report)), floatPaths)) return fail(toString(std::move(error)));
   return 0;

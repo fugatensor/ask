@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Fetch pinned ASK build dependencies (LLVM/MLIR SDK and nanobind) into .deps.
+"""Fetch the pinned ASK LLVM/MLIR SDK into .deps.
 
-Uses only the Python standard library. By default fetches both locked dependencies
-into <repository>/.deps; pass --only llvm or --only nanobind to fetch one.
+Uses only the Python standard library. Fetches the SDK into <repository>/.deps.
 Existing directories must carry a matching receipt and required files and are
 never silently overwritten.
 """
@@ -24,7 +23,6 @@ import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
 LLVM_RECEIPT = ".ask-sdk.json"
-NANOBIND_RECEIPT = ".ask-nanobind.json"
 LLVM_REQUIRED_FILES = (
     "lib/cmake/llvm/LLVMConfig.cmake",
     "lib/cmake/mlir/MLIRConfig.cmake",
@@ -36,7 +34,6 @@ LLVM_REQUIRED_FILES = (
     "bin/mlir-tblgen",
     "bin/opt",
 )
-NANOBIND_REQUIRED_FILES = ("cmake/nanobind-config.cmake",)
 _EXTRACTALL_SUPPORTS_FILTER = "filter" in inspect.signature(tarfile.TarFile.extractall).parameters
 
 
@@ -64,12 +61,6 @@ def load_llvm_lock(path: Path | str = ROOT / "cmake" / "llvm.lock.json") -> dict
     if type(lock["unpacked_size_limit_bytes"]) is not int or lock["unpacked_size_limit_bytes"] <= 0:
         raise ValueError("invalid extraction size limit")
     return lock
-
-
-def load_nanobind_lock(path: Path | str = ROOT / "cmake" / "nanobind.lock.json") -> dict:
-    lock = json.loads(Path(path).read_text(encoding="utf-8"))
-    required = {"schema_version", "version", "directory", "url", "sha256", "size_bytes"}
-    return _validate_common_lock(lock, required, "nanobind")
 
 
 def llvm_receipt_for(lock: dict) -> dict:
@@ -204,23 +195,6 @@ def validate_llvm_sdk(path: Path, lock: dict, *, require_receipt: bool = True) -
             raise ValueError(f"existing SDK belongs to a different lock; refusing overwrite: {path}")
 
 
-def validate_nanobind(path: Path, lock: dict, *, require_receipt: bool = True) -> None:
-    if path.is_symlink() or not path.is_dir():
-        raise ValueError(f"nanobind path is not a real directory: {path}")
-    for name in NANOBIND_REQUIRED_FILES:
-        candidate = path / name
-        if not candidate.is_file() or candidate.stat().st_size == 0:
-            raise ValueError(f"existing nanobind is incomplete: missing {candidate}")
-    if require_receipt:
-        receipt_path = path / NANOBIND_RECEIPT
-        try:
-            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"existing nanobind has no valid receipt: {path}") from exc
-        if receipt != lock:
-            raise ValueError(f"existing nanobind does not match lock; refusing overwrite: {path}")
-
-
 def fetch_llvm(lock: dict, destination: Path | str) -> Path:
     destination = Path(destination).expanduser().resolve()
     destination.mkdir(parents=True, exist_ok=True)
@@ -244,34 +218,12 @@ def fetch_llvm(lock: dict, destination: Path | str) -> Path:
     return target
 
 
-def fetch_nanobind(lock: dict, destination: Path | str) -> Path:
-    destination = Path(destination).expanduser().resolve()
-    destination.mkdir(parents=True, exist_ok=True)
-    target = destination / lock["directory"]
-    if target.exists() or target.is_symlink():
-        validate_nanobind(target, lock)
-        return target
-    with tempfile.TemporaryDirectory(dir=destination, prefix=".ask-nanobind-") as temporary:
-        staging = Path(temporary)
-        archive = staging / (lock["directory"] + ".tar.gz")
-        _download_archive(archive, lock)
-        _extract_archive(archive, staging, archive_filter(lock, allow_links=False))
-        extracted = staging / lock["directory"]
-        validate_nanobind(extracted, lock, require_receipt=False)
-        (extracted / NANOBIND_RECEIPT).write_text(json.dumps(lock, indent=2) + "\n", encoding="utf-8")
-        if target.exists() or target.is_symlink():
-            raise ValueError(f"nanobind appeared during extraction; refusing overwrite: {target}")
-        extracted.rename(target)
-    return target
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, default=ROOT / ".deps")
-    parser.add_argument("--only", choices=("llvm", "nanobind"), default=None,
-                        help="fetch only one dependency instead of both")
+    parser.add_argument("--only", choices=("llvm",), default="llvm",
+                        help="fetch the pinned LLVM/MLIR SDK")
     parser.add_argument("--llvm-lock", type=Path, default=ROOT / "cmake" / "llvm.lock.json")
-    parser.add_argument("--nanobind-lock", type=Path, default=ROOT / "cmake" / "nanobind.lock.json")
     args = parser.parse_args(argv)
     try:
         if args.only in (None, "llvm"):
@@ -283,9 +235,6 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 raise ValueError("this LLVM SDK lock supports only Linux x86-64")
             print(fetch_llvm(llvm_lock, args.destination))
-        if args.only in (None, "nanobind"):
-            nanobind_lock = load_nanobind_lock(args.nanobind_lock)
-            print(fetch_nanobind(nanobind_lock, args.destination))
         return 0
     except (OSError, ValueError, tarfile.TarError) as exc:
         print(f"ASK dependency fetch failed: {exc}", file=sys.stderr)

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <limits>
 #include <mutex>
 #include <set>
@@ -17,6 +18,15 @@ namespace ask::runtime {
 namespace {
 using Handle = void *;
 using DevicePointer = std::uint64_t;
+// CUDA_KERNEL_NODE_PARAMS v1. Resolve the corresponding unversioned driver
+// entry points explicitly; newer *_v2 APIs use a different structure.
+struct KernelNodeParams {
+  Handle function = nullptr;
+  unsigned gridX = 0, gridY = 0, gridZ = 0;
+  unsigned blockX = 0, blockY = 0, blockZ = 0;
+  unsigned sharedBytes = 0;
+  void **parameters = nullptr, **extra = nullptr;
+};
 constexpr int notReady = 600;
 void require(bool condition, const std::string &message) {
   if (!condition) throw CUDAError(message);
@@ -56,6 +66,13 @@ struct Driver {
   CUDA_FUNCTION(cuEventDestroy, (Handle));
   CUDA_FUNCTION(cuLaunchKernel, (Handle, unsigned, unsigned, unsigned, unsigned, unsigned,
                                 unsigned, unsigned, Handle, void **, void **));
+  CUDA_FUNCTION(cuGraphCreate, (Handle *, unsigned));
+  CUDA_FUNCTION(cuGraphAddKernelNode, (Handle *, Handle, const Handle *, std::size_t, const KernelNodeParams *));
+  CUDA_FUNCTION(cuGraphInstantiate, (Handle *, Handle, Handle *, char *, std::size_t));
+  CUDA_FUNCTION(cuGraphExecKernelNodeSetParams, (Handle, Handle, const KernelNodeParams *));
+  CUDA_FUNCTION(cuGraphLaunch, (Handle, Handle));
+  CUDA_FUNCTION(cuGraphExecDestroy, (Handle));
+  CUDA_FUNCTION(cuGraphDestroy, (Handle));
   CUDA_FUNCTION(cuGetErrorName, (int, const char **));
   CUDA_FUNCTION(cuGetErrorString, (int, const char **));
 #undef CUDA_FUNCTION
@@ -94,9 +111,19 @@ struct Driver {
       B(cuPointerGetAttribute); V(cuMemGetAddressRange);
       B(cuEventCreate); B(cuEventRecord); B(cuEventQuery); B(cuEventSynchronize); V(cuEventDestroy);
       B(cuLaunchKernel); B(cuGetErrorName); B(cuGetErrorString);
+      // Graph support is required only when the caller explicitly enables it.
+#define G(name) name = reinterpret_cast<name##Type>(symbol(#name))
+      G(cuGraphCreate); G(cuGraphAddKernelNode); G(cuGraphExecKernelNodeSetParams);
+      G(cuGraphLaunch); G(cuGraphExecDestroy); G(cuGraphDestroy);
+      cuGraphInstantiate = reinterpret_cast<cuGraphInstantiateType>(symbol("cuGraphInstantiate_v2"));
+#undef G
 #undef B
 #undef V
     } catch (...) { unload(); throw; }
+  }
+  bool graphs() const {
+    return cuGraphCreate && cuGraphAddKernelNode && cuGraphInstantiate &&
+           cuGraphExecKernelNodeSetParams && cuGraphLaunch && cuGraphExecDestroy && cuGraphDestroy;
   }
   void unload() noexcept {
     if (!library) return;
@@ -150,20 +177,36 @@ struct SessionState {
   bool closed = false;
   std::array<unsigned,3> maxGrid{}, maxBlock{};
   unsigned maxThreads = 0;
+  std::map<std::size_t, std::vector<DevicePointer>> freeBuffers;
+  std::size_t pooledBytes = 0;
+  static constexpr std::size_t poolLimit = 64 * 1024 * 1024;
+  std::vector<Handle> freeEvents;
   std::map<std::string,std::uint64_t> counters = {
       {"context_creations",0},{"primary_context_retains",0},{"stream_creations",0},
       {"module_loads",0},{"module_hits",0},{"allocations",0},{"launches",0},
       {"synchronizations",0},{"event_waits",0},{"external_stream_waits",0},
-      {"host_to_device_copies",0},{"device_to_host_copies",0}};
+      {"host_to_device_copies",0},{"device_to_host_copies",0},
+      {"allocation_reuses",0},{"event_creations",0},{"event_reuses",0},
+      {"program_submissions",0},{"workspace_reuses",0},
+      {"graph_instantiations",0},{"graph_launches",0},{"graph_node_updates",0}};
   void checkOpen() const { require(!closed, "CUDA execution session is closed"); }
   void synchronize() {
     driver->check(driver->cuStreamSynchronize(stream), "cuStreamSynchronize");
     ++counters["synchronizations"];
   }
+  void clearPools() {
+    for (auto &[bytes, pointers] : freeBuffers)
+      for (auto pointer : pointers) driver->cuMemFree(pointer);
+    freeBuffers.clear();
+    pooledBytes = 0;
+    for (auto event : freeEvents) driver->cuEventDestroy(event);
+    freeEvents.clear();
+  }
   ~SessionState() {
     if (!context) return;
     try {
       ContextScope current(*driver, context);
+      clearPools();
       if (stream) driver->cuStreamDestroy(stream);
     } catch (...) {}
     driver->cuDevicePrimaryCtxRelease(device);
@@ -185,10 +228,21 @@ struct Kernel::Impl {
 struct Event::Impl {
   std::shared_ptr<SessionState> state;
   Handle event = nullptr;
-  bool complete = false;
+  bool complete = false, recorded = false;
   std::vector<std::shared_ptr<DeviceBuffer>> buffers;
   std::shared_ptr<Kernel> kernel;
-  void finish() { complete = true; buffers.clear(); kernel.reset(); }
+  std::shared_ptr<PreparedProgram> program;
+  std::function<void()> releaseWorkspace;
+  void finish() {
+    complete = true;
+    if (event) {
+      if (state->closed) state->driver->cuEventDestroy(event);
+      else state->freeEvents.push_back(event);
+      event = nullptr;
+    }
+    if (releaseWorkspace) { releaseWorkspace(); releaseWorkspace = {}; }
+    buffers.clear(); kernel.reset(); program.reset();
+  }
 };
 struct Session::Impl {
   std::shared_ptr<SessionState> state;
@@ -196,6 +250,31 @@ struct Session::Impl {
   // needed here. The Python package has already validated its SHA256 receipt.
   std::map<std::pair<std::string,std::string>, std::shared_ptr<Kernel>> kernels;
   std::vector<std::shared_ptr<Event>> pending;
+};
+
+struct PreparedProgram::Impl {
+  struct Workspace {
+    std::shared_ptr<SessionState> state;
+    std::vector<std::shared_ptr<DeviceBuffer>> buffers;
+    std::vector<Handle> nodes;
+    std::vector<std::vector<DevicePointer>> values;
+    Handle graph = nullptr, executable = nullptr;
+    bool busy = false;
+    ~Workspace() {
+      auto &s = *state;
+      std::lock_guard<std::recursive_mutex> lock(s.mutex);
+      try {
+        ContextScope current(*s.driver, s.context);
+        if (executable) s.driver->cuGraphExecDestroy(executable);
+        if (graph) s.driver->cuGraphDestroy(graph);
+      } catch (...) {}
+    }
+  };
+  std::weak_ptr<Session> session;
+  std::vector<std::size_t> sizes, inputs, outputs;
+  std::vector<PlanStep> steps;
+  std::vector<std::shared_ptr<Workspace>> workspaces;
+  bool graph = false;
 };
 
 Session::Session(std::unique_ptr<Impl> impl) : impl(std::move(impl)) {}
@@ -237,8 +316,20 @@ std::shared_ptr<DeviceBuffer> Session::allocate(std::size_t bytes) {
   ContextScope current(*s.driver,s.context);
   auto p=std::make_unique<DeviceBuffer::Impl>(); p->state=state; p->bytes=bytes; p->owned=true;
   // Empty tensors have no accessible elements but still own a stable allocation.
-  s.driver->check(s.driver->cuMemAlloc(&p->pointer,std::max<std::size_t>(1,bytes)),"cuMemAlloc");
-  ++s.counters["allocations"];
+  auto available=s.freeBuffers.find(bytes);
+  if(available!=s.freeBuffers.end() && !available->second.empty()) {
+    p->pointer=available->second.back();available->second.pop_back();
+    s.pooledBytes-=std::max<std::size_t>(1,bytes);++s.counters["allocation_reuses"];
+    if(available->second.empty()) s.freeBuffers.erase(available);
+  } else {
+    int status=s.driver->cuMemAlloc(&p->pointer,std::max<std::size_t>(1,bytes));
+    // Cached free blocks must not make an otherwise possible allocation fail.
+    if(status==2 && s.pooledBytes) {
+      s.clearPools();status=s.driver->cuMemAlloc(&p->pointer,std::max<std::size_t>(1,bytes));
+    }
+    s.driver->check(status,"cuMemAlloc");
+    ++s.counters["allocations"];
+  }
   return std::shared_ptr<DeviceBuffer>(new DeviceBuffer(std::move(p)));
 }
 std::shared_ptr<DeviceBuffer> Session::importBuffer(std::uint64_t pointer,std::size_t bytes,bool readonly) {
@@ -313,17 +404,33 @@ std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string
   kernel->impl->maxDynamicSharedBytes=maxDynamicShared;
   impl->kernels.emplace(std::move(key),kernel);++s.counters["module_loads"];return kernel;
 }
-std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
-    const std::vector<KernelArgument> &arguments,std::array<unsigned,3> grid,
-    std::array<unsigned,3> block,unsigned sharedBytes) {
-  auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
+void Session::validateLaunch(const std::shared_ptr<Kernel> &kernel,
+    const std::array<unsigned,3> &grid,const std::array<unsigned,3> &block,unsigned sharedBytes) const {
+  auto &s=*impl->state;
   require(kernel && kernel->impl->state==impl->state,"kernel belongs to a different CUDA execution session");
-  require(arguments.size()==kernel->impl->parameterWidths.size(),"kernel argument count differs from its ABI");
   require(sharedBytes<=kernel->impl->maxDynamicSharedBytes,"dynamic shared memory exceeds the compiled kernel configured limit");
   std::uint64_t threads=1;
   for(unsigned i=0;i<3;++i) { require(grid[i] && grid[i]<=s.maxGrid[i],"launch grid exceeds device limits");
     require(block[i] && block[i]<=s.maxBlock[i],"launch block exceeds device limits");threads*=block[i]; }
   require(threads<=s.maxThreads && threads<=kernel->impl->maxThreads,"launch thread count exceeds kernel/device limits");
+}
+std::shared_ptr<Event> Session::completion() {
+  auto &s=*impl->state;
+  auto p=std::make_unique<Event::Impl>();p->state=impl->state;
+  if(s.freeEvents.empty()) {
+    s.driver->check(s.driver->cuEventCreate(&p->event,2),"cuEventCreate");
+    ++s.counters["event_creations"];
+  } else {
+    p->event=s.freeEvents.back();s.freeEvents.pop_back();++s.counters["event_reuses"];
+  }
+  return std::shared_ptr<Event>(new Event(std::move(p)));
+}
+std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
+    const std::vector<KernelArgument> &arguments,std::array<unsigned,3> grid,
+    std::array<unsigned,3> block,unsigned sharedBytes) {
+  auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
+  validateLaunch(kernel,grid,block,sharedBytes);
+  require(arguments.size()==kernel->impl->parameterWidths.size(),"kernel argument count differs from its ABI");
   std::vector<DevicePointer> storage(arguments.size());
   std::vector<void *> parameters;
   std::vector<std::shared_ptr<DeviceBuffer>> buffers;
@@ -343,15 +450,174 @@ std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
     parameters.push_back(&storage[index]);
   }
   reap(); ContextScope current(*s.driver,s.context);auto &d=*s.driver;
-  auto p=std::make_unique<Event::Impl>();p->state=impl->state;p->buffers=buffers;p->kernel=kernel;
-  auto event=std::shared_ptr<Event>(new Event(std::move(p)));
-  d.check(d.cuEventCreate(&event->impl->event,2),"cuEventCreate");
+  auto event=completion();event->impl->buffers=std::move(buffers);event->impl->kernel=kernel;
   d.check(d.cuLaunchKernel(kernel->impl->function,grid[0],grid[1],grid[2],block[0],block[1],block[2],
                          sharedBytes,s.stream,parameters.data(),nullptr),"cuLaunchKernel");
   ++s.counters["launches"];
   int status=d.cuEventRecord(event->impl->event,s.stream);
-  if(status) { s.synchronize();d.check(status,"cuEventRecord"); }
+  if(status) {
+    // Keep unrecorded completions alive if the stream cannot be drained.
+    try { s.synchronize();event->impl->finish(); }
+    catch(...) { impl->pending.push_back(event);throw; }
+    d.check(status,"cuEventRecord");
+  }
+  event->impl->recorded=true;
   impl->pending.push_back(event);return event;
+}
+
+std::shared_ptr<PreparedProgram> Session::prepareProgram(
+    std::vector<std::size_t> sizes,std::vector<std::size_t> inputs,
+    std::vector<std::size_t> outputs,std::vector<PlanStep> steps,bool graph) {
+  auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
+  require(!graph || s.driver->graphs(),"CUDA driver does not support graph replay");
+  require(!outputs.empty(),"program must have at least one output");
+  auto index=[&](std::size_t value) { require(value<sizes.size(),"program buffer index is out of range"); };
+  std::set<std::size_t> available;
+  for(auto value:inputs) { index(value);require(available.insert(value).second,"program inputs must be unique"); }
+  for(auto value:outputs) index(value);
+  for(const auto &step:steps) {
+    validateLaunch(step.kernel,step.grid,step.block,step.sharedBytes);
+    require(step.arguments.size()==step.kernel->impl->parameterWidths.size(),"program kernel argument count differs from its ABI");
+    std::set<std::size_t> ports;
+    for(auto value:step.inputs) {
+      index(value);require(available.count(value),"program step reads a buffer before it is produced");ports.insert(value);
+    }
+    for(auto value:step.outputs) {
+      index(value);require(!available.count(value),"program step overwrites an existing logical buffer");
+      require(ports.insert(value).second,"program step repeats or aliases an output");
+    }
+    std::set<std::size_t> bound;
+    for(std::size_t i=0;i<step.arguments.size();++i) {
+      const auto &argument=step.arguments[i];auto width=step.kernel->impl->parameterWidths[i];
+      if(width) require(argument.buffer==-1 && argument.scalar.size()==width,"program scalar argument differs from its ABI");
+      else {
+        require(argument.scalar.empty() && argument.buffer>=-1,"program pointer argument differs from its ABI");
+        if(argument.buffer>=0) {
+          index(argument.buffer);require(ports.count(argument.buffer),"program argument is not a step port");
+          bound.insert(argument.buffer);
+        }
+      }
+    }
+    require(bound==ports,"program step port is not bound to a kernel parameter");
+    available.insert(step.outputs.begin(),step.outputs.end());
+  }
+  for(auto value:outputs) require(available.count(value),"program output is never produced");
+  require(available.size()==sizes.size(),"program contains an undefined buffer");
+  auto p=std::make_unique<PreparedProgram::Impl>();p->session=shared_from_this();
+  p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
+  p->steps=std::move(steps);p->graph=graph;
+  return std::shared_ptr<PreparedProgram>(new PreparedProgram(std::move(p)));
+}
+
+PreparedProgram::PreparedProgram(std::unique_ptr<Impl> impl):impl(std::move(impl)){}
+PreparedProgram::~PreparedProgram()=default;
+std::shared_ptr<Event> PreparedProgram::submit(
+    const std::vector<std::shared_ptr<DeviceBuffer>> &inputs,
+    const std::vector<std::shared_ptr<DeviceBuffer>> &outputs) {
+  auto session=impl->session.lock();require(bool(session),"program execution session no longer exists");
+  auto &s=*session->impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
+  require(inputs.size()==impl->inputs.size() && outputs.size()==impl->outputs.size(),"program input/output count differs from its contract");
+  std::vector<std::shared_ptr<DeviceBuffer>> bound(impl->sizes.size());
+  auto bind=[&](std::size_t index,const std::shared_ptr<DeviceBuffer> &buffer,bool output) {
+    require(buffer && buffer->impl->state==session->impl->state,"program tensor belongs to a different CUDA execution session");
+    require(buffer->size()==impl->sizes[index],"program tensor byte count differs from its compiled type");
+    bool input=std::find(impl->inputs.begin(),impl->inputs.end(),index)!=impl->inputs.end();
+    require(!output || input || !buffer->readonly(),"program output tensor is read-only");
+    require(!bound[index] || bound[index]->pointer()==buffer->pointer(),"repeated logical buffers must use the same device storage");
+    bound[index]=buffer;
+  };
+  for(std::size_t i=0;i<inputs.size();++i) bind(impl->inputs[i],inputs[i],false);
+  for(std::size_t i=0;i<outputs.size();++i) bind(impl->outputs[i],outputs[i],true);
+  for(auto index:impl->outputs) {
+    if(std::find(impl->inputs.begin(),impl->inputs.end(),index)!=impl->inputs.end()) continue;
+    const auto &output=bound[index];
+    for(std::size_t other=0;other<bound.size();++other) {
+      if(other==index || !bound[other]) continue;
+      const auto &buffer=bound[other];
+      require(!output->size() || !buffer->size() || output->pointer()+output->size()<=buffer->pointer() ||
+              buffer->pointer()+buffer->size()<=output->pointer(),"distinct program output buffers must not overlap other ports");
+    }
+  }
+  session->reap();
+  std::shared_ptr<Impl::Workspace> workspace;
+  for(const auto &candidate:impl->workspaces) if(!candidate->busy) { workspace=candidate;break; }
+  if(workspace) ++s.counters["workspace_reuses"];
+  else {
+    workspace=std::make_shared<Impl::Workspace>();workspace->state=session->impl->state;
+    workspace->buffers.resize(bound.size());
+    for(std::size_t i=0;i<bound.size();++i) if(!bound[i]) workspace->buffers[i]=session->allocate(impl->sizes[i]);
+    impl->workspaces.push_back(workspace);
+  }
+  for(std::size_t i=0;i<bound.size();++i) if(!bound[i]) bound[i]=workspace->buffers[i];
+  // All storage and argument vectors are prepared before the first launch.
+  std::vector<std::vector<DevicePointer>> values(impl->steps.size());
+  std::vector<std::vector<void *>> parameters(impl->steps.size());
+  std::vector<KernelNodeParams> nodes(impl->steps.size());
+  for(std::size_t i=0;i<impl->steps.size();++i) {
+    const auto &step=impl->steps[i];values[i].resize(step.arguments.size());parameters[i].resize(step.arguments.size());
+    for(std::size_t j=0;j<step.arguments.size();++j) {
+      const auto &argument=step.arguments[j];
+      if(!argument.scalar.empty()) std::memcpy(&values[i][j],argument.scalar.data(),argument.scalar.size());
+      else values[i][j]=argument.buffer<0 ? 0 : bound[argument.buffer]->pointer();
+      parameters[i][j]=&values[i][j];
+    }
+    nodes[i]={step.kernel->impl->function,step.grid[0],step.grid[1],step.grid[2],
+              step.block[0],step.block[1],step.block[2],step.sharedBytes,parameters[i].data(),nullptr};
+  }
+  ContextScope current(*s.driver,s.context);auto &d=*s.driver;
+  if(impl->graph && !nodes.empty()) {
+    if(!workspace->executable) {
+      // Retain a partially constructed graph only within this attempt.
+      if(workspace->graph) { d.cuGraphDestroy(workspace->graph);workspace->graph=nullptr;workspace->nodes.clear(); }
+      d.check(d.cuGraphCreate(&workspace->graph,0),"cuGraphCreate");
+      for(const auto &node:nodes) {
+        Handle next=nullptr;
+        d.check(d.cuGraphAddKernelNode(&next,workspace->graph,
+            workspace->nodes.empty()?nullptr:&workspace->nodes.back(),workspace->nodes.empty()?0:1,&node),"cuGraphAddKernelNode");
+        workspace->nodes.push_back(next);
+      }
+      d.check(d.cuGraphInstantiate(&workspace->executable,workspace->graph,nullptr,nullptr,0),"cuGraphInstantiate");
+      workspace->values=values;
+      ++s.counters["graph_instantiations"];
+    } else for(std::size_t i=0;i<nodes.size();++i) if(workspace->values[i]!=values[i]) {
+      d.check(d.cuGraphExecKernelNodeSetParams(workspace->executable,workspace->nodes[i],&nodes[i]),"cuGraphExecKernelNodeSetParams");
+      workspace->values[i]=values[i];++s.counters["graph_node_updates"];
+    }
+  }
+  auto event=session->completion();event->impl->buffers=bound;event->impl->program=shared_from_this();
+  workspace->busy=true;event->impl->releaseWorkspace=[workspace]{workspace->busy=false;};
+  try {
+    if(impl->graph && !nodes.empty()) {
+      d.check(d.cuGraphLaunch(workspace->executable,s.stream),"cuGraphLaunch");++s.counters["graph_launches"];
+      s.counters["launches"]+=nodes.size();
+    } else for(const auto &node:nodes) {
+      d.check(d.cuLaunchKernel(node.function,node.gridX,node.gridY,node.gridZ,node.blockX,node.blockY,node.blockZ,
+                              node.sharedBytes,s.stream,node.parameters,nullptr),"cuLaunchKernel");
+      ++s.counters["launches"];
+    }
+    d.check(d.cuEventRecord(event->impl->event,s.stream),"cuEventRecord");
+    event->impl->recorded=true;
+  } catch(...) {
+    // A later launch can fail after preceding steps were queued. Retain every
+    // argument and intermediate until that partial submission has completed.
+    try { s.synchronize();event->impl->finish(); }
+    catch(...) { session->impl->pending.push_back(event);throw; }
+    throw;
+  }
+  ++s.counters["program_submissions"];session->impl->pending.push_back(event);return event;
+}
+std::pair<std::vector<std::shared_ptr<DeviceBuffer>>,std::shared_ptr<Event>> PreparedProgram::run(
+    const std::vector<std::shared_ptr<DeviceBuffer>> &inputs) {
+  auto session=impl->session.lock();require(bool(session),"program execution session no longer exists");
+  auto &s=*session->impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
+  require(inputs.size()==impl->inputs.size(),"program input count differs from its contract");
+  std::vector<std::shared_ptr<DeviceBuffer>> bound(impl->sizes.size()),outputs;
+  for(std::size_t i=0;i<inputs.size();++i) bound[impl->inputs[i]]=inputs[i];
+  for(auto index:impl->outputs) {
+    if(!bound[index]) bound[index]=session->allocate(impl->sizes[index]);
+    outputs.push_back(bound[index]);
+  }
+  auto event=submit(inputs,outputs);return {std::move(outputs),std::move(event)};
 }
 void Session::waitForExternalStream(std::uint64_t stream) {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
@@ -379,10 +645,13 @@ void Session::close() {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);if(s.closed)return;
   ContextScope current(*s.driver,s.context);std::exception_ptr failure;
   try { s.synchronize(); } catch (...) { failure=std::current_exception(); }
-  if(!failure) reap();
-  s.closed=true;impl->pending.clear();impl->kernels.clear();
-  if(s.stream) { s.driver->cuStreamDestroy(s.stream);s.stream=nullptr; }
+  // A failed drain is not proof of completion. Leave resources owned by the
+  // session so an explicit caller may retry close rather than recycling them.
   if(failure)std::rethrow_exception(failure);
+  reap();
+  s.closed=true;impl->pending.clear();impl->kernels.clear();
+  s.clearPools();
+  if(s.stream) { s.driver->cuStreamDestroy(s.stream);s.stream=nullptr; }
 }
 bool Session::closed() const { auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);return s.closed; }
 std::uint64_t Session::stream() const { auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();return reinterpret_cast<std::uintptr_t>(s.stream); }
@@ -391,13 +660,20 @@ std::array<int,2> Session::capability() const {return {impl->state->major,impl->
 std::string Session::deviceName() const {return impl->state->name;}
 std::map<std::string,std::uint64_t> Session::stats() const {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);auto result=s.counters;
-  result["pending_events"]=impl->pending.size();result["resident_modules"]=impl->kernels.size();return result;
+  result["pending_events"]=impl->pending.size();result["resident_modules"]=impl->kernels.size();
+  result["pooled_bytes"]=s.pooledBytes;result["pooled_events"]=s.freeEvents.size();return result;
 }
 DeviceBuffer::DeviceBuffer(std::unique_ptr<Impl> impl):impl(std::move(impl)){}
 DeviceBuffer::~DeviceBuffer(){
   if(!impl->owned || !impl->pointer)return;auto &s=*impl->state;
   std::lock_guard<std::recursive_mutex> lock(s.mutex);
-  try{ContextScope current(*s.driver,s.context);s.driver->cuMemFree(impl->pointer);}catch(...){}
+  try{
+    ContextScope current(*s.driver,s.context);
+    auto bytes=std::max<std::size_t>(1,impl->bytes);
+    if(!s.closed && bytes<=SessionState::poolLimit-s.pooledBytes) {
+      s.freeBuffers[impl->bytes].push_back(impl->pointer);s.pooledBytes+=bytes;
+    } else s.driver->cuMemFree(impl->pointer);
+  }catch(...){}
 }
 std::uint64_t DeviceBuffer::pointer()const{return impl->pointer;}
 std::size_t DeviceBuffer::size()const{return impl->bytes;}
@@ -411,11 +687,15 @@ void DeviceBuffer::copyFromHost(const void *data,std::size_t bytes){
   s.synchronize();++s.counters["host_to_device_copies"];
 }
 std::string DeviceBuffer::copyToHost()const{
+  std::string output(impl->bytes,'\0');copyToHost(output.data(),output.size());return output;
+}
+void DeviceBuffer::copyToHost(void *data,std::size_t bytes)const{
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
-  if(!impl->bytes)return {};ContextScope current(*s.driver,s.context);HostStorage staging(*s.driver,impl->bytes);
+  require(bytes==impl->bytes,"host byte count must equal device buffer size");
+  if(!impl->bytes)return;ContextScope current(*s.driver,s.context);HostStorage staging(*s.driver,impl->bytes);
   s.driver->check(s.driver->cuMemcpyDtoHAsync(staging.pointer,impl->pointer,impl->bytes,s.stream),"cuMemcpyDtoHAsync");
   s.synchronize();++s.counters["device_to_host_copies"];
-  return std::string(static_cast<const char *>(staging.pointer),impl->bytes);
+  std::memcpy(data,staging.pointer,impl->bytes);
 }
 Kernel::Kernel(std::unique_ptr<Impl> impl):impl(std::move(impl)){}
 Kernel::~Kernel(){if(!impl->module)return;auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);
@@ -423,17 +703,28 @@ Kernel::~Kernel(){if(!impl->module)return;auto &s=*impl->state;std::lock_guard<s
 std::string Kernel::entry()const{return impl->name;}
 unsigned Kernel::maxThreads()const{return impl->maxThreads;}
 Event::Event(std::unique_ptr<Impl> impl):impl(std::move(impl)){}
-Event::~Event(){if(!impl->event)return;try{wait();}catch(...){}
-  auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);
-  try{ContextScope current(*s.driver,s.context);s.driver->cuEventDestroy(impl->event);}catch(...){} }
+Event::~Event(){
+  if(impl->complete)return;
+  try { wait(); }
+  catch(...) {
+    // Destruction after an unrecoverable driver error cannot prove completion.
+    // Quarantine the remaining native resources instead of freeing storage
+    // still referenced by queued GPU work. Explicit wait/close reports errors.
+    (void)impl.release();
+  }
+}
 bool Event::query(){
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);if(impl->complete)return true;
-  ContextScope current(*s.driver,s.context);int status=s.driver->cuEventQuery(impl->event);
+  ContextScope current(*s.driver,s.context);
+  if(!impl->recorded) { s.synchronize();impl->finish();return true; }
+  int status=s.driver->cuEventQuery(impl->event);
   if(status==notReady)return false;s.driver->check(status,"cuEventQuery");impl->finish();return true;
 }
 void Event::wait(){
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);if(impl->complete)return;
-  ContextScope current(*s.driver,s.context);s.driver->check(s.driver->cuEventSynchronize(impl->event),"cuEventSynchronize");
+  ContextScope current(*s.driver,s.context);
+  if(impl->recorded) s.driver->check(s.driver->cuEventSynchronize(impl->event),"cuEventSynchronize");
+  else s.synchronize();
   ++s.counters["event_waits"];impl->finish();
 }
 } // namespace ask::runtime

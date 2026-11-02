@@ -1,11 +1,9 @@
-# Read the same literal as the Python package and scikit-build-core metadata.
-get_filename_component(_ask_version_file "${CMAKE_CURRENT_LIST_DIR}/../python/ask/_version.py" ABSOLUTE)
+# One native release version, shared by installed libraries and capabilities.
+get_filename_component(_ask_version_file "${CMAKE_CURRENT_LIST_DIR}/../VERSION" ABSOLUTE)
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${_ask_version_file}")
-file(STRINGS "${_ask_version_file}" _ask_version_line REGEX "^__version__ = ")
-if(NOT _ask_version_line MATCHES "^__version__ = \"([0-9]+\\.[0-9]+\\.[0-9]+)\"$")
-  message(FATAL_ERROR "python/ask/_version.py must define a single major.minor.patch release version")
+file(READ "${_ask_version_file}" _ask_version_line)
+string(STRIP "${_ask_version_line}" _ask_version_line)
+if(NOT _ask_version_line MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)$")
+  message(FATAL_ERROR "VERSION must contain a major.minor.patch release version")
 endif()
 set(ASK_VERSION "${CMAKE_MATCH_1}")
-if(DEFINED SKBUILD_PROJECT_VERSION AND NOT SKBUILD_PROJECT_VERSION STREQUAL ASK_VERSION)
-  message(FATAL_ERROR "Python package version ${SKBUILD_PROJECT_VERSION} differs from ASK ${ASK_VERSION}")
-endif()
