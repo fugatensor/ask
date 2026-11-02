@@ -5,6 +5,7 @@ ASK 接收静态张量图，编译自有 CPU/CUDA 计算，并调度调用方提
 | 文档 | 内容 | 对应实现 |
 | --- | --- | --- |
 | [独立安装](安装.md) | wheel、源码构建、独立 CUDA 工具和调用方 worker | `pyproject.toml`、`tools/fetch_deps.py` |
+| [用户 API](用户API.md) | Python 构图、编译、会话执行、外部标量/多输出和产物保存 | `python/ask/` |
 | [核心思想](核心思想.md) | 框架分工、IR 边界和执行流程 | 全局架构 |
 | [01. ASK IR 与数值语义](01-ASK-IR与数值语义.md) | 显式类型、RNE、cast、形状与外部声明 | `lib/IR/`、`lib/Frontend/Prepare.cpp` |
 | [02. 前端接入与构建配置](02-前端接入与构建配置.md) | core 构建、Python/C++/CLI、版本与分发 | `CMakeLists.txt`、`bindings/`、`python/ask/compiler.py` |
