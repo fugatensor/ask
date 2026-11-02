@@ -19,6 +19,12 @@ class Kernel;
 class Event;
 struct SessionState;
 
+struct KernelArgument {
+  std::shared_ptr<DeviceBuffer> buffer;
+  // Empty scalar storage denotes a buffer (including a null device pointer).
+  std::string scalar;
+};
+
 // The primary context is retained, never reset. Each session owns one
 // nonblocking stream; every driver operation pushes/pops its thread's context.
 class Session {
@@ -32,9 +38,9 @@ public:
                                             bool readonly = false);
   std::shared_ptr<Kernel> load(const std::string &cubin, const std::string &entry,
                                const std::vector<std::string> &requiredTypes,
-                               int arch, unsigned expectedParameters);
+                               int arch, const std::vector<unsigned> &parameterWidths);
   std::shared_ptr<Event> submit(const std::shared_ptr<Kernel> &kernel,
-      const std::vector<std::shared_ptr<DeviceBuffer>> &buffers,
+      const std::vector<KernelArgument> &arguments,
       std::array<unsigned, 3> grid, std::array<unsigned, 3> block,
       unsigned sharedBytes = 0);
   // CUDA Array Interface stream values 1/2 mean legacy/per-thread default.

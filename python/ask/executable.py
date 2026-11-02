@@ -5,6 +5,7 @@ import copy
 import ctypes
 import math
 
+from ._abi import parameter_types, scalar_bytes
 from .cuda import (_kernel_contract, _validated_image,
                    _required_types, _require, _storage_dtype, _STORAGE_TYPES)
 
@@ -34,9 +35,11 @@ class PreparedCUDAKernel:
         self._session = session
         self._inputs, self._outputs = inputs, outputs
         self._invocation = invocation
+        self._scalars = {argument["argument"]: scalar_bytes(argument["type"], argument["value"])
+                         for argument in invocation["arguments"] if argument.get("kind") == "scalar"}
         self._kernel = session.load(binary, entry, arch=arch,
                                     required_types=sorted(_required_types(artifact, dtype)),
-                                    expected_parameters=len(invocation["arguments"]))
+                                    parameter_types=parameter_types(invocation))
 
     @property
     def shape(self):
@@ -92,7 +95,8 @@ class PreparedCUDAKernel:
                          or other.data_ptr + other.nbytes <= output.data_ptr
                          or output.data_ptr + output.nbytes <= other.data_ptr,
                          "compiled graph requires non-overlapping input/output and output/output buffers")
-        return [bindings[argument["binding"]] if argument["binding"] != "null" else None
+        return [self._scalars[argument["argument"]] if argument.get("kind") == "scalar" else
+                (bindings[argument["binding"]] if argument["binding"] != "null" else None)
                 for argument in self._invocation["arguments"]]
 
     def _submit(self, parameters):

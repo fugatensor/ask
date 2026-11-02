@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 
 from .cache import IRCache
+from ._abi import parameter_layout, parameter_types, scalar_bytes
 from .numerics import decode_float, encode_float, round_float
 
 
@@ -48,7 +49,7 @@ def _artifact_digest(artifact):
 def _kernel_contract(artifact):
     """Validate the compiler-independent CUDA invocation schema (version 2).
 
-    A producer adapter supplies concrete port shapes, pointer bindings, launch
+    A producer adapter supplies concrete port shapes, argument bindings, launch
     dimensions and backend options. The runner does not reconstruct these from
     a producer's DSL constants, scheduling metadata or private proof records.
     """
@@ -80,14 +81,21 @@ def _kernel_contract(artifact):
              "CUDA shared_bytes must be a nonnegative 32-bit integer")
     arguments = invocation.get("arguments")
     _require(isinstance(arguments, list) and 0 < len(arguments) <= 64,
-             "CUDA pointer ABI requires between 1 and 64 declared arguments")
+             "CUDA ABI requires between 1 and 64 declared arguments")
     bindings = {}
     for index, argument in enumerate(arguments):
         _require(isinstance(argument, dict) and type(argument.get("argument")) is int
-                 and argument["argument"] == index
-                 and (argument.get("llvm_type") in ("ptr", "ptr addrspace(1)") if format_ == "llvm-ir"
-                      else argument.get("kind") == "pointer"),
-                 "invalid CUDA pointer argument mapping")
+                 and argument["argument"] == index, "invalid CUDA argument index")
+        if argument.get("kind") == "scalar":
+            _require(format_ != "llvm-ir" and set(argument) == {"argument", "kind", "type", "value"},
+                     "scalar argument requires type and value")
+            try:
+                scalar_bytes(argument["type"], argument["value"])
+            except ValueError as error:
+                raise CUDAError(str(error)) from error
+            continue
+        _require(argument.get("llvm_type") in ("ptr", "ptr addrspace(1)") if format_ == "llvm-ir"
+                 else argument.get("kind") == "pointer", "invalid CUDA pointer argument mapping")
         binding = argument.get("binding")
         _require(isinstance(binding, str) and (binding == "null" or
                  re.fullmatch(r"(?:input|output):(?:0|[1-9][0-9]*)", binding)),
@@ -97,7 +105,7 @@ def _kernel_contract(artifact):
             bindings[binding] = index
     ports = artifact.get("port_map")
     _require(isinstance(ports, list) and len(ports) == len(bindings),
-             "each non-null argument requires one typed logical port")
+             "each non-null pointer argument requires one typed logical port")
     logical_ports = {}
     for port in ports:
         _require(isinstance(port, dict), "logical ports must be objects")
@@ -542,14 +550,13 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
         driver.call("cuModuleLoadDataEx", ctypes.byref(module), image, 0, None, None)
         function = ctypes.c_void_p()
         driver.call("cuModuleGetFunction", ctypes.byref(function), module, entry.encode("ascii"))
-        parameter_layout = []
+        layout = parameter_layout(parameter_types(invocation))
         parameter_count = len(invocation["arguments"])
-        for index in range(parameter_count):
+        for index, expected in enumerate(layout):
             offset, width = ctypes.c_size_t(), ctypes.c_size_t()
             driver.call("cuFuncGetParamInfo", function, index, ctypes.byref(offset), ctypes.byref(width))
-            _require(offset.value == index * 8 and width.value == 8,
-                     "compiled kernel parameter layout differs from the declared pointer ABI")
-            parameter_layout.append({"offset": offset.value, "size": width.value})
+            _require(offset.value == expected["offset"] and width.value == expected["size"],
+                     "compiled kernel parameter layout differs from the declared ABI")
         extra_offset, extra_width = ctypes.c_size_t(), ctypes.c_size_t()
         status = driver.library.cuFuncGetParamInfo(function, parameter_count, ctypes.byref(extra_offset),
                                                   ctypes.byref(extra_width))
@@ -566,7 +573,9 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
         driver.call("cuMemcpyHtoD_v2", allocations[0], host_input, ctypes.sizeof(host_input))
         driver.call("cuMemcpyHtoD_v2", allocations[1], host_output, ctypes.sizeof(host_output))
         bindings = {"input:0": allocations[0], "output:0": allocations[1]}
-        parameters = [bindings[argument["binding"]] if argument["binding"] != "null" else ctypes.c_uint64(0)
+        parameters = [ctypes.create_string_buffer(scalar_bytes(argument["type"], argument["value"]))
+                      if argument.get("kind") == "scalar" else
+                      (bindings[argument["binding"]] if argument["binding"] != "null" else ctypes.c_uint64(0))
                       for argument in invocation["arguments"]]
         addresses = (ctypes.c_void_p * parameter_count)(*[ctypes.cast(ctypes.byref(value), ctypes.c_void_p)
                                          for value in parameters])
@@ -577,7 +586,7 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
                 "device": {"ordinal": device_ordinal, "name": name.value.decode(),
                            "compute_capability": [major, minor], "driver_version": driver_version.value},
                 "grid": grid, "block": invocation["block"],
-                "parameter_layout": parameter_layout, "registers_per_thread": registers,
+                "parameter_layout": layout, "registers_per_thread": registers,
                 "code_sha256": _digest(binary),
                 **({"llvm_sha256": codegen["llvm_sha256"], "cubin_sha256": codegen["cubin_sha256"]}
                    if artifact["format"] == "llvm-ir" else {artifact["format"] + "_sha256": _digest(binary)}),

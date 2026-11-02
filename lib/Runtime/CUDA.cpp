@@ -179,7 +179,8 @@ struct Kernel::Impl {
   std::shared_ptr<SessionState> state;
   Handle module = nullptr, function = nullptr;
   std::string name;
-  unsigned parameters = 0, maxThreads = 0, maxDynamicSharedBytes = 0;
+  std::vector<unsigned> parameterWidths;
+  unsigned maxThreads = 0, maxDynamicSharedBytes = 0;
 };
 struct Event::Impl {
   std::shared_ptr<SessionState> state;
@@ -265,7 +266,7 @@ std::shared_ptr<DeviceBuffer> Session::importBuffer(std::uint64_t pointer,std::s
   return std::shared_ptr<DeviceBuffer>(new DeviceBuffer(std::move(p)));
 }
 std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string &entry,
-    const std::vector<std::string> &requiredTypes,int arch,unsigned parameters) {
+    const std::vector<std::string> &requiredTypes,int arch,const std::vector<unsigned> &parameterWidths) {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();checkTypes(requiredTypes);
   const bool ptx=cubin.compare(0,4,"\x7f" "ELF")!=0;
   require(arch>=10 && (ptx ? s.major*10+s.minor>=arch : s.major==arch/10 && s.minor>=arch%10),
@@ -273,15 +274,18 @@ std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string
   require(ptx ? cubin.find('\0')==std::string::npos && cubin.find(".version")!=std::string::npos
               : cubin.size()>=64,"runtime load requires a CUDA cubin ELF image or PTX text");
   require(!cubin.empty() && !entry.empty() && entry.find('\0')==std::string::npos,"kernel binary and entry must be nonempty");
+  const auto parameters=parameterWidths.size();
   require(parameters>0 && parameters<=64,"unsupported kernel parameter count");
+  for(auto width:parameterWidths)
+    require(width==0 || width==1 || width==2 || width==4 || width==8,"unsupported kernel parameter width");
   auto key=std::make_pair(cubin,entry);
   auto existing=impl->kernels.find(key);
   if (existing!=impl->kernels.end()) {
-    require(existing->second->impl->parameters==parameters,"cached kernel parameter contract differs");
+    require(existing->second->impl->parameterWidths==parameterWidths,"cached kernel parameter contract differs");
     ++s.counters["module_hits"];return existing->second;
   }
   ContextScope current(*s.driver,s.context);auto &d=*s.driver;
-  auto p=std::make_unique<Kernel::Impl>();p->state=impl->state;p->name=entry;p->parameters=parameters;
+  auto p=std::make_unique<Kernel::Impl>();p->state=impl->state;p->name=entry;p->parameterWidths=parameterWidths;
   auto kernel=std::shared_ptr<Kernel>(new Kernel(std::move(p)));
   // PTX is a NUL-terminated driver input. Keep the stored/hashable source exact.
   std::string image=cubin;
@@ -289,9 +293,13 @@ std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string
   d.check(d.cuModuleLoadDataEx(&kernel->impl->module,image.data(),0,nullptr,nullptr),"cuModuleLoadDataEx");
   d.check(d.cuModuleGetFunction(&kernel->impl->function,kernel->impl->module,entry.c_str()),"cuModuleGetFunction");
   auto function=kernel->impl->function;
+  std::size_t expectedOffset=0;
   for (unsigned i=0;i<parameters;++i) { std::size_t offset=0,size=0;
+    const std::size_t width=parameterWidths[i] ? parameterWidths[i] : sizeof(DevicePointer);
+    expectedOffset=(expectedOffset+width-1)/width*width;
     d.check(d.cuFuncGetParamInfo(function,i,&offset,&size),"cuFuncGetParamInfo");
-    require(offset==i*sizeof(DevicePointer) && size==sizeof(DevicePointer),"kernel ABI requires consecutive 64-bit pointer parameters"); }
+    require(offset==expectedOffset && size==width,"kernel parameter layout differs from the declared ABI");
+    expectedOffset+=width; }
   std::size_t offset=0,size=0;
   require(d.cuFuncGetParamInfo(function,parameters,&offset,&size)==1,"kernel parameter count differs from the declared ABI");
   int maxDynamicShared=0,maxThreads=0;
@@ -306,22 +314,34 @@ std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string
   impl->kernels.emplace(std::move(key),kernel);++s.counters["module_loads"];return kernel;
 }
 std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
-    const std::vector<std::shared_ptr<DeviceBuffer>> &buffers,std::array<unsigned,3> grid,
+    const std::vector<KernelArgument> &arguments,std::array<unsigned,3> grid,
     std::array<unsigned,3> block,unsigned sharedBytes) {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   require(kernel && kernel->impl->state==impl->state,"kernel belongs to a different CUDA execution session");
-  require(buffers.size()==kernel->impl->parameters,"kernel argument count differs from its ABI");
+  require(arguments.size()==kernel->impl->parameterWidths.size(),"kernel argument count differs from its ABI");
   require(sharedBytes<=kernel->impl->maxDynamicSharedBytes,"dynamic shared memory exceeds the compiled kernel configured limit");
   std::uint64_t threads=1;
   for(unsigned i=0;i<3;++i) { require(grid[i] && grid[i]<=s.maxGrid[i],"launch grid exceeds device limits");
     require(block[i] && block[i]<=s.maxBlock[i],"launch block exceeds device limits");threads*=block[i]; }
   require(threads<=s.maxThreads && threads<=kernel->impl->maxThreads,"launch thread count exceeds kernel/device limits");
-  std::vector<DevicePointer> pointers; std::vector<void *> parameters;
-  for(const auto &buffer:buffers) {
-    require(!buffer || buffer->impl->state==impl->state,"device tensor belongs to a different CUDA execution session");
-    pointers.push_back(buffer ? buffer->impl->pointer : 0);
+  std::vector<DevicePointer> storage(arguments.size());
+  std::vector<void *> parameters;
+  std::vector<std::shared_ptr<DeviceBuffer>> buffers;
+  for(std::size_t index=0;index<arguments.size();++index) {
+    const auto &argument=arguments[index];
+    const auto width=kernel->impl->parameterWidths[index];
+    if(width) {
+      require(!argument.buffer && argument.scalar.size()==width,"scalar argument byte width differs from its ABI");
+      std::memcpy(&storage[index],argument.scalar.data(),width);
+    } else {
+      require(argument.scalar.empty(),"pointer argument requires a device buffer or null");
+      const auto &buffer=argument.buffer;
+      require(!buffer || buffer->impl->state==impl->state,"device tensor belongs to a different CUDA execution session");
+      storage[index]=buffer ? buffer->impl->pointer : 0;
+      if(buffer) buffers.push_back(buffer);
+    }
+    parameters.push_back(&storage[index]);
   }
-  for(auto &pointer:pointers) parameters.push_back(&pointer);
   reap(); ContextScope current(*s.driver,s.context);auto &d=*s.driver;
   auto p=std::make_unique<Event::Impl>();p->state=impl->state;p->buffers=buffers;p->kernel=kernel;
   auto event=std::shared_ptr<Event>(new Event(std::move(p)));

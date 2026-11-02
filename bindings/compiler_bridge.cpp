@@ -13,7 +13,7 @@ std::pair<std::string, std::string> prepareJSON(const std::string &source,
       {foldConstants, eliminateDeadCode, fuseElementwise});
   if (!result) throw std::runtime_error(llvm::toString(result.takeError()));
   return {std::move(result->ir),
-          llvm::formatv("{0}", llvm::json::Value(std::move(result->report))).str()};
+          ask::reportJSON(llvm::json::Value(std::move(result->report)), result->floatPaths)};
 }
 
 std::pair<std::string, std::string> partitionJSON(const std::string &source,
@@ -25,5 +25,5 @@ std::pair<std::string, std::string> partitionJSON(const std::string &source,
   auto result = ask::partitionSource(source, options);
   if (!result) throw std::runtime_error(llvm::toString(result.takeError()));
   return {std::move(result->ir),
-          llvm::formatv("{0}", llvm::json::Value(std::move(result->report))).str()};
+          ask::reportJSON(llvm::json::Value(std::move(result->report)), result->floatPaths)};
 }

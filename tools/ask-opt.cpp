@@ -58,11 +58,8 @@ Error writeText(StringRef path, StringRef contents) {
   return Error::success();
 }
 
-Error writeJSON(StringRef path, const json::Value &value) {
-  std::string contents;
-  raw_string_ostream stream(contents);
-  stream << formatv("{0:2}\n", value);
-  return writeText(path, contents);
+Error writeJSON(StringRef path, const json::Value &value, const ask::JSONFloatPaths &floatPaths = {}) {
+  return writeText(path, ask::reportJSON(value, floatPaths, 2) + "\n");
 }
 
 } // namespace
@@ -97,7 +94,7 @@ int main(int argc, char **argv) {
     if (!result) return fail(toString(result.takeError()));
     if (auto error = writeText(output, result->ir)) return fail(toString(std::move(error)));
     if (!reportPath.empty())
-      if (auto error = writeJSON(reportPath, json::Value(std::move(result->report)))) return fail(toString(std::move(error)));
+      if (auto error = writeJSON(reportPath, json::Value(std::move(result->report)), result->floatPaths)) return fail(toString(std::move(error)));
     return 0;
   }
   if (checkLLIR || optimizeLLIR) {
@@ -126,6 +123,7 @@ int main(int argc, char **argv) {
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sources, &context);
   if (!module || mlir::failed(mlir::verify(*module))) return 1;
   json::Object report{{"schema_version", 1}, {"phase", "verified"}};
+  ask::JSONFloatPaths floatPaths;
   if (prepare || optimize || emitLLVM || emitObject || emitCUDALLVM) {
     if (optimize) {
       ask::OptimizationOptions options;
@@ -137,7 +135,7 @@ int main(int argc, char **argv) {
       return 1;
     }
     report["phase"] = optimize ? "optimized" : "prepared";
-    report["external_requests"] = ask::externalRequests(*module);
+    report["external_requests"] = ask::externalRequests(*module, &floatPaths);
   }
   std::string result;
   raw_string_ostream stream(result);
@@ -189,6 +187,6 @@ int main(int argc, char **argv) {
   if (!emitObject)
     if (auto error = writeText(output, result)) return fail(toString(std::move(error)));
   if (!reportPath.empty())
-    if (auto error = writeJSON(reportPath, json::Value(std::move(report)))) return fail(toString(std::move(error)));
+    if (auto error = writeJSON(reportPath, json::Value(std::move(report)), floatPaths)) return fail(toString(std::move(error)));
   return 0;
 }

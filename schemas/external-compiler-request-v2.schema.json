@@ -37,28 +37,52 @@
           "*i64",
           "*fp32",
           "*fp16",
-          "*bf16"
+          "*bf16",
+          "i1",
+          "i8",
+          "i16",
+          "i32",
+          "i64",
+          "u8",
+          "u16",
+          "u32",
+          "u64",
+          "fp16",
+          "bf16",
+          "fp32",
+          "fp64"
         ]
       }
     },
     "source_bindings": {
       "type": "object",
       "additionalProperties": {
-        "type": "string",
-        "pattern": "^(input|output):(0|[1-9][0-9]*)$"
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^(input|output):(0|[1-9][0-9]*)$"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "number"
+          }
+        ]
       }
     },
     "constants": {
       "type": "object",
       "additionalProperties": {
-        "type": "integer",
-        "minimum": -9223372036854775808,
-        "maximum": 9223372036854775807
+        "$ref": "#/$defs/jsonValue"
       }
     },
     "fixed_options": {
       "type": "object",
-      "description": "Compiler-specific compile options, interpreted only by the caller-owned worker."
+      "description": "Compiler-specific compile options, interpreted only by the caller-owned worker.",
+      "additionalProperties": {
+        "$ref": "#/$defs/jsonValue"
+      }
     },
     "target": {
       "type": "object",
@@ -100,6 +124,42 @@
           "minimum": 0
         }
       }
+    }
+  },
+  "$defs": {
+    "jsonValue": {
+      "oneOf": [
+        {
+          "type": [
+            "null",
+            "boolean",
+            "string"
+          ]
+        },
+        {
+          "type": "integer",
+          "minimum": -9223372036854775808,
+          "maximum": 18446744073709551615
+        },
+        {
+          "type": "number",
+          "not": {
+            "type": "integer"
+          }
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/jsonValue"
+          }
+        }
+      ]
     }
   }
 }

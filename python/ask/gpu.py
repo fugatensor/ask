@@ -142,7 +142,8 @@ def _compile_external_graph(compiler, prepared, environments, *, cache_dir, outp
            "request": request, "worker": identity,
            "environment_sha256": _sha(_json(dict(os.environ))),
            "orchestrator_sha256": _sha(Path(__file__).read_bytes()),
-           "protocol_sha256": _sha(Path(__file__).with_name("adapters.py").read_bytes())}
+           "protocol_sha256": _sha(b"".join(Path(__file__).with_name(name).read_bytes()
+                                           for name in ("adapters.py", "_abi.py")))}
     def build():
         artifact = export_kernel(command, request, timeout=compiler.timeout)
         if artifact["producer"] != identity["probe"]["producer"]:

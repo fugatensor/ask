@@ -19,6 +19,7 @@ for entry in (str(ROOT / "python"), str(ROOT / "tests")):
         sys.path.insert(0, entry)
 
 from ask import CompilerEnvironment, CompilerError, Module, ScalarType, TensorType
+from ask._abi import parameter_layout, scalar_bytes
 from ask.cuda import (
     CUDAError,
     _artifact_digest,
@@ -310,6 +311,41 @@ class PreparedExecutableContractTests(unittest.TestCase):
 
 
 class ExternalExecutableTests(unittest.TestCase):
+    def test_scalar_encodings_and_mixed_prepared_arguments(self):
+        samples = [("i1", True, "01"), ("i8", -128, "80"), ("i16", -32768, "0080"),
+                   ("i32", -2147483648, "00000080"), ("i64", -(2**63), "0000000000000080"),
+                   ("u8", 255, "ff"), ("u16", 65535, "ffff"), ("u32", 2**32 - 1, "ffffffff"),
+                   ("u64", 2**64 - 1, "ffffffffffffffff"), ("fp16", 1.5, "003e"),
+                   ("bf16", -2.5, "20c0"), ("fp32", 1.25, "0000a03f"),
+                   ("fp64", -0.0, "0000000000000080")]
+        for dtype, value, expected in samples:
+            with self.subTest(dtype=dtype):
+                self.assertEqual(scalar_bytes(dtype, value).hex(), expected)
+        # Encoding a large integer into f32 must avoid an intermediate f64 rounding.
+        self.assertEqual(scalar_bytes("fp32", 2**100 + 2**76 + 1).hex(), "01008071")
+        for dtype, value in (("i1", 1), ("i32", True), ("u8", -1), ("i8", 128),
+                             ("u64", 2**64), ("fp32", True), ("fp32", float("inf")),
+                             ("fp16", 65536), ("fp64", 10**400), ("bad", 1)):
+            with self.subTest(dtype=dtype, value=value), self.assertRaises(ValueError):
+                scalar_bytes(dtype, value)
+        self.assertEqual(parameter_layout(["pointer", "i1", "i16", "fp32", "pointer", "fp64"]),
+                         [{"offset": 0, "size": 8}, {"offset": 8, "size": 1},
+                          {"offset": 10, "size": 2}, {"offset": 12, "size": 4},
+                          {"offset": 16, "size": 8}, {"offset": 24, "size": 8}])
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = make_external_artifact()
+            artifact["invocation"]["arguments"].insert(1,
+                {"argument": 1, "kind": "scalar", "type": "fp32", "value": 1.25})
+            artifact["invocation"]["arguments"][2]["argument"] = 2
+            artifact["port_map"][1]["argument"] = 2
+            session = SessionRecorder()
+            executable = CUDAKernel(artifact, install_external(artifact, directory), {}, {}).prepare(session)
+            src, dst = mock_tensor(), mock_tensor(pointer=8192)
+            with patch.object(Path, "read_bytes", side_effect=AssertionError("hot path I/O")):
+                executable.submit(src, dst)
+            self.assertEqual(session.loads[0][1]["parameter_types"], ["pointer", "fp32", "pointer"])
+            self.assertEqual(session.submissions[0][0][1], [src, b"\x00\x00\xa0\x3f", dst])
+
     def test_direct_formats_prepare_and_verify_without_compiler_tools(self):
         for format_ in ("cubin", "ptx"):
             with self.subTest(format=format_), tempfile.TemporaryDirectory() as directory:

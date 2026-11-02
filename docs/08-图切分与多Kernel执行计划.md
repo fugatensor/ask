@@ -54,7 +54,7 @@ ASK 图描述数据依赖，执行计划描述哪些依赖需要落到设备缓�
 
 每个 external 步骤的请求交给调用方 worker，取得 cubin/PTX；owned 步骤经 ASK 的 LLVM 管线编译。任何非法 MLIR、缺失 worker、导出失败、损坏产物或代码生成错误都使编译失败，不能用其它计算路径掩盖。
 
-外部步骤允许多输入、多输出与不同端口形状、类型。源码参数通过 `source_bindings` 连接逻辑端口，ASK 从 `signature` 与 `port_shapes` 推导 ABI。原生 MLIR 可表示多结果节点；当前 Python ASK SDK 和 FugaTensor 的源码注册接口仍为单输出，完整图可以有多个输出。
+外部步骤允许多输入、多输出与不同端口形状、类型。指针参数通过 `source_bindings` 连接逻辑端口，标量参数在同一字典中绑定按值传递的启动值；ASK 从 `signature` 与 `port_shapes` 推导 ABI。原生 MLIR、Python ASK SDK 和 FugaTensor 注册接口均支持多结果节点，多输出仍由一个外部 kernel 写出。
 
 <a id="program-runtime"></a>
 
@@ -70,7 +70,7 @@ FugaTensor 在自动组图后直接提交完整静态图，由 ASK 在外部边�
 
 ## 5. 复杂外部算子接入
 
-ASK 只定义外部 kernel 的产物、端口、缓存与调度接口，不在仓内实现注意力、矩阵乘或归约算法。外部步骤可使用多输入、不同形状或存储类型、内部 FP32 累加和动态共享内存；调用方 worker 负责生成可执行产物并声明实际资源需求。支持范围受通用指针 ABI 与普通 CUDA 启动契约约束，见[外部执行接口](04-外部产物与执行接口.md#binary-artifact)。
+ASK 只定义外部 kernel 的产物、端口、缓存与调度接口，不在仓内实现注意力、矩阵乘或归约算法。外部步骤可使用多输入、多输出、不同形状或存储类型、内部 FP32 累加和动态共享内存；调用方 worker 负责生成可执行产物并声明实际资源需求。支持范围受通用参数 ABI 与普通 CUDA 启动契约约束，见[外部执行接口](04-外部产物与执行接口.md#binary-artifact)。
 
 复杂算子的算法语义和训练接口属于上层框架。例如 FugaTensor 维护 [FlashAttention-2 前向与反向实现](../../fugatensor/examples/flash_attention2.py)及其 [Triton 源码](../../fugatensor/examples/kernels/flash_attention2.py)，通过 `ft.fun` 的显式反向规则注册为多个 `ask.external`；ASK 将其切分为前向、统计量、dQ、dK、dV 等独立步骤并在同一会话 stream 上调度。该示例的数值验证、反向公式和适用边界由上层文档定义，ASK 不依赖或内置该算法。
 

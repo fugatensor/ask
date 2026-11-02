@@ -58,6 +58,29 @@ class AdapterContractTests(unittest.TestCase):
             with self.subTest(artifact=artifact), self.assertRaises((CompilerError, CUDAError)):
                 normalize_artifact(artifact, request())
 
+    def test_mixed_scalar_abi_preserves_values_and_only_maps_tensor_ports(self):
+        req, reply = request(), response()
+        values = {"n": ("u64", 2**64 - 1), "scale": ("fp32", -0.0),
+                  "flag": ("i1", True), "other_flag": ("i1", True)}
+        req["signature"].update({name: dtype for name, (dtype, _) in values.items()})
+        req["source_bindings"].update({name: value for name, (_, value) in values.items()})
+        reply["arguments"][1:1] = [{"type": dtype, "value": value} for dtype, value in values.values()]
+        artifact = normalize_artifact(reply, req)
+        self.assertEqual([p["argument"] for p in artifact["port_map"]], [0, 6, 7])
+        self.assertEqual(artifact["invocation"]["arguments"][1],
+                         {"argument": 1, "kind": "scalar", "type": "u64", "value": 2**64 - 1})
+        self.assertEqual(len(artifact["port_map"]), 3)
+        # Matching must retain signed zero, type, and repeated scalar count.
+        for index, replacement in ((1, {"type": "i64", "value": -1}),
+                                   (2, {"type": "fp32", "value": 0.0}),
+                                   (3, {"type": "i1", "value": 1}),
+                                   (4, "null")):
+            with self.subTest(index=index):
+                bad = json.loads(json.dumps(reply))
+                bad["arguments"][index] = replacement
+                with self.assertRaises((CompilerError, CUDAError)):
+                    normalize_artifact(bad, req)
+
     def test_explicit_worker_needs_no_registry_and_failures_are_errors(self):
         with tempfile.TemporaryDirectory() as directory:
             worker = Path(directory) / "worker.py"

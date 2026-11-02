@@ -18,7 +18,7 @@
 | 操作 | 所在层级 | 作用 |
 | --- | --- | --- |
 | `ask.semantics` | Module 顶层 | 声明外部算子的输入/输出类型签名、形状推导规则（`same_as` 或 `fixed`）；当前只接受 `effects = "none"`。 |
-| `ask.implementation` | Module 顶层 | 绑定外部编译器 ID（如 `"triton"`）、DSL 源码快照、入口函数名、指针签名、`source_bindings`、`constants`、`options`、`target` 和 `grid`。 |
+| `ask.implementation` | Module 顶层 | 绑定外部编译器 ID（如 `"triton"`）、DSL 源码快照、入口函数名、指针/标量签名、`source_bindings`、`constants`、`options`、`target` 和 `grid`。 |
 | `ask.constant` | `func.func` 内 | 生成指定类型的标量常量（`bool` / `i32` / `i64` / `f32` / `f16` / `bf16`）。 |
 | `ask.splat` | `func.func` 内 | 将标量按静态 `shape` 复制填充为同元素类型的张量。 |
 | `ask.add` / `ask.mul` | `func.func` 内 | 同形状、同元素类型的逐元素加/乘；不支持 `bool` 直接算术，整数采用二补数回绕（`overflow = "wrap"`）。 |

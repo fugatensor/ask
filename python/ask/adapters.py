@@ -5,6 +5,7 @@ nor imports their Python modules; compiler-specific workers belong to callers.
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 import hashlib
 import json
@@ -136,16 +137,40 @@ def normalize_artifact(artifact, request):
     _require(isinstance(launch, dict) and set(launch) == {"grid", "block", "shared_bytes"},
              "launch requires grid, block and shared_bytes")
     _require(launch["grid"] == request["grid"], "external launch grid differs from the request")
+    from ._abi import scalar_bytes
     arguments = artifact["arguments"]
-    _require(isinstance(arguments, list) and all(isinstance(a, str) for a in arguments),
-             "external arguments must be ordered buffer bindings")
+    _require(isinstance(arguments, list), "external arguments must be an ordered list")
     bindings = request["source_bindings"]
-    expected = set(bindings.values())
-    _require(set(arguments) - {"null"} == expected
-             and all(arguments.count(name) == 1 for name in expected),
+    expected = {binding for name, binding in bindings.items()
+                if request["signature"][name].startswith("*")}
+    pointers = [argument for argument in arguments if isinstance(argument, str)]
+    _require(set(pointers) - {"null"} == expected
+             and all(pointers.count(name) == 1 for name in expected),
              "external arguments must bind every logical port exactly once")
+    def scalar_key(dtype, value):
+        try:
+            return dtype, scalar_bytes(dtype, value)
+        except (ValueError, TypeError) as error:
+            raise CompilerError("invalid external scalar argument", diagnostics=str(error)) from error
+    expected_scalars = Counter(scalar_key(request["signature"][name], value)
+                              for name, value in bindings.items()
+                              if not request["signature"][name].startswith("*"))
+    actual_scalars = Counter()
+    invocation_arguments = []
+    for index, argument in enumerate(arguments):
+        if isinstance(argument, str):
+            invocation_arguments.append({"argument": index, "binding": argument, "kind": "pointer"})
+        else:
+            _require(isinstance(argument, dict) and set(argument) == {"type", "value"},
+                     "scalar arguments require exactly type and value")
+            actual_scalars[scalar_key(argument["type"], argument["value"])] += 1
+            invocation_arguments.append({"argument": index, "kind": "scalar", **argument})
+    _require(actual_scalars == expected_scalars,
+             "external scalar types and values must match the request exactly")
     ports = []
     for parameter, logical_port in bindings.items():
+        if not request["signature"][parameter].startswith("*"):
+            continue
         dtype, size = _ELEMENT_TYPES[request["signature"][parameter]]
         ports.append({"argument": arguments.index(logical_port), "logical_port": logical_port,
                       "shape": request["port_shapes"][logical_port], "element_type": dtype,
@@ -153,9 +178,7 @@ def normalize_artifact(artifact, request):
     normalized = {key: value for key, value in artifact.items() if key not in ("launch", "arguments")}
     normalized["port_map"] = sorted(ports, key=lambda port: port["argument"])
     normalized["invocation"] = {"version": 2, "kind": "cuda-kernel", **launch,
-        "completion": "device-event", "arguments": [
-            {"argument": index, "binding": binding, "kind": "pointer"}
-            for index, binding in enumerate(arguments)]}
+        "completion": "device-event", "arguments": invocation_arguments}
     from .cuda import _kernel_contract
     _kernel_contract(normalized)
     return normalized

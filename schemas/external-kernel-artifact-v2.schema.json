@@ -101,8 +101,78 @@
       "minItems": 1,
       "maxItems": 64,
       "items": {
-        "type": "string",
-        "pattern": "^(null|(input|output):(0|[1-9][0-9]*))$"
+        "oneOf": [
+          {
+            "type": "string",
+            "pattern": "^(null|(input|output):(0|[1-9][0-9]*))$"
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "value"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "i1"
+                ]
+              },
+              "value": {
+                "type": "boolean"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "value"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "i8",
+                  "i16",
+                  "i32",
+                  "i64",
+                  "u8",
+                  "u16",
+                  "u32",
+                  "u64"
+                ]
+              },
+              "value": {
+                "type": "integer",
+                "minimum": -9223372036854775808,
+                "maximum": 18446744073709551615
+              }
+            }
+          },
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type",
+              "value"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "fp16",
+                  "bf16",
+                  "fp32",
+                  "fp64"
+                ]
+              },
+              "value": {
+                "type": "number"
+              }
+            }
+          }
+        ]
       }
     },
     "required_element_types": {

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 import subprocess
 import tempfile
@@ -91,6 +92,65 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(len(step["outputs"]), 2)
         self.assertEqual(result.report["external_requests"][0]["port_shapes"],
                          {"input:0": [4], "input:1": [4], "output:0": [2], "output:1": [1]})
+
+    def test_sdk_multioutput_scalar_abi_and_json_constants_roundtrip(self):
+        incoming = TensorType((4,), "f32")
+        outputs = (TensorType((2,), "f32"), TensorType((1,), "i32"))
+        scalar_types = ("i1", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64",
+                        "fp16", "bf16", "fp32", "fp64")
+        scalar_values = (True, -128, -32768, -(2**31), -(2**63), 255, 65535,
+                         2**32 - 1, 2**64 - 1, 1.5, 2, -0.0, 0.1)
+        signature = {"x": "*fp32", "a": "*fp32", "b": "*i32", **dict(zip(scalar_types, scalar_types))}
+        bindings = {"x": "input:0", "a": "output:0", "b": "output:1", **dict(zip(scalar_types, scalar_values))}
+        constants = {"dtype": {"__compiler_dtype__": "float32"}, "flags": [True, False, None],
+                     "one": 1.0, "minus_one": -1.0, "integer": -1,
+                     "nested": {"key with spaces": ["text", 0.1, -0.0, -(2**63), 2**64-1]}}
+        options = {"limit": 0.25, "features": ["a", None, {"enabled": True}]}
+        module = Module()
+        semantics = module.semantics("sem", inputs=[incoming], results=outputs, shape_rule="fixed")
+        implementation = module.implementation("impl", compiler="fixture", source="opaque", entry="kernel",
+            signature=signature, source_bindings=bindings, constants=constants, options=options,
+            target={"backend": "cuda", "arch": 80})
+        graph = module.graph("main", inputs={"x": incoming}, results=outputs)
+        results = graph.external(graph.inputs["x"], semantics=semantics, implementation=implementation,
+                                 result_types=outputs, id="multi")
+        self.assertIsInstance(results, tuple)
+        self.assertEqual([value.value_id for value in results], ["multi.result0", "multi.result1"])
+        graph.return_(*results)
+        compiled = self.partition(module)
+        plan = self.assert_plan(compiled)
+        self.assertEqual(len(plan["steps"][0]["outputs"]), 2)
+        request = compiled.report["external_requests"][0]
+        self.assertEqual(request["source_bindings"], bindings)
+        self.assertEqual(request["constants"], constants)
+        self.assertEqual(request["fixed_options"], options)
+        self.assertIs(type(request["constants"]["one"]), float)
+        self.assertIs(type(request["constants"]["minus_one"]), float)
+        self.assertIs(type(request["constants"]["integer"]), int)
+        self.assertEqual(math.copysign(1, request["source_bindings"]["fp32"]), -1)
+        self.assertEqual(math.copysign(1, request["constants"]["nested"]["key with spaces"][2]), -1)
+        for compiler in (Compiler(), Compiler(executable=ask_opt_path())):
+            for method in (compiler.prepare, compiler.partition):
+                with self.subTest(compiler=compiler.executable, method=method.__name__):
+                    restored = method(module).report["external_requests"][0]
+                    self.assertEqual(restored, request)
+                    self.assertIs(type(restored["constants"]["one"]), float)
+                    self.assertIs(type(restored["constants"]["minus_one"]), float)
+                    self.assertIs(type(restored["constants"]["integer"]), int)
+                    self.assertEqual(math.copysign(1, restored["source_bindings"]["fp32"]), -1)
+
+        for parameter, replacement in (("i1", 1), ("i8", 128), ("u8", -1), ("fp32", True),
+                                       ("i64", 2**63), ("u64", -1)):
+            with self.subTest(parameter=parameter):
+                bad = Module()
+                sem = bad.semantics("sem", inputs=[incoming], results=outputs, shape_rule="fixed")
+                impl = bad.implementation("impl", compiler="fixture", source="opaque", entry="kernel",
+                    signature=signature, source_bindings={**bindings, parameter: replacement},
+                    target={"backend": "cuda", "arch": 80})
+                body = bad.graph("main", inputs={"x": incoming}, results=outputs)
+                body.return_(*body.external(body.inputs["x"], semantics=sem, implementation=impl))
+                with self.assertRaisesRegex(CompilerError, "invalid scalar source binding"):
+                    self.partition(bad)
 
     def test_cli_and_binding_have_the_same_contract_and_reject_dynamic_inputs(self):
         source = (ROOT / "tests/ir/pipeline.mlir").read_text()

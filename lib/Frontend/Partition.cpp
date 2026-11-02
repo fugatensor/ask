@@ -72,7 +72,8 @@ std::string printModule(ModuleOp module) {
   return text;
 }
 
-LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::string &ir) {
+LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::string &ir,
+                        JSONFloatPaths &floatPaths) {
   auto functions = llvm::to_vector(original.getOps<func::FuncOp>());
   if (functions.size() != 1)
     return original.emitError("CUDA partitioning requires exactly one graph function");
@@ -207,7 +208,7 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
   report["phase"] = "partitioned";
   report["execution_plan"] = std::move(plan);
   report["step_sources"] = std::move(sources);
-  report["external_requests"] = externalRequests(original);
+  report["external_requests"] = externalRequests(original, &floatPaths);
   ir = printModule(*result);
   return success();
 }
@@ -228,7 +229,7 @@ llvm::Expected<PreparedSource> partitionSource(llvm::StringRef source, const Par
   if (!module || failed(verify(*module)) ||
       failed(options.optimize ? optimizeModule(*module, result.report, options.optimization)
                               : prepareModule(*module, result.report)) ||
-      failed(partition(*module, result.report, result.ir)))
+      failed(partition(*module, result.report, result.ir, result.floatPaths)))
     return llvm::createStringError(llvm::inconvertibleErrorCode(), diagnostics);
   return result;
 }

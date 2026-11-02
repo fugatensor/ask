@@ -4,7 +4,7 @@ ASK 是面向张量框架的底层编译与运行时引擎。上层提交 MLIR `
 
 - **显式数值语义**：支持 `bool`、`i32`、`i64`、`f32`、`f16`、`bf16`，单步 RNE 常量和 6×6 显式 `ask.cast`，不做隐式类型提升或广播。
 - **自有融合与代码生成**：常量折叠、DCE、多输出逐元素融合；Host 生成 `.o`，CUDA 生成 cubin，支持异构多端口、0-D 张量和空张量。
-- **外部可执行接口**：调用方 worker 返回 cubin 或 PTX，ASK 推导端口并校验启动契约。外部 kernel 保持独立，与自有区域通过显存缓冲区连接，在单 stream 上顺序执行。
+- **外部可执行接口**：调用方 worker 返回 cubin 或 PTX，ASK 推导多输入、多输出端口并校验指针与标量混合 ABI。外部 kernel 保持独立，与自有区域通过显存缓冲区连接，在单 stream 上顺序执行。
 - **常驻会话与缓存**：进程内 nanobind 编译入口、`ExecutionSession`、CUDA Array Interface 零拷贝、异步事件、自有 IR/机器码缓存和外部产物缓存。
 
 ASK 不依赖 Triton、NumPy、PyTorch 或 FugaTensor。第三方编译器适配器由调用方维护；FugaTensor 的 Triton 接入见 [上层执行说明](../fugatensor/docs/architecture/04-ASK桥接与多后端执行.md)。架构导航见 [文档目录](docs/README.md) 与 [核心思想](docs/核心思想.md)。

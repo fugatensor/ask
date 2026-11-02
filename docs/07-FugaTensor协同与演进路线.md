@@ -37,7 +37,7 @@ FugaTensor 依赖已安装的 ASK 包；ASK 不依赖 FugaTensor。两者分别�
 | 第三方融合 | 不合并第三方与 ASK 自有代码，也不合并多个外部 kernel；跨步骤通过显存连接。 |
 | 调度 | 静态计划、单 stream 顺序提交；没有图内动态条件/循环或多 stream 并发计划。 |
 | 操作集 | 自有算子没有归约、轴广播或矩阵乘；`splat` 仅将标量填充到指定静态形状。 |
-| 外部 ABI | 静态连续张量、六种类型、指针或 null 参数、固定普通 launch；没有运行时标量、非空 scratch 或描述符启动支持。 |
+| 外部 ABI | 静态连续张量、六种张量类型、指针与按值标量、固定普通 launch；没有非空 scratch 或描述符启动支持。 |
 | 副作用 | `ask.semantics` 只接受 `effects = "none"`，没有状态 token。 |
 | 互操作 | CAI 不承载 `bf16`，没有 DLPack 接口。 |
 

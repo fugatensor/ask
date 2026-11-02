@@ -35,13 +35,26 @@ void bindRuntime(nb::module_ &module) {
       .def("import_buffer",&Session::importBuffer,nb::arg("pointer"),nb::arg("nbytes"),
            nb::arg("readonly")=false,nb::call_guard<nb::gil_scoped_release>())
       .def("load",[](Session &session,nb::bytes data,const std::string &entry,
-                      const std::vector<std::string> &types,int arch,unsigned parameters){
+                      const std::vector<std::string> &types,int arch,const std::vector<unsigned> &widths){
         std::string binary(static_cast<const char *>(data.data()),data.size());
-        nb::gil_scoped_release release;return session.load(binary,entry,types,arch,parameters);
+        nb::gil_scoped_release release;return session.load(binary,entry,types,arch,widths);
       },nb::arg("cubin"),nb::arg("entry"),nb::arg("required_types"),nb::arg("arch"),
-        nb::arg("expected_parameters"))
-      .def("submit",&Session::submit,nb::arg("kernel"),nb::arg("buffers"),nb::arg("grid"),
-           nb::arg("block"),nb::arg("shared_bytes")=0,nb::call_guard<nb::gil_scoped_release>())
+        nb::arg("parameter_widths"))
+      .def("submit",[](Session &session,const std::shared_ptr<Kernel> &kernel,
+                         nb::list bindings,std::array<unsigned,3> grid,
+                         std::array<unsigned,3> block,unsigned sharedBytes){
+        std::vector<KernelArgument> arguments;
+        for(nb::handle binding:bindings) {
+          KernelArgument argument;
+          if(nb::isinstance<nb::bytes>(binding)) {
+            auto bytes=nb::cast<nb::bytes>(binding);
+            argument.scalar.assign(static_cast<const char *>(bytes.data()),bytes.size());
+            if(argument.scalar.empty()) throw CUDAError("scalar argument cannot be empty");
+          } else if(!binding.is_none()) argument.buffer=nb::cast<std::shared_ptr<DeviceBuffer>>(binding);
+          arguments.push_back(std::move(argument));
+        }
+        nb::gil_scoped_release release;return session.submit(kernel,arguments,grid,block,sharedBytes);
+      },nb::arg("kernel"),nb::arg("bindings"),nb::arg("grid"),nb::arg("block"),nb::arg("shared_bytes")=0)
       .def("wait_for_external_stream",&Session::waitForExternalStream,nb::call_guard<nb::gil_scoped_release>())
       .def("check_types",&Session::checkTypes,nb::call_guard<nb::gil_scoped_release>())
       .def("synchronize",&Session::synchronize,nb::call_guard<nb::gil_scoped_release>())

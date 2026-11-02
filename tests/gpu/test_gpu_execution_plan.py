@@ -156,6 +156,68 @@ class CUDAExecutionPlanHardwareTests(unittest.TestCase):
             kernel.prepare(session).submit(x, y).wait()
             self.assertEqual(y.to_host(), [2 * value for value in range(10)])
 
+    def test_mixed_scalar_abi_preserves_bits_and_checks_layout(self):
+        # Independent PTX observes the exact scalar encodings. Parameter widths
+        # deliberately force padding before both scalar and pointer arguments.
+        samples = [("i1", True, 1), ("i8", -5, 251), ("i16", -1234, 64302),
+                   ("i32", -7, 4294967289), ("i64", -9, -9), ("u8", 255, 255),
+                   ("u16", 65535, 65535), ("u32", 2**32 - 1, 2**32 - 1),
+                   ("u64", 2**64 - 1, -1), ("fp16", 1.5, 0x3e00),
+                   ("bf16", -2.5, 0xc020), ("fp32", 1.25, 0x3fa00000),
+                   ("fp64", -0.0, -(2**63))]
+        widths = [1, 1, 2, 4, 8, 1, 2, 4, 8, 2, 2, 4, 8]
+        parameters = [".param .u64 input_ptr"]
+        arguments = [{"argument": 0, "kind": "pointer", "binding": "input:0"}]
+        output_index = 0
+        body = ["ld.param.u64 %out, [output_ptr];"]
+        for index, ((dtype, value, _), width) in enumerate(zip(samples, widths)):
+            if index == 2:
+                output_index = len(arguments)
+                parameters.append(".param .u64 output_ptr")
+                arguments.append({"argument": output_index, "kind": "pointer", "binding": "output:0"})
+            parameters.append(f".param .u{width * 8} scalar{index}")
+            arguments.append({"argument": len(arguments), "kind": "scalar", "type": dtype, "value": value})
+            if width == 8:
+                body.append(f"ld.param.u64 %wide, [scalar{index}];")
+            else:
+                body.extend([f"ld.param.u{width * 8} %small, [scalar{index}];", "cvt.u64.u32 %wide, %small;"])
+            body.append(f"st.global.u64 [%out+{index * 8}], %wide;")
+        payload = (".version 8.0\n.target sm_80\n.address_size 64\n.visible .entry scale2(" +
+                   ", ".join(parameters) + ") {\n.reg .b32 %small;\n.reg .b64 %wide, %out;\n" +
+                   "\n".join(body) + "\nret;\n}\n")
+        with tempfile.TemporaryDirectory() as directory, ExecutionSession() as session:
+            artifact = make_external_artifact(payload=payload, shape=(len(samples),), arch=self.arch)
+            artifact["invocation"].update(arguments=arguments, block=[1, 1, 1])
+            artifact["port_map"][1]["argument"] = output_index
+            for port in artifact["port_map"]:
+                port["element_type"] = "i64"
+            artifact["required_element_types"] = ["i64"]
+            kernel = CUDAKernel(artifact, install_external(artifact, directory), {}, {})
+            x = session.from_host([0] * len(samples), dtype="i64")
+            y = session.tensor((len(samples),), "i64")
+            prepared = kernel.prepare(session)
+            prepared.submit(x, y).wait()
+            expected = [value for _, _, value in samples]
+            self.assertEqual(y.to_host(), expected)
+            # The synchronous host runner uses the same encoding/layout helpers.
+            self.assertEqual(kernel.run([0] * len(samples))["output"], expected)
+            launches = session.stats["launches"]
+            raw = prepared._parameters([x], [y])
+            raw[1] = b"\x01\x00"
+            with self.assertRaisesRegex(CUDAError, "byte width"):
+                session.submit(prepared._kernel, raw, grid=[1, 1, 1], block=[1, 1, 1])
+            raw = prepared._parameters([x], [y])
+            raw[0] = b"\x00" * 8
+            with self.assertRaisesRegex(CUDAError, "pointer argument"):
+                session.submit(prepared._kernel, raw, grid=[1, 1, 1], block=[1, 1, 1])
+            self.assertEqual(session.stats["launches"], launches)
+            with ExecutionSession() as other:
+                wrong_types = [arg["type"] if arg["kind"] == "scalar" else "pointer" for arg in arguments]
+                wrong_types[1] = "i16"
+                with self.assertRaisesRegex(CUDAError, "layout"):
+                    other.load(payload.encode(), "scale2", required_types=["i64"], arch=self.arch,
+                               parameter_types=wrong_types)
+
     def test_external_module_parameter_abi_is_checked_before_launch(self):
         with tempfile.TemporaryDirectory() as directory, ExecutionSession() as session:
             # Remove one declared pointer but keep the normalized artifact's two

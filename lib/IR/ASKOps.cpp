@@ -2,6 +2,9 @@
 
 #include "mlir/IR/BuiltinOps.h"
 #include "llvm/ADT/SmallBitVector.h"
+#include "llvm/ADT/StringSwitch.h"
+
+#include <cmath>
 
 using namespace mlir;
 
@@ -185,6 +188,35 @@ LogicalResult SemanticsOp::verify() {
   return success();
 }
 
+static bool isJSONAttribute(Attribute value) {
+  if (isa<UnitAttr, StringAttr, BoolAttr>(value)) return true;
+  if (auto number = dyn_cast<IntegerAttr>(value))
+    return isa<IntegerType>(number.getType()) && number.getValue().getBitWidth() <= 64;
+  if (auto number = dyn_cast<FloatAttr>(value))
+    return std::isfinite(number.getValueAsDouble());
+  if (auto array = dyn_cast<ArrayAttr>(value))
+    return llvm::all_of(array, isJSONAttribute);
+  if (auto dict = dyn_cast<DictionaryAttr>(value))
+    return llvm::all_of(dict, [](NamedAttribute item) { return isJSONAttribute(item.getValue()); });
+  return false;
+}
+
+static bool isScalarBinding(StringRef type, Attribute value) {
+  if (type == "i1") return isa<BoolAttr>(value);
+  if (type == "fp16" || type == "bf16" || type == "fp32" || type == "fp64")
+    return !isa<BoolAttr>(value) && isa<IntegerAttr, FloatAttr>(value) && isJSONAttribute(value);
+  unsigned bits = llvm::StringSwitch<unsigned>(type)
+      .Cases({"i8", "u8"}, 8).Cases({"i16", "u16"}, 16)
+      .Cases({"i32", "u32"}, 32).Cases({"i64", "u64"}, 64).Default(0);
+  auto integer = dyn_cast<IntegerAttr>(value);
+  if (!bits || !integer || isa<BoolAttr>(value) || !isJSONAttribute(value)) return false;
+  const auto &number = integer.getValue();
+  bool unsignedValue = cast<IntegerType>(integer.getType()).isUnsigned();
+  if (type.starts_with("u"))
+    return (unsignedValue || !number.isNegative()) && number.getActiveBits() <= bits;
+  return unsignedValue ? number.getActiveBits() < bits : number.isSignedIntN(bits);
+}
+
 LogicalResult ImplementationOp::verify() {
   if (!isa<ModuleOp>((*this)->getParentOp()))
     return emitOpError("must be declared directly in builtin.module");
@@ -197,14 +229,18 @@ LogicalResult ImplementationOp::verify() {
     return emitOpError("requires signature and source_bindings dictionaries with identical parameter names");
   for (NamedAttribute item : signature) {
     auto type = dyn_cast<StringAttr>(item.getValue());
-    auto binding = bindings.getAs<StringAttr>(item.getName());
-    if (!type || (type.getValue() != "*i1" && type.getValue() != "i1" &&
-                  type.getValue() != "*i32" && type.getValue() != "i32" &&
-                  type.getValue() != "*i64" && type.getValue() != "i64" &&
-                  type.getValue() != "*fp32" && type.getValue() != "fp32" &&
-                  type.getValue() != "*fp16" && type.getValue() != "fp16" &&
-                  type.getValue() != "*bf16" && type.getValue() != "bf16"))
-      return emitOpError("signature parameters must be i1/i32/i64/fp32/fp16/bf16 scalars or their pointer types");
+    Attribute value = bindings.get(item.getName());
+    if (!type || !value)
+      return emitOpError("signature requires string types and a source binding for every parameter");
+    if (!type.getValue().starts_with("*")) {
+      if (!isScalarBinding(type.getValue(), value))
+        return emitOpError() << "invalid scalar source binding for " << item.getName() << " of type " << type;
+      continue;
+    }
+    if (type.getValue() != "*i1" && type.getValue() != "*i32" && type.getValue() != "*i64" &&
+        type.getValue() != "*fp32" && type.getValue() != "*fp16" && type.getValue() != "*bf16")
+      return emitOpError("pointer parameters require one of the six ASK element types");
+    auto binding = dyn_cast<StringAttr>(value);
     if (!binding)
       return emitOpError() << "missing string source binding for " << item.getName();
     StringRef text = binding.getValue();
@@ -221,19 +257,14 @@ LogicalResult ImplementationOp::verify() {
   for (NamedAttribute constant : constants) {
     if (signature.get(constant.getName()))
       return emitOpError("a constexpr constant must not also appear in signature");
-    auto value = dyn_cast<IntegerAttr>(constant.getValue());
-    if (!value || value.getValue().getBitWidth() > 64)
-      return emitOpError("prototype constexpr constants must be integers of at most 64 bits");
+    if (!isJSONAttribute(constant.getValue()))
+      return emitOpError("constexpr constants must be finite JSON values with at most 64-bit integers");
   }
   auto target = (*this)->getAttrOfType<DictionaryAttr>("target");
   for (StringRef name : {"options", "target"}) {
     for (NamedAttribute item : (*this)->getAttrOfType<DictionaryAttr>(name)) {
-      if (isa<StringAttr>(item.getValue()))
-        continue;
-      auto value = dyn_cast<IntegerAttr>(item.getValue());
-      if (!value || value.getValue().getBitWidth() > 64)
-        return emitOpError() << "prototype '" << name
-                             << "' values must be strings or integers of at most 64 bits";
+      if (!isJSONAttribute(item.getValue()))
+        return emitOpError() << "'" << name << "' values must be finite JSON values with at most 64-bit integers";
     }
   }
   if (!target.getAs<StringAttr>("backend") ||
@@ -284,6 +315,7 @@ LogicalResult ExternalOp::verify() {
   auto bindings = implementation->getAttrOfType<DictionaryAttr>("source_bindings");
   llvm::SmallBitVector inputs(getNumOperands()), outputs(getNumResults());
   for (NamedAttribute item : bindings) {
+    if (!signature.getAs<StringAttr>(item.getName()).getValue().starts_with("*")) continue;
     StringRef binding = cast<StringAttr>(item.getValue()).getValue();
     bool input = binding.consume_front("input:");
     if (!input)
@@ -298,7 +330,7 @@ LogicalResult ExternalOp::verify() {
     Type dataType = input ? getOperand(index).getType() : getResult(index).getType();
     auto tensor = dyn_cast<RankedTensorType>(dataType);
     Type elementType = tensor ? tensor.getElementType() : dataType;
-    std::string expected = tensor || !input ? "*" : "";
+    std::string expected = "*";
     expected += elementType.isF32() ? "fp32" : elementType.isF16() ? "fp16" :
                 elementType.isBF16() ? "bf16" : elementType.isSignlessInteger(1) ? "i1" :
                 elementType.isSignlessInteger(64) ? "i64" : "i32";

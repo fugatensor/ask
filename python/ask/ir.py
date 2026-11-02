@@ -40,16 +40,22 @@ def _i64(value: int) -> str:
 
 
 def _attribute(value: Any) -> str:
+    if value is None:
+        return "unit"
     if isinstance(value, str):
         return mlir_string(value)
     if type(value) is bool:
         return "true" if value else "false"
     if type(value) is int:
+        if 2**63 <= value < 2**64:
+            return f"{value} : ui64"
         return _i64(value)
     if type(value) is float and math.isfinite(value):
         return f"{value:.17e} : f64"
     if isinstance(value, Mapping):
         return _dictionary(value)
+    if isinstance(value, (tuple, list)):
+        return "[" + ", ".join(_attribute(item) for item in value) + "]"
     raise TypeError(f"unsupported attribute value: {value!r}")
 
 
@@ -57,7 +63,7 @@ def _dictionary(values: Mapping[str, Any]) -> str:
     if not isinstance(values, Mapping):
         raise TypeError("expected an attribute mapping")
     return "{" + ", ".join(
-        f"{identifier(key)} = {_attribute(value)}" for key, value in sorted(values.items())
+        f"{mlir_string(key)} = {_attribute(value)}" for key, value in sorted(values.items())
     ) + "}"
 
 
@@ -116,8 +122,8 @@ class Module:
                   shape_operand: int = 0, effects: str = "none") -> Semantics:
         input_types = tuple(as_type(value) for value in inputs)
         result_types = tuple(as_type(value) for value in results)
-        if len(result_types) != 1:
-            raise ValueError("the initial SDK supports one external result")
+        if not result_types:
+            raise ValueError("external semantics require at least one result")
         if effects != "none":
             raise ValueError("the initial SDK supports only effects='none'")
         if shape_rule not in ("same_as", "fixed"):
@@ -126,7 +132,9 @@ class Module:
             type(shape_operand) is not int or not 0 <= shape_operand < len(input_types)
         ):
             raise ValueError("shape_operand must select an input")
-        if shape_rule == "same_as" and not compatible_shapes(input_types[shape_operand], result_types[0]):
+        if shape_rule == "same_as" and any(
+            not compatible_shapes(input_types[shape_operand], result) for result in result_types
+        ):
             raise ValueError("same_as input and result types must have compatible shapes")
         if shape_rule == "fixed" and any(
             isinstance(type_, TensorType) and None in type_.shape for type_ in result_types
@@ -145,7 +153,7 @@ class Module:
         return Semantics(name, input_types, result_types, shape_rule, shape_operand, self)
 
     def implementation(self, name: str, *, compiler: str, source: str, entry: str,
-                       signature: Mapping[str, str], source_bindings: Mapping[str, str],
+                       signature: Mapping[str, str], source_bindings: Mapping[str, Any],
                        constants: Mapping[str, Any] | None = None,
                        options: Mapping[str, Any] | None = None,
                        target: Mapping[str, Any] | None = None,
@@ -158,8 +166,8 @@ class Module:
             raise ValueError("signature and source_bindings must name the same source parameters")
         if any(not isinstance(value, str) for value in signature.values()):
             raise TypeError("signature entries must be strings")
-        if any(not isinstance(value, str) for value in source_bindings.values()):
-            raise TypeError("source_bindings entries must be strings")
+        if any(type(value) not in (str, bool, int, float) for value in source_bindings.values()):
+            raise TypeError("source_bindings entries must be port names or scalar literals")
         if not target or not isinstance(target.get("backend"), str) or not target["backend"]:
             raise ValueError("target requires a nonempty backend string")
         grid = tuple(grid)
@@ -221,32 +229,39 @@ class Graph:
         if any(not isinstance(value, Value) or value._graph is not self for value in values):
             raise ValueError("all operands must be values from this graph")
 
-    def _emit(self, operation: str, operands: Sequence[Value], result_type: Type,
+    def _emit(self, operation: str, operands: Sequence[Value], result_type: Type | Sequence[Type],
               attributes: Mapping[str, str], *, id: str | None,
-              value_id: str | None = None) -> Value:
+              value_id: str | None = None) -> Value | tuple[Value, ...]:
         self._check_values(operands)
+        result_types = (result_type,) if isinstance(result_type, (ScalarType, TensorType)) else tuple(result_type)
+        if len(result_types) != 1 and value_id is not None:
+            raise ValueError("value_id requires a single-result operation")
         op_id = id if id is not None else f"{self.name}.op{self._counter}"
         if not isinstance(op_id, str) or not op_id:
             raise ValueError("operation id must be a nonempty string")
         if op_id in self._module._operation_ids:
             raise ValueError(f"duplicate operation id: {op_id}")
-        logical_id = value_id if value_id is not None else f"{op_id}.result0"
-        if not isinstance(logical_id, str) or not logical_id:
+        if value_id is not None and (not isinstance(value_id, str) or not value_id):
             raise ValueError("value_id must be a nonempty string")
-        name = f"%ask_v{self._counter}"
-        while name in {value.name for value in self.inputs.values()}:
+        names = lambda: ([f"%ask_v{self._counter}"] if len(result_types) == 1 else
+                         [f"%ask_v{self._counter}_{index}" for index in range(len(result_types))])
+        while set(names()) & {value.name for value in self.inputs.values()}:
             self._counter += 1
-            name = f"%ask_v{self._counter}"
+        values = tuple(Value(name, type_, value_id if value_id is not None else f"{op_id}.result{index}", self)
+                       for index, (name, type_) in enumerate(zip(names(), result_types)))
         attrs = dict(attributes)
         attrs["ask.id"] = mlir_string(op_id)
-        attrs["ask.value_id"] = mlir_string(logical_id)
-        text = (f"{name} = {mlir_string(operation)}(" + ", ".join(value.name for value in operands)
+        if len(values) == 1:
+            attrs["ask.value_id"] = mlir_string(values[0].value_id)
+        result_signature = str(result_types[0]) if len(result_types) == 1 else _types(result_types)
+        text = (", ".join(value.name for value in values) + f" = {mlir_string(operation)}("
+                + ", ".join(value.name for value in operands)
                 + ") {" + ", ".join(f"{key} = {value}" for key, value in attrs.items())
-                + f"}} : {_types([value.type for value in operands])} -> {result_type}")
+                + f"}} : {_types([value.type for value in operands])} -> {result_signature}")
         self._module._operation_ids.add(op_id)
         self._operations.append(text)
         self._counter += 1
-        return Value(name, result_type, logical_id, self)
+        return values[0] if len(values) == 1 else values
 
     def constant(self, value: bool | int | float, *, dtype: str = "i32",
                  id: str | None = None, value_id: str | None = None) -> Value:
@@ -320,7 +335,8 @@ class Graph:
 
     def external(self, *operands: Value, semantics: Semantics, implementation: Implementation,
                  result_type: Type | str | None = None, id: str | None = None,
-                 value_id: str | None = None) -> Value:
+                 value_id: str | None = None,
+                 result_types: Sequence[Type | str] | None = None) -> Value | tuple[Value, ...]:
         self._check_values(operands)
         if semantics._module is not self._module or implementation._module is not self._module:
             raise ValueError("semantics and implementation must be registered in this module")
@@ -328,19 +344,27 @@ class Graph:
             not compatible(value.type, declared) for value, declared in zip(operands, semantics.inputs)
         ):
             raise TypeError("external inputs do not match the registered semantic signature")
-        declared = semantics.results[0]
         if result_type is not None:
-            inferred = as_type(result_type)
-        elif semantics.shape_rule == "same_as" and isinstance(declared, TensorType):
-            source_type = operands[semantics.shape_operand].type
-            if not isinstance(source_type, TensorType):
-                raise TypeError("tensor same_as requires a tensor shape operand")
-            inferred = TensorType(source_type.shape, declared.dtype)
-        else:
-            inferred = declared
-        if not compatible(inferred, declared):
-            raise TypeError("external result type does not match its semantic signature")
-        return self._emit("ask.external", operands, inferred,
+            if result_types is not None:
+                raise ValueError("provide result_type or result_types, not both")
+            result_types = (result_type,)
+        if result_types is not None and len(result_types) != len(semantics.results):
+            raise TypeError("external result count does not match its semantic signature")
+        inferred_types = []
+        for index, declared in enumerate(semantics.results):
+            if result_types is not None:
+                inferred = as_type(result_types[index])
+            elif semantics.shape_rule == "same_as" and isinstance(declared, TensorType):
+                source_type = operands[semantics.shape_operand].type
+                if not isinstance(source_type, TensorType):
+                    raise TypeError("tensor same_as requires a tensor shape operand")
+                inferred = TensorType(source_type.shape, declared.dtype)
+            else:
+                inferred = declared
+            if not compatible(inferred, declared):
+                raise TypeError("external result type does not match its semantic signature")
+            inferred_types.append(inferred)
+        return self._emit("ask.external", operands, inferred_types,
                           {"semantics": f"@{semantics.name}", "implementation": f"@{implementation.name}"},
                           id=id, value_id=value_id)
 
