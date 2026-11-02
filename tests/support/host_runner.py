@@ -31,7 +31,7 @@ def ask_opt_path() -> str:
     env = os.environ.get("ASK_OPT")
     if env:
         return str(Path(env).resolve())
-    for preset in ("all", "triton", "core"):
+    for preset in ("core",):
         candidate = ROOT / "build" / preset / "bin" / "ask-opt"
         if candidate.is_file():
             return str(candidate)
@@ -39,22 +39,6 @@ def ask_opt_path() -> str:
     if found:
         return found
     raise unittest.SkipTest("ASK_OPT is not set and no build/<preset>/bin/ask-opt was found")
-
-
-def boundary_inline_test_path() -> str:
-    env = os.environ.get("ASK_BOUNDARY_INLINE_BIN")
-    if env and Path(env).is_file():
-        return str(Path(env).resolve())
-    driver = Path(ask_opt_path())
-    build_root = driver.parent.parent
-    candidate = build_root / "ask-boundary-inline-test"
-    if candidate.is_file():
-        return str(candidate)
-    for preset in ("all", "triton", "core"):
-        fallback = ROOT / "build" / preset / "ask-boundary-inline-test"
-        if fallback.is_file():
-            return str(fallback)
-    raise unittest.SkipTest("ask-boundary-inline-test binary not found")
 
 
 def llvm_tools_dir() -> Path:
@@ -88,17 +72,6 @@ def ptxas_path() -> str:
     for cuda_bin in sorted(Path("/usr/local").glob("cuda*/bin/ptxas"), reverse=True):
         if cuda_bin.is_file():
             return str(cuda_bin)
-    triton_py = os.environ.get("ASK_TEST_TRITON_PYTHON") or os.environ.get("ASK_TRITON_PYTHON")
-    if triton_py and Path(triton_py).is_file():
-        probe = subprocess.run(
-            [triton_py, "-c",
-             "import pathlib, triton; p = pathlib.Path(triton.__file__).parent / 'backends/nvidia/bin/ptxas'; "
-             "print(p if p.is_file() else '')"],
-            capture_output=True, text=True, timeout=15,
-        )
-        candidate = probe.stdout.strip()
-        if candidate:
-            return candidate
     if os.environ.get("ASK_REQUIRE_CUDA_DEVICE"):
         raise RuntimeError("ptxas is required when ASK_REQUIRE_CUDA_DEVICE is set")
     raise unittest.SkipTest("ptxas not found")

@@ -14,6 +14,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/SourceMgr.h"
 #include <functional>
+#include <set>
 
 using namespace mlir;
 
@@ -63,34 +64,6 @@ Ports ports(const Partition &part) {
   return result;
 }
 
-bool canFuse(const Partition &part) {
-  auto ext = part.external;
-  if (!ext || ext->getNumOperands() != 1 || ext->getNumResults() != 1 || part.operations.size() < 2)
-    return false;
-  auto boundary = dyn_cast<RankedTensorType>(ext->getOperand(0).getType());
-  if (!boundary || !boundary.hasStaticShape() || boundary.getNumElements() == 0 ||
-      ext->getResult(0).getType() != boundary ||
-      ext.resolveSemantics()->getAttrOfType<StringAttr>("effects").getValue() != "none")
-    return false;
-  Ports boundaryPorts = ports(part);
-  if (boundaryPorts.inputs.size() != 1 || boundaryPorts.outputs.size() != 1 ||
-      boundaryPorts.inputs.front().getType() != boundary || boundaryPorts.outputs.front().getType() != boundary)
-    return false;
-  for (auto *operation : part.operations)
-    for (Value value : operation->getResults())
-      if (auto tensor = dyn_cast<RankedTensorType>(value.getType()))
-        if (tensor.getShape() != boundary.getShape()) return false;
-  std::function<bool(Value, Value)> dependsOnlyOn = [&](Value value, Value leaf) {
-    if (value == leaf) return true;
-    auto *owner = value.getDefiningOp();
-    if (!owner || isa<ExternalOp>(owner)) return false;
-    return llvm::all_of(owner->getOperands(), [&](Value operand) { return dependsOnlyOn(operand, leaf); });
-  };
-  if (!dependsOnlyOn(ext->getOperand(0), boundaryPorts.inputs.front()) ||
-      !dependsOnlyOn(boundaryPorts.outputs.front(), ext->getResult(0))) return false;
-  return true;
-}
-
 std::string printModule(ModuleOp module) {
   std::string text;
   llvm::raw_string_ostream stream(text);
@@ -99,8 +72,7 @@ std::string printModule(ModuleOp module) {
   return text;
 }
 
-LogicalResult partition(ModuleOp original, llvm::json::Object &report,
-                        const PartitionOptions &options, std::string &ir) {
+LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::string &ir) {
   auto functions = llvm::to_vector(original.getOps<func::FuncOp>());
   if (functions.size() != 1)
     return original.emitError("CUDA partitioning requires exactly one graph function");
@@ -111,60 +83,18 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report,
       return function.emitError("CUDA partition ports must be static ranked tensors; use tensor<...> for 0-D scalars");
 
   std::vector<Partition> parts;
-  llvm::StringSet<> externalIds;
   for (Operation &operation : function.front()) {
     if (isa<func::ReturnOp>(operation)) continue;
     if (auto external = dyn_cast<ExternalOp>(operation)) {
       for (Type type : llvm::concat<const Type>(external->getOperandTypes(), external->getResultTypes()))
         if (!isa<RankedTensorType>(type))
           return external.emitError("CUDA external ports must be static ranked tensors");
-      externalIds.insert(operation.getAttrOfType<StringAttr>("ask.id").getValue());
       parts.push_back({{&operation}, "external", external});
     } else if (llvm::any_of(operation.getResultTypes(), [](Type type) { return isa<RankedTensorType>(type); })) {
       if (parts.empty() || parts.back().kind != "owned") parts.emplace_back();
       parts.back().operations.push_back(&operation);
     }
   }
-  for (const auto &id : options.unfusedExternals)
-    if (!externalIds.contains(id)) return original.emitError("unknown unfused external ID: ") << id;
-
-  if (options.fuseExternal) {
-    for (size_t index = 0; index < parts.size(); ++index) {
-      if (parts[index].kind != "external" || options.unfusedExternals.count(
-          parts[index].external->getAttrOfType<StringAttr>("ask.id").getValue().str())) continue;
-      size_t begin = index, end = index;
-      Partition candidate = parts[index];
-      candidate.kind = "fused";
-      // Try the whole adjacent region first, then each side independently.
-      if (index && parts[index - 1].kind == "owned") {
-        candidate.operations.insert(candidate.operations.begin(), parts[index - 1].operations.begin(),
-                                    parts[index - 1].operations.end());
-        begin = index - 1;
-      }
-      if (index + 1 < parts.size() && parts[index + 1].kind == "owned") {
-        candidate.operations.append(parts[index + 1].operations);
-        end = index + 1;
-      }
-      if (!canFuse(candidate)) {
-        candidate = parts[index]; candidate.kind = "fused"; begin = end = index;
-        if (index && parts[index - 1].kind == "owned") {
-          candidate.operations.insert(candidate.operations.begin(), parts[index - 1].operations.begin(),
-                                      parts[index - 1].operations.end());
-          if (canFuse(candidate)) begin = index - 1;
-          else { candidate = parts[index]; candidate.kind = "fused"; }
-        }
-        if (begin == index && index + 1 < parts.size() && parts[index + 1].kind == "owned") {
-          candidate.operations.append(parts[index + 1].operations);
-          if (canFuse(candidate)) end = index + 1;
-        }
-      }
-      if (!canFuse(candidate)) continue;
-      parts.erase(parts.begin() + begin, parts.begin() + end + 1);
-      parts.insert(parts.begin() + begin, std::move(candidate));
-      index = begin;
-    }
-  }
-
   llvm::json::Array buffers, inputs, outputs, steps;
   llvm::StringSet<> registeredBuffers;
   auto registerBuffer = [&](Value value) {
@@ -298,7 +228,7 @@ llvm::Expected<PreparedSource> partitionSource(llvm::StringRef source, const Par
   if (!module || failed(verify(*module)) ||
       failed(options.optimize ? optimizeModule(*module, result.report, options.optimization)
                               : prepareModule(*module, result.report)) ||
-      failed(partition(*module, result.report, options, result.ir)))
+      failed(partition(*module, result.report, result.ir)))
     return llvm::createStringError(llvm::inconvertibleErrorCode(), diagnostics);
   return result;
 }

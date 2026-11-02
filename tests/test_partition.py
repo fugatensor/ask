@@ -53,26 +53,19 @@ class PartitionTests(unittest.TestCase):
         self.assertEqual(plan["steps"], [])
         self.assertEqual(plan["inputs"], plan["outputs"])
 
-    def test_fusion_partition_and_selective_fallback_preserve_provenance(self):
+    def test_external_boundaries_preserve_owned_regions_and_provenance(self):
         source = (ROOT / "tests/ir/pipeline.mlir").read_text()
-        fused = self.partition(source)
-        plan = self.assert_plan(fused)
-        self.assertEqual([step["kind"] for step in plan["steps"]], ["fused"])
-        self.assertEqual(plan["steps"][0]["external_id"], "F")
-        self.assertEqual(len(fused.report["markers"]), 2)
-        self.assertIn("ask.source_markers", fused.ir)
-        split = self.partition(source, unfused_externals=["F"])
-        plan = self.assert_plan(split)
+        result = self.partition(source)
+        plan = self.assert_plan(result)
         self.assertEqual([step["kind"] for step in plan["steps"]], ["owned", "external", "owned"])
-        self.assertEqual(plan, self.partition(source, fuse_external=False).report["execution_plan"])
-        self.assertEqual(plan["inputs"], fused.report["execution_plan"]["inputs"])
-        self.assertEqual(plan["outputs"], fused.report["execution_plan"]["outputs"])
-        self.assertEqual(split.report["external_requests"][0]["port_shapes"],
+        self.assertEqual(plan["steps"][1]["external_id"], "F")
+        self.assertEqual(len(result.report["markers"]), 2)
+        self.assertIn("ask.source_markers", result.ir)
+        self.assertEqual(result.report["external_requests"][0]["protocol_version"], 2)
+        self.assertEqual(result.report["external_requests"][0]["port_shapes"],
                          {"input:0": [10], "output:0": [10]})
-        with self.assertRaisesRegex(CompilerError, "unknown unfused external"):
-            self.partition(source, unfused_externals=["missing"])
 
-    def test_fanout_cannot_be_hidden_inside_a_single_output_fusion(self):
+    def test_fanout_preserves_public_outputs(self):
         source = (ROOT / "tests/ir/pipeline.mlir").read_text()
         source = source.replace('-> tensor<10xi32> {\n    %one', '-> (tensor<10xi32>, tensor<10xi32>) {\n    %one')
         source = source.replace('return %y : tensor<10xi32>', 'return %t, %y : tensor<10xi32>, tensor<10xi32>')
@@ -101,11 +94,11 @@ class PartitionTests(unittest.TestCase):
 
     def test_cli_and_binding_have_the_same_contract_and_reject_dynamic_inputs(self):
         source = (ROOT / "tests/ir/pipeline.mlir").read_text()
-        native = self.partition(source, optimize=False, fuse_external=False)
+        native = self.partition(source, optimize=False)
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.json"
             output = Path(directory) / "partition.mlir"
-            result = subprocess.run([ask_opt_path(), "--partition", "--no-optimize", "--no-external-fusion",
+            result = subprocess.run([ask_opt_path(), "--partition", "--no-optimize",
                                      "--report-json", str(report), "-o", str(output)],
                                     input=source, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)

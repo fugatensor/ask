@@ -1,6 +1,7 @@
 """Native CUDA graph lowering, CUDA compilation contract, adapter routing, and prepared executable validation."""
 from __future__ import annotations
 
+import base64
 import copy
 import ctypes
 import json
@@ -18,7 +19,6 @@ for entry in (str(ROOT / "python"), str(ROOT / "tests")):
         sys.path.insert(0, entry)
 
 from ask import CompilerEnvironment, CompilerError, Module, ScalarType, TensorType
-from ask.adapters import AdapterRegistry, CompilerAdapter
 from ask.cuda import (
     CUDAError,
     _artifact_digest,
@@ -28,6 +28,7 @@ from ask.cuda import (
     _host_buffers,
     _kernel_contract,
     compile_cuda,
+    install_external,
     execute,
     execute_i32,
 )
@@ -61,6 +62,23 @@ def make_artifact(size: int = 10, *, block: int = 128, dtype: str = "i32") -> di
         "codegen": {"fp_contract": "fast", "ptx_version": 80},
         "required_element_types": [dtype],
     }
+
+
+def make_external_artifact(format_="ptx", *, shape=(2, 5), payload=None, arch=80):
+    if payload is None:
+        payload = (".version 8.0\n.target sm_80\n.address_size 64\n" if format_ == "ptx"
+                   else base64.b64encode(b"\x7fELF" + b"\0" * 60).decode())
+    artifact = make_artifact()
+    artifact.pop("codegen")
+    artifact.update(protocol_version=2, format=format_, payload=payload,
+                    producer={"name": "fixture", "version": "1"}, target={"backend": "cuda", "arch": arch})
+    artifact["invocation"]["completion"] = "device-event"
+    artifact["invocation"]["arguments"] = [
+        {"argument": i, "binding": name, "kind": "pointer"}
+        for i, name in enumerate(("input:0", "output:0"))]
+    for port in artifact["port_map"]:
+        port["shape"] = list(shape)
+    return artifact
 
 
 def mock_tensor(shape=(2, 5), dtype="i32", pointer=4096, nbytes=40, readonly=False):
@@ -203,31 +221,15 @@ class CUDAContractAndRoutingTests(unittest.TestCase):
             self.assertEqual(math.copysign(1.0, dec[2]), -1.0)
         _check_device_dtype("bf16", 8, 6, "Ampere")
 
-    def test_adapter_registry_and_owned_graph_routing(self):
-        class ToyAdapter(CompilerAdapter):
-            compiler_id = "toy"
-            def cache_identity(self, request, environment, *, timeout):
-                return {"producer": {"name": "toy"}, "adapter": {"revision": "1"}, "dsl": "x",
-                        "config": request, "target": {"backend": "cuda", "arch": 80},
-                        "numerics": {"element_type": "f32"}}
-
-        reg = {"toy": {"id": "toy", "protocol_version": 1, "module": "test.toy",
-                       "factory": "create", "aliases": {"toy_python": "python", "toy_worker": "worker"}}}
-        caps = {"third_party_compilers": ["toy"], "external_llir_fusion": True,
-                "compiler_adapters": [{"id": "toy", "protocol_version": 1, "supports_fusion": True}],
-                "llvm_revision": "rev"}
-        registry = AdapterRegistry(caps, registrations=reg)
-        self.assertEqual(registry.environments(None, {"toy_python": "py", "toy_worker": "w.py"}),
-                         {"toy": CompilerEnvironment("py", "w.py")})
-
+    def test_owned_graph_routing(self):
         owned_compiler = Mock(executable="ask-opt")
         owned_compiler.capabilities.return_value = {
-            "third_party_compilers": [], "compiler_adapters": [], "cuda_graph_codegen": True, "llvm_revision": "rev",
+            "external_execution": True, "external_formats": ["cubin", "ptx"],
+            "cuda_graph_codegen": True, "llvm_revision": "rev",
         }
         owned_compiler.prepare.return_value = SimpleNamespace(report={"external_requests": [], "shape_snapshot": {}})
         stats = {"status": "hit", "counters": {"hits": 1}}
         with tempfile.TemporaryDirectory() as directory, \
-             patch("ask.gpu.AdapterRegistry.load", side_effect=AssertionError("unexpected adapter")), \
              patch("ask.gpu._tool", return_value={"path": "/t", "sha256": "a" * 64}), \
              patch("ask.gpu.IRCache") as cache_cls, \
              patch("ask.gpu.compile_cuda", return_value={"executable_cache": stats}):
@@ -305,6 +307,56 @@ class PreparedExecutableContractTests(unittest.TestCase):
             bad_sparse["invocation"]["arguments"][1]["binding"] = "input:3"
             with self.assertRaises(CUDAError):
                 _kernel_contract(bad_sparse)
+
+
+class ExternalExecutableTests(unittest.TestCase):
+    def test_direct_formats_prepare_and_verify_without_compiler_tools(self):
+        for format_ in ("cubin", "ptx"):
+            with self.subTest(format=format_), tempfile.TemporaryDirectory() as directory:
+                artifact = make_external_artifact(format_)
+                with patch("ask.cuda.subprocess.run", side_effect=AssertionError("unexpected tool")):
+                    receipt = install_external(artifact, directory)
+                    session = SessionRecorder()
+                    executable = CUDAKernel(artifact, receipt, {}, {}).prepare(session)
+                    executable.submit(mock_tensor(), mock_tensor(pointer=8192))
+                self.assertEqual(receipt["compiler_invocations"], 0)
+                self.assertNotIn("llvm_ir", receipt)
+                expected = (base64.b64decode(artifact["payload"]) if format_ == "cubin"
+                            else artifact["payload"].encode())
+                self.assertEqual(session.loads[0][0][0], expected)
+                self.assertEqual(Path(receipt[format_]).read_bytes(), expected)
+                with self.assertRaisesRegex(CUDAError, "already contains"):
+                    install_external(artifact, directory)
+                Path(receipt[format_]).write_bytes(b"tampered")
+                with self.assertRaisesRegex(CUDAError, "digest"), patch("ask.cuda._Driver") as driver:
+                    execute(artifact, receipt, [0] * 10)
+                driver.assert_not_called()
+
+    def test_external_contract_payload_and_receipt_rejections(self):
+        mutations = [
+            lambda a: a.update(protocol_version=True),
+            lambda a: a.update(format="llvm-bitcode"),
+            lambda a: a.update(payload=".version 8.0\0"),
+            lambda a: a.update(format="cubin", payload="invalid base64"),
+            lambda a: a.update(format="cubin", payload=base64.b64encode(b"not ELF").decode()),
+            lambda a: a["invocation"]["arguments"][0].update(kind="scalar"),
+            lambda a: a["invocation"]["arguments"][0].update(binding="scratch:0"),
+            lambda a: a["invocation"].update(completion="host"),
+            lambda a: a["port_map"][0].update(argument=1),
+        ]
+        for mutate in mutations:
+            artifact = make_external_artifact()
+            mutate(artifact)
+            with self.subTest(artifact=artifact), self.assertRaises(CUDAError):
+                _kernel_contract(artifact)
+        with tempfile.TemporaryDirectory() as directory:
+            artifact = make_external_artifact()
+            receipt = install_external(artifact, directory)
+            for field, value in (("format", "cubin"), ("schema_version", 1),
+                                 ("payload_sha256", "0" * 64), ("llvm_ir", "/etc/passwd")):
+                bad = dict(receipt, **{field: value})
+                with self.subTest(field=field), self.assertRaises(CUDAError):
+                    CUDAKernel(artifact, bad, {}, {}).prepare(SessionRecorder())
 
 
 if __name__ == "__main__":

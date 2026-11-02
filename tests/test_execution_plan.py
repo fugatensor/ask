@@ -18,8 +18,8 @@ for path in (ROOT / "python", ROOT / "tests"):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from ask.cuda import CUDAError
-from ask.gpu import _unsupported_fusion
+from ask.cuda import CUDAError, install_external
+from ask.gpu import CUDAKernel
 from ask.plan import CUDAProgram, validate_plan
 from ask.runtime import ExecutionSession
 import test_cuda_compilation as compilation_fixtures
@@ -173,12 +173,38 @@ class ExecutionPlanTests(unittest.TestCase):
             self.assertTrue(complete.query())
             self.assertIs(complete.wait(), complete)
 
-    def test_only_explicit_unsupported_fusion_is_retryable(self):
-        self.assertTrue(_unsupported_fusion('ask-opt: UnsupportedFusion: boundary proof failed'))
-        self.assertTrue(_unsupported_fusion(json.dumps({"error": {"code": "UnsupportedFusion", "stage": "fusion"}})))
-        for error in ('invalid LLVM', 'worker failed: UnsupportedFusion somewhere',
-                      '{"error":{"code":"InvalidRequest","stage":"fusion"}}'):
-            self.assertFalse(_unsupported_fusion(error))
+    def test_external_formats_relocate_and_reject_tampered_packages(self):
+        for format_ in ("cubin", "ptx"):
+            with self.subTest(format=format_), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                artifact = compilation_fixtures.make_external_artifact(format_)
+                codegen = install_external(artifact, root / "source")
+                kernel = CUDAKernel(artifact, codegen, {}, {})
+                plan = sample_plan()
+                for step in plan["steps"]:
+                    step.update(kind="external", external_id=step["id"])
+                program = CUDAProgram(plan, {"first": kernel, "second": kernel})
+                program.save(root / "package")
+                shutil.move(root / "package", root / "relocated")
+                shutil.rmtree(root / "source")
+                loaded = CUDAProgram.load(root / "relocated")
+                with session_fixture() as session:
+                    executable = loaded.prepare(session)
+                    x, z = session.tensor((2, 5), "i32"), session.tensor((2, 5), "i32")
+                    executable.submit(x, z).wait()
+                    self.assertEqual(len(session._native.events), 2)
+                manifest = root / "relocated/program.json"
+                original = json.loads(manifest.read_text())
+                bad = copy.deepcopy(original)
+                bad["steps"]["second"]["files"][format_]["path"] = "../outside"
+                manifest.write_text(json.dumps(bad))
+                with self.assertRaisesRegex(CUDAError, "escapes"):
+                    CUDAProgram.load(root / "relocated")
+                manifest.write_text(json.dumps(original))
+                path = root / "relocated/package/second" / ("kernel." + format_)
+                path.write_bytes(path.read_bytes() + b"changed")
+                with self.assertRaisesRegex(CUDAError, "digest"):
+                    CUDAProgram.load(root / "relocated")
 
 
 if __name__ == "__main__":

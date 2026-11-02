@@ -24,7 +24,7 @@ def main() -> None:
     caps = compiler.capabilities()
     if ask.__version__ != metadata.version("ask-compiler") or ask.__version__ != caps["ask_version"]:
         raise RuntimeError("Python, wheel metadata and native compiler versions differ")
-    if caps["third_party_compilers"] or not caps["host_codegen"]:
+    if not caps["external_execution"] or not caps["host_codegen"]:
         raise RuntimeError("the default wheel must include host codegen and no third-party compilers")
     cli = Compiler(compiler.executable)
     if cli.capabilities() != caps:

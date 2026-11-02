@@ -1,6 +1,0 @@
-#pragma once
-
-// Private adapter contract, generated from dependencies.lock.json.
-#define ASK_TRITON_COMPILER_VERSION "@ASK_TRITON_COMPILER_VERSION@"
-#define ASK_TRITON_ADAPTER_VERSION "@ASK_TRITON_ADAPTER_VERSION@"
-#define ASK_TRITON_PROTOCOL_VERSION @ASK_TRITON_PROTOCOL_VERSION@

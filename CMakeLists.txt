@@ -6,17 +6,12 @@ include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 include(CTest)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
-include(AskCompilerSelection)
-include(AskCompilerRegistry)
-
-set(ASK_THIRD_PARTY_COMPILERS "none" CACHE STRING "none, all, or semicolon-separated compiler IDs")
 set(ASK_TARGET_BACKENDS "host" CACHE STRING "none or host")
-ask_resolve_compilers("${ASK_THIRD_PARTY_COMPILERS}" "${ASK_SUPPORTED_COMPILERS}" ASK_ENABLED_COMPILERS)
 if(NOT ASK_TARGET_BACKENDS STREQUAL "none" AND NOT ASK_TARGET_BACKENDS STREQUAL "host")
   message(FATAL_ERROR "ASK_TARGET_BACKENDS supports 'none' or 'host'; requested '${ASK_TARGET_BACKENDS}'")
 endif()
 
-# Native Python bindings are part of every ASK build, including none.
+# Native Python bindings are part of every ASK build.
 find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/nanobind.lock.json" ASK_NANOBIND_LOCK)
 string(JSON ASK_NANOBIND_VERSION GET "${ASK_NANOBIND_LOCK}" version)
@@ -78,7 +73,7 @@ set(ASK_WITH_HOST 0)
 if(ASK_TARGET_BACKENDS STREQUAL "host")
   set(ASK_WITH_HOST 1)
 endif()
-string(SHA256 ASK_BUILD_ID "${CMAKE_CURRENT_BINARY_DIR};${PROJECT_VERSION};${ASK_LLVM_REVISION};${ASK_ENABLED_COMPILERS};${ASK_WITH_HOST};${Python_SOABI}")
+string(SHA256 ASK_BUILD_ID "${CMAKE_CURRENT_BINARY_DIR};${PROJECT_VERSION};${ASK_LLVM_REVISION};${ASK_WITH_HOST};${Python_SOABI}")
 configure_file(cmake/BuildConfig.h.in generated/ask/BuildConfig.h @ONLY)
 
 separate_arguments(ASK_LLVM_DEFINITIONS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
@@ -92,11 +87,11 @@ endif()
 
 llvm_map_components_to_libnames(ASK_LLVM_LIBS
   Core Support AsmParser BitReader BitWriter Analysis Target MC CodeGen
-  native nativecodegen Passes InstCombine ScalarOpts TransformUtils Linker)
+  native nativecodegen Passes InstCombine ScalarOpts TransformUtils)
 
 add_library(ask_core STATIC
   lib/IR/ASKDialect.cpp lib/IR/ASKOps.cpp lib/Frontend/Prepare.cpp lib/Frontend/Compiler.cpp lib/Frontend/Partition.cpp
-  lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp lib/LLIR/Fuse.cpp lib/LLIR/Inline.cpp
+  lib/LLIR/Import.cpp lib/LLIR/Optimize.cpp
   lib/Lowering/Host.cpp lib/Lowering/CUDA.cpp
   lib/Transforms/Optimize.cpp)
 add_library(ASK::Core ALIAS ask_core)
@@ -121,31 +116,10 @@ set_target_properties(ask-opt PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRE
 
 if(SKBUILD)
   set(ASK_PYTHON_INSTALL_DIR "ask")
-  set(ASK_ADAPTER_INSTALL_DIR "ask/share/ask/adapters")
   install(TARGETS ask-opt RUNTIME DESTINATION ask/_bin COMPONENT Core)
 else()
   set(ASK_PYTHON_INSTALL_DIR "${CMAKE_INSTALL_LIBDIR}/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages/ask")
-  set(ASK_ADAPTER_INSTALL_DIR "${CMAKE_INSTALL_DATADIR}/ask/adapters")
 endif()
-set(ASK_RESOLVED_TRITON_PYTHON "")
-ask_configure_compilers()
-
-# Only this assembly target depends on selected compiler implementations.
-add_library(ask_compilers STATIC lib/Adapters/Registry.cpp ${ASK_ADAPTER_OBJECTS})
-add_library(ASK::Compilers ALIAS ask_compilers)
-set_target_properties(ask_compilers PROPERTIES EXPORT_NAME Compilers POSITION_INDEPENDENT_CODE ON)
-target_compile_features(ask_compilers PUBLIC cxx_std_17)
-target_include_directories(ask_compilers PUBLIC
-  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-  PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_include_directories(ask_compilers SYSTEM PUBLIC $<BUILD_INTERFACE:${LLVM_INCLUDE_DIRS}>)
-target_compile_options(ask_compilers PUBLIC ${ASK_LLVM_DEFINITIONS})
-if(NOT LLVM_ENABLE_RTTI)
-  target_compile_options(ask_compilers PUBLIC $<$<CXX_COMPILER_ID:GNU,Clang>:-fno-rtti>)
-endif()
-target_link_libraries(ask_compilers PUBLIC ${ASK_LLVM_LIBS})
-target_link_libraries(ask-opt PRIVATE ASK::Compilers)
 
 add_library(ask_runtime STATIC lib/Runtime/CUDA.cpp)
 add_library(ASK::Runtime ALIAS ask_runtime)
@@ -157,7 +131,7 @@ target_include_directories(ask_runtime PUBLIC
 target_link_libraries(ask_runtime PRIVATE ${CMAKE_DL_LIBS})
 
 nanobind_add_module(_native NB_STATIC bindings/compiler.cpp bindings/compiler_bridge.cpp bindings/runtime.cpp)
-target_link_libraries(_native PRIVATE ASK::Core ASK::Runtime ASK::Compilers)
+target_link_libraries(_native PRIVATE ASK::Core ASK::Runtime)
 # LLVM is built without RTTI, while nanobind bound classes require RTTI.
 set_source_files_properties(bindings/compiler.cpp bindings/runtime.cpp PROPERTIES
   COMPILE_OPTIONS "$<$<CXX_COMPILER_ID:GNU,Clang>:-frtti>")
@@ -171,7 +145,7 @@ endforeach()
 
 install(TARGETS _native LIBRARY DESTINATION "${ASK_PYTHON_INSTALL_DIR}" COMPONENT Core)
 install(DIRECTORY python/ask/ DESTINATION "${ASK_PYTHON_INSTALL_DIR}" COMPONENT Core FILES_MATCHING PATTERN "*.py")
-install(TARGETS ask_core ask_compilers ask_runtime EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
+install(TARGETS ask_core ask_runtime EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
 if(NOT SKBUILD)
   install(TARGETS ask-opt RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Core)
 endif()
@@ -187,23 +161,11 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BIN
 install(FILES cmake/llvm.lock.json cmake/nanobind.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 
 if(BUILD_TESTING)
-  add_executable(ask-compiler-adapter-test tests/cpp/test_compiler_adapter.cpp)
-  target_link_libraries(ask-compiler-adapter-test PRIVATE ASK::Core)
-  add_test(NAME ask-compiler-adapter COMMAND ask-compiler-adapter-test)
-
-  add_executable(ask-boundary-inline-test tests/cpp/test_boundary_inline.cpp)
-  target_link_libraries(ask-boundary-inline-test PRIVATE ASK::Core)
-  add_test(NAME ask-boundary-inline COMMAND ask-boundary-inline-test)
-
   set(ASK_TEST_COMMON_ENV
     "PYTHONPATH=${CMAKE_CURRENT_BINARY_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/python:${CMAKE_CURRENT_SOURCE_DIR}/tests"
     "ASK_OPT=$<TARGET_FILE:ask-opt>"
-    "ASK_BOUNDARY_INLINE_BIN=$<TARGET_FILE:ask-boundary-inline-test>"
     "ASK_LLVM_TOOLS_DIR=${LLVM_TOOLS_BINARY_DIR}"
     "ASK_NATIVE_REQUIRED=1")
-  if(ASK_RESOLVED_TRITON_PYTHON)
-    list(APPEND ASK_TEST_COMMON_ENV "ASK_TEST_TRITON_PYTHON=${ASK_RESOLVED_TRITON_PYTHON}")
-  endif()
 
   add_test(NAME ask-unit COMMAND "${Python_EXECUTABLE}" -m unittest discover
     -s "${CMAKE_CURRENT_SOURCE_DIR}/tests" -p "test_*.py" -v)
@@ -214,6 +176,5 @@ if(BUILD_TESTING)
   set_tests_properties(ask-gpu PROPERTIES ENVIRONMENT "${ASK_TEST_COMMON_ENV}")
 endif()
 
-message(STATUS "ASK compiler selection: '${ASK_THIRD_PARTY_COMPILERS}' -> [${ASK_ENABLED_COMPILERS}]")
 message(STATUS "ASK target backends: ${ASK_TARGET_BACKENDS}; LLVM/MLIR ${LLVM_PACKAGE_VERSION}")
 message(STATUS "ASK native Python: ${Python_EXECUTABLE} (${Python_SOABI}); nanobind ${ASK_NANOBIND_VERSION}")

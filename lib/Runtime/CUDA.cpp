@@ -267,8 +267,11 @@ std::shared_ptr<DeviceBuffer> Session::importBuffer(std::uint64_t pointer,std::s
 std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string &entry,
     const std::vector<std::string> &requiredTypes,int arch,unsigned parameters) {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();checkTypes(requiredTypes);
-  require(arch>=10 && s.major==arch/10 && s.minor>=arch%10,"CUDA cubin target is incompatible with the selected device");
-  require(cubin.size()>=64 && cubin.compare(0,4,"\x7f" "ELF")==0,"runtime load requires a compiled CUDA cubin ELF image");
+  const bool ptx=cubin.compare(0,4,"\x7f" "ELF")!=0;
+  require(arch>=10 && (ptx ? s.major*10+s.minor>=arch : s.major==arch/10 && s.minor>=arch%10),
+          "CUDA code target is incompatible with the selected device");
+  require(ptx ? cubin.find('\0')==std::string::npos && cubin.find(".version")!=std::string::npos
+              : cubin.size()>=64,"runtime load requires a CUDA cubin ELF image or PTX text");
   require(!cubin.empty() && !entry.empty() && entry.find('\0')==std::string::npos,"kernel binary and entry must be nonempty");
   require(parameters>0 && parameters<=64,"unsupported kernel parameter count");
   auto key=std::make_pair(cubin,entry);
@@ -280,7 +283,10 @@ std::shared_ptr<Kernel> Session::load(const std::string &cubin,const std::string
   ContextScope current(*s.driver,s.context);auto &d=*s.driver;
   auto p=std::make_unique<Kernel::Impl>();p->state=impl->state;p->name=entry;p->parameters=parameters;
   auto kernel=std::shared_ptr<Kernel>(new Kernel(std::move(p)));
-  d.check(d.cuModuleLoadDataEx(&kernel->impl->module,cubin.data(),0,nullptr,nullptr),"cuModuleLoadDataEx");
+  // PTX is a NUL-terminated driver input. Keep the stored/hashable source exact.
+  std::string image=cubin;
+  if(ptx) image.push_back('\0');
+  d.check(d.cuModuleLoadDataEx(&kernel->impl->module,image.data(),0,nullptr,nullptr),"cuModuleLoadDataEx");
   d.check(d.cuModuleGetFunction(&kernel->impl->function,kernel->impl->module,entry.c_str()),"cuModuleGetFunction");
   auto function=kernel->impl->function;
   for (unsigned i=0;i<parameters;++i) { std::size_t offset=0,size=0;

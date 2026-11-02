@@ -1,7 +1,6 @@
-"""Persistent content-addressed IR artifacts, independent of compiler caches.
+"""Persistent content-addressed artifacts, independent of compiler caches.
 
-Callers must check compiler allowlists before accessing this cache and provide
-all compilation inputs/fingerprints in the key. This module checks integrity;
+Callers provide all compilation inputs/fingerprints in the key. This module checks integrity;
 it neither authorizes a compiler nor proves an artifact's semantic correctness.
 """
 
@@ -25,10 +24,7 @@ import weakref
 
 
 _FORMAT_VERSION = 1
-_REQUIRED_KEY_FIELDS = frozenset({
-    "schema_version", "pipeline_version", "graph", "dsl", "config",
-    "llvm_revision", "producer", "adapter", "tools", "target", "shape", "numerics",
-})
+_REQUIRED_KEY_FIELDS = frozenset({"schema_version", "pipeline_version"})
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _thread_guard = threading.Lock()
 _thread_locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
@@ -66,7 +62,7 @@ def _key_bytes(key: dict[str, Any]) -> bytes:
         raise ValueError("cache key is missing: " + ", ".join(sorted(missing)))
     if type(key["schema_version"]) is not int or key["schema_version"] < 1:
         raise ValueError("schema_version must be a positive integer")
-    for name in ("pipeline_version", "llvm_revision"):
+    for name in ("pipeline_version",):
         if not isinstance(key[name], str) or not key[name]:
             raise ValueError(f"{name} must be a nonempty string")
     return _json_bytes(_json_value(key))

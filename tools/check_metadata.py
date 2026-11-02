@@ -51,39 +51,6 @@ def check_source():
     nanobind = json.loads((ROOT / "cmake/nanobind.lock.json").read_text())["version"]
     require(f"nanobind=={nanobind}" in config["build-system"]["requires"],
             "build-system nanobind pin differs from cmake/nanobind.lock.json")
-    llvm = json.loads((ROOT / "cmake/llvm.lock.json").read_text())
-    registry = json.loads((ROOT / "adapters/registry.json").read_text())
-    require(registry.get("schema_version") == 1 and isinstance(registry.get("compilers"), dict),
-            "adapter registry must use schema_version 1 and a compiler map")
-    for directory in registry["compilers"].values():
-        root = ROOT / "adapters" / directory
-        lock = json.loads((root / "dependencies.lock.json").read_text())
-        registration = json.loads((root / "registration.json").read_text())
-        require(registration.get("id") == directory and registration.get("protocol_version") == 1,
-                f"{directory}: registration id/protocol_version must match the registry directory")
-        require(type(registration.get("supports_fusion")) is bool,
-                f"{directory}: registration supports_fusion must be a boolean")
-        worker = registration.get("worker")
-        require(isinstance(worker, str) and worker and (root / worker).is_file(),
-                f"{directory}: registered worker file is missing")
-        aliases = registration.get("aliases", {})
-        require(isinstance(aliases, dict) and set(aliases.values()) <= {"python", "worker"},
-                f"{directory}: aliases must map to python or worker")
-        require(isinstance(registration.get("native_factory"), str)
-                and (root / "CMakeLists.txt").is_file(),
-                f"{directory}: adapters need native_factory and a CMakeLists.txt")
-        if registration["supports_fusion"]:
-            require(isinstance(registration.get("package"), str),
-                    f"{directory}: fusion adapters need a Python package")
-        if registration.get("requires_python"):
-            require(isinstance(registration.get("module"), str)
-                    and isinstance(registration.get("factory"), str),
-                    f"{directory}: Python adapters need module and factory")
-        require(lock["protocol_version"] == registration["protocol_version"],
-                f"{directory}: lock and registration protocol versions differ")
-        require(lock["ask_reader"]["revision"] == llvm["revision"]
-                and lock["ask_reader"]["version"] == llvm["version"],
-                f"{directory}: reader contract differs from the LLVM SDK lock")
     return version, config["project"]["requires-python"]
 
 
@@ -105,13 +72,9 @@ def check_dist(directory, version, requires_python):
                  for item in archive.getmembers() if item.isfile()}
         required = {"PKG-INFO", "README.md", "pyproject.toml", "CMakeLists.txt", "CMakePresets.json",
                     "python/ask/_version.py", "cmake/AskVersion.cmake", "cmake/llvm.lock.json",
-                    "cmake/nanobind.lock.json", "tools/fetch_deps.py", "adapters/registry.json",
-                    "adapters/triton/dependencies.lock.json", "adapters/triton/registration.json",
-                    "adapters/triton/CMakeLists.txt", "adapters/triton/TritonVersion.h.in",
-                    "adapters/triton/worker.py", "adapters/triton/fusion.py",
-                    "adapters/triton/requirements.lock", "adapters/triton/python/__init__.py",
-                    "adapters/triton/lib/TritonBoundary.cpp",
-                    "adapters/triton/include/ask/Adapters/TritonBoundary.h"}
+                    "cmake/nanobind.lock.json", "tools/fetch_deps.py", "python/ask/adapters.py",
+                    "schemas/external-compiler-request-v2.schema.json",
+                    "schemas/external-kernel-artifact-v2.schema.json"}
         require(required <= files.keys(), f"sdist missing required sources: {sorted(required - files.keys())}")
         for name in files:
             require(not any(part in {".deps", "build", "dist", ".venv", "__pycache__", ".git"}
@@ -129,10 +92,10 @@ def check_dist(directory, version, requires_python):
         require(read_version(archive.read("ask/_version.py")) == version, "wheel Python version mismatch")
         require("ask/_bin/ask-opt" in names and any(name.startswith("ask/_native.") and name.endswith(".so") for name in names),
                 "wheel must contain both the native extension and companion CLI")
-        require(json.loads(archive.read("ask/_adapter_registry.json")) == {},
-                "release smoke check expects a core wheel with no enabled adapters")
-        require(not any(name.startswith("ask/_adapters/") or name.startswith("ask/share/ask/adapters/")
-                        for name in names), "core wheel contains adapter resources")
+        require(not any("_adapter_registry" in name or name.startswith("ask/_adapters/")
+                        or name.startswith("ask/share/ask/adapters/") for name in names),
+                "ASK wheel must contain only the generic external execution interface")
+
 
 
 def main():

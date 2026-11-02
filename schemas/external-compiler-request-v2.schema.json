@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "ASK external compiler worker request v1",
+  "title": "ASK external compiler worker request v2",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -12,11 +12,12 @@
     "constants",
     "fixed_options",
     "target",
-    "grid"
+    "grid",
+    "port_shapes"
   ],
   "properties": {
     "protocol_version": {
-      "const": 1
+      "const": 2
     },
     "source": {
       "type": "string",
@@ -28,7 +29,7 @@
     },
     "signature": {
       "type": "object",
-      "minProperties": 2,
+      "minProperties": 1,
       "additionalProperties": {
         "enum": [
           "*i1",
@@ -57,34 +58,14 @@
     },
     "fixed_options": {
       "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "num_warps"
-      ],
-      "properties": {
-        "num_warps": {
-          "enum": [
-            4,
-            8
-          ]
-        },
-        "enable_fp_fusion": {
-          "type": "boolean"
-        },
-        "num_stages": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 5
-        }
-      }
+      "description": "Compiler-specific compile options, interpreted only by the caller-owned worker."
     },
     "target": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "backend",
-        "arch",
-        "warp_size"
+        "arch"
       ],
       "properties": {
         "backend": {
@@ -92,7 +73,7 @@
         },
         "arch": {
           "type": "integer",
-          "minimum": 70,
+          "minimum": 10,
           "maximum": 999
         },
         "warp_size": {
@@ -108,18 +89,6 @@
         "type": "integer",
         "minimum": 1,
         "maximum": 2147483647
-      }
-    },
-    "fusion": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "enabled"
-      ],
-      "properties": {
-        "enabled": {
-          "type": "boolean"
-        }
       }
     },
     "port_shapes": {

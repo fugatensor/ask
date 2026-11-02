@@ -10,7 +10,7 @@ from .compiler import Compiler, CompilerError, PreparedModule
 from .ir import Graph, Implementation, Module, Semantics, Value
 from .types import ScalarType, TensorType
 from .runtime import ExecutionSession, DeviceTensor, Event
-from .adapters import CompilerAdapter, CompilerEnvironment
+from .adapters import CompilerEnvironment
 from .plan import CUDAProgram
 from .gpu import CUDAKernel
 
@@ -19,6 +19,6 @@ __all__ = [
     "Compiler", "CompilerError", "PreparedModule", "Graph", "Implementation",
     "Module", "Semantics", "Value", "ScalarType", "TensorType",
     "ExecutionSession", "DeviceTensor", "Event",
-    "CompilerAdapter", "CompilerEnvironment",
+    "CompilerEnvironment",
     "CUDAKernel", "CUDAProgram",
 ]

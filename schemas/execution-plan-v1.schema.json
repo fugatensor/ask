@@ -116,8 +116,7 @@
         "kind": {
           "enum": [
             "owned",
-            "fused",
-            "external"
+                        "external"
           ]
         },
         "function": {

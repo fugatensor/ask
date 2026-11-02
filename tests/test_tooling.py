@@ -1,4 +1,4 @@
-"""CMake compiler selection allowlist and tools/fetch_deps.py verification tests."""
+"""Build metadata, dependency fetching and CI coverage verification."""
 from __future__ import annotations
 
 import hashlib
@@ -41,7 +41,7 @@ def make_nanobind_bytes(member_name: str = "nanobind-test/cmake/nanobind-config.
     return buf.getvalue()
 
 
-class CompilerSelectionTests(unittest.TestCase):
+class BuildMetadataTests(unittest.TestCase):
     def test_cmake_release_version_rejects_different_python_metadata(self):
         import runpy
         version = runpy.run_path(str(ROOT / "python/ask/_version.py"))["__version__"]
@@ -60,30 +60,6 @@ class CompilerSelectionTests(unittest.TestCase):
             self.assertNotEqual(rejected.returncode, 0)
             self.assertIn("differs from ASK", rejected.stderr)
 
-    def test_cmake_allowlist_resolution(self):
-        cases = {
-            "none": "", "all": "triton", "triton": "triton",
-            "triton;triton": "triton", " triton ": "triton",
-            "": None, "none;triton": None, "all;triton": None,
-            "bogus": None, "triton;;triton": None,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            script = Path(directory) / "selection.cmake"
-            for requested, expected in cases.items():
-                with self.subTest(requested=requested):
-                    script.write_text(
-                        "cmake_minimum_required(VERSION 3.28)\n"
-                        f'include("{ROOT}/cmake/AskCompilerSelection.cmake")\n'
-                        f"ask_resolve_compilers([=[{requested}]=] triton selected)\n"
-                        'message(STATUS "SELECTED=${selected}")\n',
-                        encoding="utf-8",
-                    )
-                    res = subprocess.run(["cmake", "-P", str(script)], capture_output=True, text=True)
-                    if expected is None:
-                        self.assertNotEqual(res.returncode, 0, res.stdout)
-                    else:
-                        self.assertEqual(res.returncode, 0, res.stderr)
-                        self.assertIn("SELECTED=" + expected, res.stdout)
 
 
 class FetchDepsTests(unittest.TestCase):
@@ -186,7 +162,7 @@ class CITestReportTests(unittest.TestCase):
                         runner.check_report(report, {"ask-unit"})
             report.write_text(valid, encoding="utf-8")
             with self.assertRaises(ValueError):
-                runner.check_report(report, {"ask-unit", "ask-triton"})
+                runner.check_report(report, {"ask-unit", "ask-gpu"})
 
 
 if __name__ == "__main__":

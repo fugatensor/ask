@@ -25,8 +25,6 @@ jobs:
             python: '3.10'
           - preset: core
             python: '3.13'
-          - preset: all
-            python: '3.13'
     env:
       CMAKE_BUILD_PARALLEL_LEVEL: '2'
       CTEST_PARALLEL_LEVEL: '1'
@@ -52,18 +50,13 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-llvm-${{ hashFiles('cmake/llvm.lock.json') }}
       - name: Fetch and verify dependencies
         run: python tools/fetch_deps.py
-      - name: Install selected compiler
-        if: matrix.preset == 'all'
-        run: python -m pip install -r adapters/triton/requirements.lock
       - name: Configure and build
         run: |
           cmake --preset "${{ matrix.preset }}" -DPython_EXECUTABLE="$(command -v python)"
           cmake --build --preset "${{ matrix.preset }}"
       - name: Run CPU suites and reject skipped coverage
         run: |
-          extra=()
-          if [[ '${{ matrix.preset }}' == all ]]; then extra+=(--with-triton); fi
-          python tools/run_ci_tests.py --build-dir "build/${{ matrix.preset }}" "${extra[@]}"
+          python tools/run_ci_tests.py --build-dir "build/${{ matrix.preset }}"
       - name: Install and consume the C++ package
         if: matrix.preset == 'core' && matrix.python == '3.13'
         run: |

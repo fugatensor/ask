@@ -3,7 +3,6 @@
 #include "ask/Transforms/Optimize.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/JSON.h"
-#include <set>
 
 namespace ask {
 struct PreparedSource {
@@ -13,7 +12,7 @@ struct PreparedSource {
 
 // Both the Python extension and CLI report the same build capabilities.
 llvm::json::Object compilerCapabilities();
-llvm::json::Array externalRequests(mlir::ModuleOp module, bool fusion = false);
+llvm::json::Array externalRequests(mlir::ModuleOp module);
 // Each call owns its context and diagnostics; no global CLI state or subprocess.
 llvm::Expected<PreparedSource> prepareSource(
     llvm::StringRef source, bool optimize = false,
@@ -22,8 +21,6 @@ llvm::Expected<PreparedSource> prepareSource(
 struct PartitionOptions {
   bool optimize = true;
   OptimizationOptions optimization;
-  bool fuseExternal = true;
-  std::set<std::string> unfusedExternals;
 };
 
 // Partition one static tensor graph into explicit kernel functions. This only

@@ -1,24 +1,25 @@
-"""Explicit compiler adapters selected by the native build's registration set.
+"""Compiler-independent subprocess protocol for externally compiled CUDA code.
 
-Loading this module never imports an external compiler or discovers entrypoints.
-Build authorization is checked before importing any selected adapter module.
+The caller supplies a worker explicitly. ASK neither discovers compiler packages
+nor imports their Python modules; compiler-specific workers belong to callers.
 """
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from importlib import import_module as _import_module
+import hashlib
 import json
 import os
 from pathlib import Path
-from typing import Any, Mapping
+import shutil
+import subprocess
+import tempfile
 
 from .compiler import CompilerError
 
 
 @dataclass(frozen=True)
 class CompilerEnvironment:
-    """Explicit subprocess environment for a registered compiler exporter."""
+    """Explicit worker, optionally run by an isolated Python interpreter."""
     python: str | os.PathLike[str] | None = None
     worker: str | os.PathLike[str] | None = None
 
@@ -35,108 +36,126 @@ class CompilerEnvironment:
             object.__setattr__(self, field, value)
 
 
-class CompilerAdapter(ABC):
-    """Producer-specific policy for an otherwise generic compilation pipeline."""
-    compiler_id: str
-
-    @abstractmethod
-    def cache_identity(self, request: dict[str, Any], environment: CompilerEnvironment,
-                       *, timeout: float) -> dict[str, Any]:
-        """Validate producer policy and return producer/adapter/DSL/numerics identity."""
+def _require(condition, message):
+    if not condition:
+        raise CompilerError(message)
 
 
-def _build_registrations():
-    from . import __path__ as package_paths
-    candidates = [Path(directory) / "_adapter_registry.json" for directory in package_paths]
-    found = [path for path in candidates if path.is_file()]
-    if not found:
-        return {}
-    contents = [json.loads(path.read_text()) for path in found]
-    if any(value != contents[0] for value in contents[1:]):
-        raise CompilerError("multiple ASK builds expose different compiler adapter registrations")
-    if not isinstance(contents[0], dict):
-        raise CompilerError("compiler adapter registration must be an object keyed by compiler ID")
-    return contents[0]
-
-
-class AdapterRegistry:
-    """Only native-enabled IDs may resolve an explicitly registered factory."""
-    def __init__(self, capabilities: dict[str, Any], *, registrations=None):
-        enabled = capabilities.get("third_party_compilers", [])
-        descriptions = capabilities.get("compiler_adapters", [])
-        if not isinstance(enabled, list) or not isinstance(descriptions, list):
-            raise CompilerError("invalid native compiler adapter capabilities")
-        self._enabled = set(enabled)
-        self._capabilities = {item["id"]: item for item in descriptions
-                              if isinstance(item, dict) and isinstance(item.get("id"), str)}
-        self._registrations = registrations
-
-    def require_enabled(self, compiler_id, *, fusion=False):
-        if not isinstance(compiler_id, str) or compiler_id not in self._enabled:
-            raise CompilerError(f"this ASK build does not enable compiler {compiler_id!r}")
-        capability = self._capabilities.get(compiler_id, {})
-        if fusion and capability.get("supports_fusion") is not True:
-            raise CompilerError(f"compiler {compiler_id!r} does not support native LLIR fusion in this build")
-
-    def require_any(self):
-        if not self._enabled:
-            raise CompilerError("this ASK build does not enable any third-party compiler")
-
-    def registration(self, compiler_id):
-        self.require_enabled(compiler_id)
-        if self._registrations is None:
-            self._registrations = _build_registrations()
-        entry = self._registrations.get(compiler_id)
-        if not isinstance(entry, dict) or entry.get("id", compiler_id) != compiler_id:
-            raise CompilerError(f"enabled compiler {compiler_id!r} has no matching Python registration")
-        if entry.get("protocol_version") != self._capabilities.get(compiler_id, {}).get("protocol_version"):
-            raise CompilerError(f"compiler {compiler_id!r} registration protocol differs from the native build")
-        return entry
-
-    def load(self, compiler_id):
-        entry = self.registration(compiler_id)
-        module, factory = entry.get("module"), entry.get("factory")
-        if not isinstance(module, str) or not isinstance(factory, str):
-            raise CompilerError(f"compiler {compiler_id!r} has an invalid adapter factory registration")
-        try:
-            adapter = getattr(_import_module(module), factory)()
-        except (ImportError, AttributeError) as error:
-            raise CompilerError(f"cannot load registered compiler adapter {compiler_id!r}: {error}") from error
-        if not isinstance(adapter, CompilerAdapter) or adapter.compiler_id != compiler_id:
-            raise CompilerError(f"compiler adapter factory {compiler_id!r} returned an incompatible adapter")
-        return adapter
-
-    def environments(self, compilers: Mapping[str, CompilerEnvironment] | None, legacy_options=None):
-        self.require_any()
-        if compilers is not None and not isinstance(compilers, Mapping):
-            raise TypeError("compilers must map compiler IDs to CompilerEnvironment values")
-        result = dict(compilers or {})
-        for compiler_id, environment in result.items():
-            self.require_enabled(compiler_id)
-            if not isinstance(environment, CompilerEnvironment):
-                raise TypeError(f"compiler {compiler_id!r} requires a CompilerEnvironment")
-        legacy = dict(legacy_options or {})
-        if legacy:
-            # Aliases are inert build metadata, not backend-specific conditionals.
-            aliases = {}
-            for compiler_id in sorted(self._enabled):
-                for name, field in self.registration(compiler_id).get("aliases", {}).items():
-                    if name in aliases or field not in ("python", "worker"):
-                        raise CompilerError("ambiguous or invalid compiler environment alias registration")
-                    aliases[name] = (compiler_id, field)
-            grouped = {}
-            for name, value in legacy.items():
-                if name not in aliases:
-                    raise TypeError(f"unknown compiler environment option: {name}")
-                compiler_id, field = aliases[name]
-                if compiler_id in result:
-                    raise TypeError(f"compiler {compiler_id!r} environment was provided twice")
-                fields = grouped.setdefault(compiler_id, {})
-                if field in fields:
-                    raise TypeError(f"compiler {compiler_id!r} environment {field} was provided twice")
-                fields[field] = value
-            for compiler_id, fields in grouped.items():
-                if "worker" not in fields:
-                    raise TypeError(f"compiler {compiler_id!r} requires a worker path")
-                result[compiler_id] = CompilerEnvironment(**fields)
+def _read_json(text):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError(f"duplicate JSON field: {key}")
+            result[key] = value
         return result
+    def invalid(value):
+        raise ValueError(f"non-finite JSON constant: {value}")
+    return json.loads(text, object_pairs_hook=pairs, parse_constant=invalid)
+
+
+def worker_command(environment):
+    if not isinstance(environment, CompilerEnvironment):
+        raise TypeError("compilers must map IDs to CompilerEnvironment values")
+    command = []
+    if environment.python is not None:
+        interpreter = shutil.which(environment.python)
+        _require(interpreter is not None, "compiler Python executable not found")
+        # Do not resolve virtualenv interpreter symlinks.
+        command.append(str(Path(interpreter).absolute()))
+        worker = Path(environment.worker).resolve()
+        _require(worker.is_file(), "compiler worker file not found")
+    else:
+        executable = shutil.which(environment.worker)
+        _require(executable is not None, "compiler worker executable not found")
+        worker = Path(executable).absolute()
+    return [*command, str(worker)]
+
+
+def _run(command, arguments, timeout):
+    try:
+        result = subprocess.run([*command, *arguments], capture_output=True, text=True,
+                                timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise CompilerError("external compiler worker failed", diagnostics=str(error)) from error
+    if result.returncode:
+        raise CompilerError("external compiler worker failed", diagnostics=result.stderr,
+                            returncode=result.returncode)
+    return result.stdout
+
+
+def worker_identity(command, *, timeout, request=None):
+    """Probe transitive producer dependencies before every cache lookup."""
+    try:
+        with tempfile.TemporaryDirectory(prefix="ask-probe-") as directory:
+            arguments = ["--probe"]
+            if request is not None:
+                path = Path(directory) / "request.json"
+                path.write_text(json.dumps(request, allow_nan=False), encoding="utf-8")
+                arguments.extend(["--request", str(path)])
+            probe = _read_json(_run(command, arguments, timeout))
+    except (ValueError, TypeError) as error:
+        raise CompilerError("external compiler probe returned invalid JSON") from error
+    _require(isinstance(probe, dict) and isinstance(probe.get("producer"), dict)
+             and isinstance(probe.get("adapter_version"), str) and probe["adapter_version"],
+             "worker probe requires producer and adapter_version")
+    _require(all(isinstance(probe["producer"].get(k), str) and probe["producer"][k]
+                 for k in ("name", "version")), "worker producer requires name and version")
+    return {"probe": probe, "files": [
+        {"path": path, "sha256": hashlib.sha256(Path(path).read_bytes()).hexdigest()}
+        for path in command]}
+
+
+def export_kernel(command, request, *, timeout):
+    with tempfile.TemporaryDirectory(prefix="ask-external-") as directory:
+        request_path, output_path = Path(directory) / "request.json", Path(directory) / "artifact.json"
+        request_path.write_text(json.dumps(request, allow_nan=False), encoding="utf-8")
+        _run(command, ["--request", str(request_path), "--output", str(output_path)], timeout)
+        try:
+            return normalize_artifact(_read_json(output_path.read_text()), request)
+        except (OSError, ValueError, TypeError) as error:
+            raise CompilerError("external compiler returned an invalid artifact", diagnostics=str(error)) from error
+
+
+_ELEMENT_TYPES = {"*i1": ("bool", 1), "*i32": ("i32", 4), "*i64": ("i64", 8),
+                  "*fp16": ("f16", 2), "*bf16": ("bf16", 2), "*fp32": ("f32", 4)}
+
+
+def normalize_artifact(artifact, request):
+    """Derive tensor ABI from verified ASK ports, rather than adapter boilerplate."""
+    fields = {"protocol_version", "format", "payload", "entry", "target", "producer",
+              "launch", "arguments", "required_element_types"}
+    _require(isinstance(artifact, dict) and set(artifact) == fields,
+             "external artifact must contain exactly the protocol v2 fields")
+    _require(type(artifact["protocol_version"]) is int and artifact["protocol_version"] == 2,
+             "external artifact requires protocol_version 2")
+    _require(artifact["format"] in ("cubin", "ptx"), "external artifact format must be cubin or ptx")
+    _require(isinstance(artifact["target"], dict)
+             and artifact["target"] == request["target"], "external target differs from the request")
+    launch = artifact["launch"]
+    _require(isinstance(launch, dict) and set(launch) == {"grid", "block", "shared_bytes"},
+             "launch requires grid, block and shared_bytes")
+    _require(launch["grid"] == request["grid"], "external launch grid differs from the request")
+    arguments = artifact["arguments"]
+    _require(isinstance(arguments, list) and all(isinstance(a, str) for a in arguments),
+             "external arguments must be ordered buffer bindings")
+    bindings = request["source_bindings"]
+    expected = set(bindings.values())
+    _require(set(arguments) - {"null"} == expected
+             and all(arguments.count(name) == 1 for name in expected),
+             "external arguments must bind every logical port exactly once")
+    ports = []
+    for parameter, logical_port in bindings.items():
+        dtype, size = _ELEMENT_TYPES[request["signature"][parameter]]
+        ports.append({"argument": arguments.index(logical_port), "logical_port": logical_port,
+                      "shape": request["port_shapes"][logical_port], "element_type": dtype,
+                      "storage_bytes": size, "layout": "contiguous_row_major"})
+    normalized = {key: value for key, value in artifact.items() if key not in ("launch", "arguments")}
+    normalized["port_map"] = sorted(ports, key=lambda port: port["argument"])
+    normalized["invocation"] = {"version": 2, "kind": "cuda-kernel", **launch,
+        "completion": "device-event", "arguments": [
+            {"argument": index, "binding": binding, "kind": "pointer"}
+            for index, binding in enumerate(arguments)]}
+    from .cuda import _kernel_contract
+    _kernel_contract(normalized)
+    return normalized

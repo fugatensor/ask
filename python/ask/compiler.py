@@ -116,21 +116,16 @@ class Compiler:
     def prepare(self, module: Module | str) -> PreparedModule:
         return self._process(module, ["--prepare"])
 
-    def partition(self, module: Module | str, *, optimize=True, fuse_external=True,
-                  unfused_externals=()) -> PreparedModule:
+    def partition(self, module: Module | str, *, optimize=True) -> PreparedModule:
         """Partition a verified graph into a sequential CUDA execution plan."""
         source = module.to_mlir() if isinstance(module, Module) else module
         if not isinstance(source, str):
             raise TypeError("partition expects a Module or MLIR string")
-        if type(optimize) is not bool or type(fuse_external) is not bool:
+        if type(optimize) is not bool:
             raise TypeError("partition options must be bool values")
-        if not isinstance(unfused_externals, (tuple, list)) or not all(
-                isinstance(name, str) and name for name in unfused_externals):
-            raise TypeError("unfused_externals must be a list/tuple of external IDs")
         if self._native is not None:
             try:
-                ir, report = self._native.partition(source, optimize=optimize, fuse_external=fuse_external,
-                                                    unfused_externals=list(unfused_externals))
+                ir, report = self._native.partition(source, optimize=optimize)
             except RuntimeError as exc:
                 raise CompilerError("native ASK compiler rejected partitioning", diagnostics=str(exc)) from exc
             return PreparedModule(ir, json.loads(report))
@@ -140,21 +135,17 @@ class Compiler:
             flags = ["--partition"]
             if not optimize:
                 flags.append("--no-optimize")
-            if not fuse_external:
-                flags.append("--no-external-fusion")
-            for name in unfused_externals:
-                flags.extend(["--unfused-external", name])
             self._run([str(root / "input.mlir"), *flags, "-o", str(root / "output.mlir"),
                        "--report-json", str(root / "report.json")])
             return PreparedModule((root / "output.mlir").read_text(), json.loads((root / "report.json").read_text()))
 
     def compile_cuda(self, module: Module | str, *, cache_dir, output_dir,
-                     llc, ptxas, compilers=None, target=None, block_size=128,
-                     ptx_version=80, **legacy_environments):
+                     llc=None, ptxas=None, compilers=None, target=None, block_size=128,
+                     ptx_version=80):
         """Compile an ASK graph or a graph containing an external compiler node.
 
         Pure ASK graphs need an explicit target (backend=cuda, arch=SM number)
-        and work in none builds. External nodes retain their compiler's target
+        and explicit llc/ptxas paths. External nodes retain their compiler's target
         and execution policy. No third-party compiler is loaded for a pure graph.
         """
         from .gpu import compile_graph
@@ -164,7 +155,7 @@ class Compiler:
             self._check_companion()
         return compile_graph(self, module, cache_dir=cache_dir, output_dir=output_dir,
                              compilers=compilers, llc=llc, ptxas=ptxas, target=target,
-                             block_size=block_size, ptx_version=ptx_version, **legacy_environments)
+                             block_size=block_size, ptx_version=ptx_version)
 
     def optimize(self, module: Module | str, *, fold_constants: bool = True,
                  eliminate_dead_code: bool = True,

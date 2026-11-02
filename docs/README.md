@@ -1,24 +1,24 @@
 # ASK 文档目录
 
-ASK 是面向张量框架的底层编译与运行时引擎：上层以 MLIR `ask` dialect 提交静态计算图和可选的外部 DSL（如 Triton），ASK 完成语义与形状检查、基础图优化、原生 LLVM IR 降级与受支持的跨编译器值边界融合。CPU 目标文件由宿主链接调用，CUDA `cubin` 由常驻设备会话执行。
+ASK 接收静态张量图，编译自有 CPU/CUDA 计算，并调度调用方提供的外部 cubin/PTX。自有区域内部执行逐元素融合，外部节点保持独立。
 
-| 文档 | 内容 | 对应代码 |
+| 文档 | 内容 | 对应实现 |
 | --- | --- | --- |
-| [独立安装](安装.md) | wheel 安装、任意路径源码构建、独立 CUDA 工具与包内 worker；不要求相邻源码仓库 | `pyproject.toml`、`tools/fetch_deps.py` |
-| [核心思想](核心思想.md) | ASK 定位、双层 IR 分工、端到端编译执行流水线 | 全局架构 |
-| [01. ASK IR 与数值语义](01-ASK-IR与数值语义.md) | `ask` dialect 结构、6 种标量/张量类型、单步 RNE 常量、`ask.cast` 转换规则、形状推导与 `ask.mark` / `ask.external` | `include/ask/IR/`、`lib/IR/`、`lib/Frontend/Prepare.cpp` |
-| [02. 前端接入与构建配置](02-前端接入与构建配置.md) | 依赖拉取、CMake Preset、可选适配器白名单、Python `nanobind` SDK、C++ `ASK::Core` 与 `ask-opt` CLI | `tools/fetch_deps.py`、`CMakeLists.txt`、`python/ask/`、`bindings/` |
-| [03. 图优化与自有代码生成](03-图优化与自有代码生成.md) | 常量/类型折叠、死代码消除、多输出逐元素融合组、Host 共享循环降级、自有 CUDA 降级与 LLVM IR 清理 | `lib/Transforms/`、`lib/Lowering/`、`lib/LLIR/Optimize.cpp` |
-| [04. 外部编译器适配与边界内联](04-外部编译器适配与边界内联.md) | `adapters/<id>/` 插件机制、导出协议与 ABI v2、通用 LLVM 值边界内联器、Triton `P → F → Q` 融合与 FMA 隔离 | `adapters/`、`lib/Adapters/`、`lib/LLIR/Inline.cpp`、`lib/LLIR/Fuse.cpp` |
-| [05. 常驻运行时与多级缓存](05-常驻运行时与多级缓存.md) | 动态加载 CUDA Driver、`ExecutionSession`、设备张量与 `__cuda_array_interface__` 零拷贝、异步事件、IR / `cubin` 双层持久缓存 | `lib/Runtime/CUDA.cpp`、`bindings/runtime.cpp`、`python/ask/gpu.py` |
-| [06. 工程结构与测试体系](06-工程结构与测试体系.md) | 仓库目录职责、5 个 CTest 测试集、共享多精度测试矩阵与独立数值参考实现 | `tests/`、`adapters/triton/tests/` |
-| [07. FugaTensor 协同与演进路线](07-FugaTensor协同与演进路线.md) | 与上层框架 [FugaTensor](../../fugatensor/docs/README.md) 的职责边界、已实现能力清单与当前限制 | `ask` ↔ `fugatensor` |
-| [08. 图切分与多 Kernel 执行计划](08-图切分与多Kernel执行计划.md) | 高层 MLIR 分区表示、执行计划 JSON v1、融合回退、常驻多 kernel 调度与复杂外部算子接入 | `lib/Frontend/Partition.cpp`、`python/ask/plan.py`、`schemas/execution-plan-v1.schema.json` |
-| [09. 外部编译器适配接入规范](09-外部编译器适配接入规范.md) | 适配器目录/注册、worker 请求与 artifact 契约、缓存身份、可选值边界融合与新编译器接入清单 | `adapters/`、`include/ask/Adapters/`、`python/ask/adapters.py`、`schemas/` |
+| [独立安装](安装.md) | wheel、源码构建、独立 CUDA 工具和调用方 worker | `pyproject.toml`、`tools/fetch_deps.py` |
+| [核心思想](核心思想.md) | 框架分工、IR 边界和执行流程 | 全局架构 |
+| [01. ASK IR 与数值语义](01-ASK-IR与数值语义.md) | 显式类型、RNE、cast、形状与外部声明 | `lib/IR/`、`lib/Frontend/Prepare.cpp` |
+| [02. 前端接入与构建配置](02-前端接入与构建配置.md) | core 构建、Python/C++/CLI、版本与分发 | `CMakeLists.txt`、`bindings/`、`python/ask/compiler.py` |
+| [03. 图优化与自有代码生成](03-图优化与自有代码生成.md) | 折叠、DCE、自有融合、Host/CUDA 降级 | `lib/Transforms/`、`lib/Lowering/` |
+| [04. 外部产物与执行接口](04-外部产物与执行接口.md) | cubin/PTX、端口 ABI 和 worker 配置 | `python/ask/adapters.py`、`python/ask/cuda.py` |
+| [05. 常驻运行时与多级缓存](05-常驻运行时与多级缓存.md) | 会话、CAI、异步事件与缓存 | `lib/Runtime/`、`python/ask/runtime.py`、`python/ask/cache.py` |
+| [06. 工程结构与测试体系](06-工程结构与测试体系.md) | 目录职责、两个 CTest 目标、数值参考和 CI | `tests/`、`.github/workflows/ci.yml` |
+| [07. FugaTensor 协同与演进路线](07-FugaTensor协同与演进路线.md) | 两仓分工和当前支持边界 | ASK 与 FugaTensor |
+| [08. 图切分与多 Kernel 执行计划](08-图切分与多Kernel执行计划.md) | owned/external 分区、JSON v1、编译包和调度 | `lib/Frontend/Partition.cpp`、`python/ask/plan.py` |
+| [09. 外部编译器适配接入规范](09-外部编译器适配接入规范.md) | 通用 worker 请求/响应协议 v2 与缓存身份 | `python/ask/adapters.py`、`schemas/` |
 
 ## 关联仓库文档
 
-以下相对链接用于联合浏览源码文档，安装和执行 ASK 不依赖这些目录。
+以下相对链接用于联合浏览源码文档，ASK 构建和运行不依赖这些目录。
 
 - [FugaTensor 文档目录](../../fugatensor/docs/README.md)
 - [FugaTensor 架构总览](../../fugatensor/docs/architecture/README.md)

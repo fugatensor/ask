@@ -31,4 +31,3 @@ sdist.exclude = [".deps/**", "build/**", "dist/**", ".venv/**", "**/__pycache__/
 
 [tool.scikit-build.cmake.define]
 BUILD_TESTING = "OFF"
-ASK_THIRD_PARTY_COMPILERS = "none"

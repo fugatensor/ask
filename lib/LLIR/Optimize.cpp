@@ -38,9 +38,7 @@ llvm::json::Object counts(const llvm::Module &module) {
 }
 
 bool isTraceMetadata(llvm::StringRef name) {
-  return name.starts_with("ask.trace") || name.starts_with("ask.boundary_map") ||
-         name.starts_with("ask.boundarymap") ||
-         name.starts_with("ask.BoundaryMap") ||
+  return name.starts_with("ask.trace") ||
          name.starts_with("ask.instruction_map") ||
          name.starts_with("ask.ssa_map") || name.starts_with("ask.value_map");
 }
@@ -208,7 +206,7 @@ llvm::Error optimizeLLVMIR(llvm::Module &module, llvm::json::Object &report) {
       {"removed_instruction_attachments", removedAttachments},
       {"removed_object_attachments", removedObjectAttachments},
       {"unvalidated_named_metadata", std::move(unvalidatedMetadata)},
-      {"invalidated_analyses", llvm::json::Array{"llvm_ssa_locations", "trace", "BoundaryMap"}}};
+      {"invalidated_analyses", llvm::json::Array{"llvm_ssa_locations", "trace"}}};
   return llvm::Error::success();
 }
 

@@ -1,3 +1,0 @@
-# Exact compiler pin, checked against dependencies.lock.json during configuration.
-# This is not a hash-locked portable Python environment or a complete wheel lock.
-triton==3.7.1

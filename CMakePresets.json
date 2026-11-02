@@ -3,18 +3,12 @@
   "cmakeMinimumRequired": {"major": 3, "minor": 28, "patch": 0},
   "configurePresets": [
     {"name": "base", "hidden": true, "generator": "Ninja", "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "BUILD_TESTING": "ON", "ASK_TARGET_BACKENDS": "host"}},
-    {"name": "core", "inherits": "base", "binaryDir": "${sourceDir}/build/core", "cacheVariables": {"ASK_THIRD_PARTY_COMPILERS": "none"}},
-    {"name": "triton", "inherits": "base", "binaryDir": "${sourceDir}/build/triton", "cacheVariables": {"ASK_THIRD_PARTY_COMPILERS": "triton"}},
-    {"name": "all", "inherits": "base", "binaryDir": "${sourceDir}/build/all", "cacheVariables": {"ASK_THIRD_PARTY_COMPILERS": "all"}}
+    {"name": "core", "inherits": "base", "binaryDir": "${sourceDir}/build/core"}
   ],
   "buildPresets": [
-    {"name": "core", "configurePreset": "core"},
-    {"name": "triton", "configurePreset": "triton"},
-    {"name": "all", "configurePreset": "all"}
+    {"name": "core", "configurePreset": "core"}
   ],
   "testPresets": [
-    {"name": "core", "configurePreset": "core", "output": {"outputOnFailure": true}},
-    {"name": "triton", "configurePreset": "triton", "output": {"outputOnFailure": true}},
-    {"name": "all", "configurePreset": "all", "output": {"outputOnFailure": true}}
+    {"name": "core", "configurePreset": "core", "output": {"outputOnFailure": true}}
   ]
 }

@@ -60,11 +60,11 @@ def validate_plan(plan):
             "invalid execution plan step fields")
         name, kind = step["id"], step["kind"]
         _require(_identifier(name) and name not in steps, "invalid or duplicate plan step ID")
-        _require(kind in ("owned", "fused", "external") and _identifier(step["function"]),
+        _require(kind in ("owned", "external") and _identifier(step["function"]),
                  "invalid plan step kind or function symbol")
         _require((kind == "owned" and "external_id" not in step)
                  or (kind != "owned" and isinstance(step.get("external_id"), str) and bool(step["external_id"])),
-                 "external and fused steps require an external_id; owned steps must omit it")
+                 "external steps require an external_id; owned steps must omit it")
         for port in ("inputs", "outputs", "depends_on"):
             _require(isinstance(step[port], list) and all(isinstance(n, str) for n in step[port]),
                      f"step {port} must be an array of IDs")
@@ -197,10 +197,16 @@ class CUDAProgram:
                 _require(isinstance(item, dict) and set(item) == {"artifact", "codegen", "files"},
                          "invalid compiled step receipt")
                 artifact = json.loads(_read_reference(root, item["artifact"])[0])
+                _require(isinstance(artifact, dict), "compiled artifact must be an object")
                 codegen = json.loads(_read_reference(root, item["codegen"])[0])
-                _require(isinstance(codegen, dict) and isinstance(item["files"], dict)
-                         and {"llvm_ir", "cubin"} <= set(item["files"]) <= {"llvm_ir", "cubin", "ptx"},
-                         "invalid compiled step file set")
+                _require(isinstance(codegen, dict) and isinstance(item["files"], dict), "invalid compiled step file set")
+                file_keys = set(item["files"])
+                if artifact.get("format") == "llvm-ir":
+                    _require({"llvm_ir", "cubin"} <= file_keys <= {"llvm_ir", "cubin", "ptx"},
+                             "invalid compiled step file set")
+                else:
+                    _require(artifact.get("format") in ("cubin", "ptx") and file_keys == {artifact["format"]},
+                             "invalid external step file set")
                 for key, reference in item["files"].items():
                     _, path = _read_reference(root, reference)
                     _require(codegen.get(key) == reference["path"], "codegen path disagrees with package receipt")

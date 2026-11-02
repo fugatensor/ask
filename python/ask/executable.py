@@ -4,32 +4,15 @@ from __future__ import annotations
 import copy
 import ctypes
 import math
-from pathlib import Path
 
-from .cuda import (_artifact_digest, _kernel_contract, _digest, _fp_contract,
+from .cuda import (_kernel_contract, _validated_image,
                    _required_types, _require, _storage_dtype, _STORAGE_TYPES)
 
 
 def validate_kernel_package(kernel):
     artifact, codegen = copy.deepcopy(kernel.artifact), copy.deepcopy(kernel.codegen)
     entry, invocation, inputs, outputs = _kernel_contract(artifact)
-    dtype = _storage_dtype(inputs, outputs)
-    _require(isinstance(codegen, dict) and type(codegen.get("schema_version")) is int
-             and codegen["schema_version"] == 1, "unsupported codegen receipt version")
-    arch = artifact["target"]["arch"]
-    _require(codegen.get("entry") == entry and codegen.get("arch") == arch
-             and codegen.get("invocation") == invocation
-             and codegen.get("element_type") == dtype
-             and codegen.get("fp_contract") == _fp_contract(artifact, dtype),
-             "codegen and execution contracts disagree")
-    _require(codegen.get("artifact_sha256") == _artifact_digest(artifact),
-             "artifact digest differs from the compiled artifact")
-    source_digest = _digest(artifact["payload"].encode("utf-8"))
-    _require(source_digest == codegen.get("llvm_sha256")
-             and _digest(Path(codegen["llvm_ir"]).read_bytes()) == source_digest,
-             "LLVM input digest differs from the compiled IR")
-    binary = Path(codegen["cubin"]).read_bytes()
-    _require(_digest(binary) == codegen.get("cubin_sha256"), "cubin digest mismatch")
+    binary = _validated_image(artifact, codegen)
 
     return artifact, codegen, binary, entry, invocation, inputs, outputs
 

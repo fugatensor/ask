@@ -46,16 +46,15 @@ llvm::json::Value attrJSON(mlir::Attribute attr) {
 }
 } // namespace
 
-llvm::json::Array externalRequests(mlir::ModuleOp module, bool fusion) {
+llvm::json::Array externalRequests(mlir::ModuleOp module) {
   using namespace llvm;
   json::Array requests;
   module.walk([&](ExternalOp op) {
     auto impl = op.resolveImplementation();
-    json::Object request{{"protocol_version", 1}};
+    json::Object request{{"protocol_version", 2}};
     for (StringRef key : {"source", "entry", "signature", "source_bindings", "constants", "target", "grid"})
       if (auto attr = impl->getAttr(key)) request[key] = attrJSON(attr);
     request["fixed_options"] = impl->getAttr("options") ? attrJSON(impl->getAttr("options")) : json::Value(json::Object{});
-    if (fusion) request["fusion"] = json::Object{{"enabled", true}};
     request["compiler"] = attrJSON(impl->getAttr("compiler"));
     request["op_id"] = attrJSON(op->getAttr("ask.id"));
     request["function"] = op->getParentOfType<mlir::func::FuncOp>().getSymName();
@@ -81,26 +80,16 @@ llvm::json::Array externalRequests(mlir::ModuleOp module, bool fusion) {
 
 llvm::json::Object compilerCapabilities() {
   using namespace llvm;
-  json::Array compilers;
-  json::Array adapterDescriptions;
-  bool supportsFusion = false;
-#define ASK_COMPILER_ADAPTER(ID, FACTORY, FUSION) \
-  compilers.push_back(ID); \
-  adapterDescriptions.push_back(json::Object{{"id", ID}, {"protocol_version", 1}, {"supports_fusion", bool(FUSION)}}); \
-  supportsFusion |= bool(FUSION);
-#include "ask/Adapters/Manifest.inc"
-#undef ASK_COMPILER_ADAPTER
-  bool hasCompilers = !compilers.empty();
   return json::Object{
       {"schema_version", 1}, {"build_id", ASK_BUILD_ID}, {"ask_version", ASK_VERSION}, {"llvm_version", ASK_LLVM_VERSION},
-      {"llvm_revision", ASK_LLVM_REVISION}, {"third_party_compilers", std::move(compilers)},
-      {"compiler_adapters", std::move(adapterDescriptions)},
+      {"llvm_revision", ASK_LLVM_REVISION},
       {"prepare", true}, {"partition", true}, {"cuda_execution_plan", true},
       {"native_llvm_import", true}, {"host_codegen", bool(ASK_WITH_HOST)},
       {"ir_optimization", true}, {"elementwise_fusion", true}, {"llvm_optimization", true},
-      {"external_export", hasCompilers}, {"gpu_execution", true},
+      {"external_execution", true}, {"external_formats", json::Array{"cubin", "ptx"}},
+      {"gpu_execution", true},
       {"cuda_lowering", true}, {"cuda_graph_codegen", true},
-      {"external_llir_fusion", supportsFusion}, {"cuda_execution_via_python", true},
+      {"cuda_execution_via_python", true},
       {"supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
       {"explicit_cast", true}, {"mixed_precision", true},
       {"host_bf16_hardware_supported", bool(ASK_WITH_HOST) && nativeHostSupportsBF16()},

@@ -85,7 +85,7 @@ llvm::Error validateFunction(mlir::func::FuncOp graph,
     if (auto failure = checkType(type)) return failure;
   for (mlir::Operation &op : graph.front()) {
     if (mlir::isa<ExternalOp>(op))
-      return error("ASK-owned CUDA lowering cannot compile ask.external; use its compiler adapter");
+      return error("ASK-owned CUDA lowering cannot compile ask.external; provide an external executable through an execution plan");
     if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, mlir::func::ReturnOp>(op))
       return error("CUDA lowering requires prepared constant/splat/add/mul/cast graphs; unsupported operation " + op.getName().getStringRef());
     for (auto type : op.getResultTypes())

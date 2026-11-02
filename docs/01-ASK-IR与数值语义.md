@@ -75,4 +75,4 @@ Python SDK（`python/ask/ir.py`）在编码 `f16`、`bf16`、`f32` 标量常量�
 - `ask.semantics` 描述图级接口（输入输出秩与 dtype、形状规则及 `effects = "none"`），供图校验和端口连接使用。当前不支持有状态外部算子或 token；高层 DCE 保守保留 `ask.external`。
 - `ask.implementation` 描述具体编译配置（`compiler = "triton"`、DSL 源码、`entry`、`signature`、`source_bindings`、`constants`、`options`、`target`、`grid`）。
 
-拆分后，未启用第三方适配器的 `core` 构建也能验证和准备含 `ask.external` 的图，并在 `report["external_requests"]` 中导出标准化请求；更换目标配置时也无需改动外层图语义。
+ASK 构建始终可以验证和准备含 `ask.external` 的图，并在 `report["external_requests"]` 中导出协议 v2 请求。`compiler` 是调用方提供的 worker 映射键，不对应构建白名单；更换编译配置无需改动外层图语义。实际产物通过[外部执行接口](04-外部产物与执行接口.md)进入运行时。

@@ -18,14 +18,14 @@ namespace ask::llir {
 ///
 /// Module-level ask.abi and ask.shape_snapshot remain semantic records. All
 /// ask.* instruction attachments and known module/function/global
-/// trace/BoundaryMap records are removed because their SSA locations may become
+/// trace records are removed because their SSA locations may become
 /// stale. Other ask.* named metadata is retained but reported as unvalidated,
 /// never as an exact map.
 /// LLVM/target metadata is left to LLVM's own preservation rules.
 ///
 /// This mutates module. A caller needing transactions must pass a clone and
 /// commit it only on success; discard it on failure. The report is updated only
-/// on success, under "llir_optimization". Caller-owned trace/BoundaryMap data
+/// on success, under "llir_optimization". Caller-owned trace data
 /// outside the module must also be invalidated after a successful call.
 /// Pass status is "applied" only when that pass changes IR; metadata cleanup
 /// is reported separately by "metadata_changed".

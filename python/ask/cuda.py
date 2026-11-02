@@ -2,10 +2,12 @@
 
 Importing this module needs only the standard library. The driver is loaded only
 by execute; no third-party compiler package is imported.
-Code generation consumes the supplied LLVM file, including ASK's transformations.
+Owned code generation consumes LLVM IR; external cubin/PTX is loaded unchanged.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import ctypes
 import ctypes.util
 import hashlib
@@ -51,9 +53,14 @@ def _kernel_contract(artifact):
     a producer's DSL constants, scheduling metadata or private proof records.
     """
     _require(isinstance(artifact, dict), "artifact must be an object")
-    _require(artifact.get("format") == "llvm-ir", "expected native LLVM IR artifact")
+    format_ = artifact.get("format")
+    _require(format_ in ("llvm-ir", "cubin", "ptx"), "expected LLVM IR, cubin or PTX artifact")
     _require(isinstance(artifact.get("payload"), str) and bool(artifact["payload"]),
-             "artifact must carry the LLVM IR that will actually be compiled")
+             "artifact must carry its code payload")
+    if format_ != "llvm-ir":
+        _require(type(artifact.get("protocol_version")) is int and artifact["protocol_version"] == 2,
+                 "external executable protocol version 2 is required")
+        _external_payload(artifact)
     entry = artifact.get("entry")
     _require(isinstance(entry, str) and entry.isascii() and entry.isidentifier(), "unsupported entry name")
     target = artifact.get("target")
@@ -77,7 +84,9 @@ def _kernel_contract(artifact):
     bindings = {}
     for index, argument in enumerate(arguments):
         _require(isinstance(argument, dict) and type(argument.get("argument")) is int
-                 and argument["argument"] == index and argument.get("llvm_type") in ("ptr", "ptr addrspace(1)"),
+                 and argument["argument"] == index
+                 and (argument.get("llvm_type") in ("ptr", "ptr addrspace(1)") if format_ == "llvm-ir"
+                      else argument.get("kind") == "pointer"),
                  "invalid CUDA pointer argument mapping")
         binding = argument.get("binding")
         _require(isinstance(binding, str) and (binding == "null" or
@@ -115,7 +124,11 @@ def _kernel_contract(artifact):
         ordered.append(tuple(logical_ports[f"{kind}:{index}"] for index in range(len(group))))
     incoming, outgoing = ordered
     _require(bool(outgoing), "CUDA graph requires at least one output")
-    _fp_contract(artifact)
+    if format_ == "llvm-ir":
+        _fp_contract(artifact)
+    else:
+        _require(invocation.get("completion") == "device-event", "external completion must use a device event")
+        _require(isinstance(artifact.get("producer"), dict), "external artifact requires producer metadata")
     _required_types(artifact)
     return entry, invocation, incoming, outgoing
 
@@ -201,7 +214,7 @@ def _storage_dtype(inputs, outputs):
 
 
 def _fp_contract(artifact, dtype=None):
-    """Read the adapter-normalized backend policy, independent of its producer."""
+    """Read ASK-owned LLVM code generation policy."""
     options = artifact.get("codegen")
     _require(isinstance(options, dict) and options.get("fp_contract") in ("on", "off", "fast")
              and type(options.get("ptx_version")) is int and 10 <= options["ptx_version"] <= 999,
@@ -232,6 +245,7 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=N
     No producer-supplied binary is reused. Cache counters describe this request.
     """
     entry, invocation, inputs, outputs = _kernel_contract(artifact)
+    _require(artifact["format"] == "llvm-ir", "compile_cuda requires owned LLVM IR; use install_external for cubin/PTX")
     dtype = _storage_dtype(inputs, outputs)
     arch = artifact["target"]["arch"]
     required = _required_types(artifact, dtype)
@@ -331,6 +345,88 @@ def compile_cuda(llvm_ir, artifact, output_directory, *, llc, ptxas, cache_dir=N
     return result
 
 
+def _external_payload(artifact):
+    """Decode executable bytes without translating or modifying producer code."""
+    payload = artifact["payload"]
+    if artifact["format"] == "cubin":
+        try:
+            binary = base64.b64decode(payload, validate=True)
+        except (ValueError, binascii.Error) as error:
+            raise CUDAError("cubin payload must be valid base64") from error
+        _require(len(binary) >= 64 and binary.startswith(b"\x7fELF"),
+                 "cubin payload must contain a CUDA ELF image")
+        return binary
+    _require(artifact["format"] == "ptx" and "\0" not in payload,
+             "PTX payload must be text without embedded NUL bytes")
+    return payload.encode("utf-8")
+
+
+def install_external(artifact, output_directory):
+    """Package a producer cubin or PTX without invoking an ASK compiler tool.
+
+    PTX remains PTX on disk. The CUDA driver performs JIT compilation when the
+    session loads it; no llc or ptxas executable is needed for this path.
+    """
+    entry, invocation, inputs, outputs = _kernel_contract(artifact)
+    _require(artifact["format"] in ("cubin", "ptx"), "external executable must be cubin or PTX")
+    binary = _external_payload(artifact)
+    format_ = artifact["format"]
+    directory = Path(output_directory).resolve()
+    directory.mkdir(parents=True, exist_ok=True)
+    path, receipt = directory / ("kernel." + format_), directory / "codegen.json"
+    _require(not path.exists() and not receipt.exists(), "codegen destination already contains artifacts; use a fresh directory")
+    result = {"schema_version": 2, "format": format_, "entry": entry,
+              "arch": artifact["target"]["arch"], "element_type": _storage_dtype(inputs, outputs),
+              "artifact_sha256": _artifact_digest(artifact), "payload_sha256": _digest(binary),
+              format_: str(path), format_ + "_sha256": _digest(binary),
+              "invocation": invocation, "compiler_invocations": 0,
+              "original_producer_binary_used": format_ == "cubin"}
+    created = []
+    try:
+        for destination, contents in ((path, binary), (receipt,
+                (json.dumps(result, indent=2, sort_keys=True, allow_nan=False) + "\n").encode())):
+            with destination.open("xb") as stream:
+                created.append(destination)
+                stream.write(contents)
+    except BaseException:
+        for destination in created:
+            destination.unlink(missing_ok=True)
+        raise
+    return result
+
+
+def _validated_image(artifact, codegen):
+    """Validate a package before any driver call, returning its exact code bytes."""
+    entry, invocation, inputs, outputs = _kernel_contract(artifact)
+    dtype = _storage_dtype(inputs, outputs)
+    external = artifact["format"] != "llvm-ir"
+    _require(isinstance(codegen, dict) and type(codegen.get("schema_version")) is int
+             and codegen["schema_version"] == (2 if external else 1), "unsupported codegen receipt version")
+    _require(codegen.get("entry") == entry and codegen.get("arch") == artifact["target"]["arch"]
+             and codegen.get("invocation") == invocation and codegen.get("element_type") == dtype,
+             "codegen and execution contracts disagree")
+    _require(codegen.get("artifact_sha256") == _artifact_digest(artifact),
+             "artifact digest differs from the compiled artifact")
+    if external:
+        format_ = artifact["format"]
+        _require(codegen.get("format") == format_, "executable format differs from its artifact")
+        _require(set(codegen) & {"llvm_ir", "cubin", "ptx"} == {format_}
+                 and isinstance(codegen.get(format_), str) and bool(codegen[format_]),
+                 "external receipt must reference exactly its executable format")
+        binary = Path(codegen[format_]).read_bytes()
+        _require(binary == _external_payload(artifact) and _digest(binary) == codegen.get("payload_sha256")
+                 and _digest(binary) == codegen.get(format_ + "_sha256"), "executable payload digest mismatch")
+    else:
+        _require(codegen.get("fp_contract") == _fp_contract(artifact, dtype), "codegen and execution contracts disagree")
+        source_digest = _digest(artifact["payload"].encode("utf-8"))
+        _require(source_digest == codegen.get("llvm_sha256")
+                 and _digest(Path(codegen["llvm_ir"]).read_bytes()) == source_digest,
+                 "LLVM input digest differs from the compiled IR")
+        binary = Path(codegen["cubin"]).read_bytes()
+        _require(_digest(binary) == codegen.get("cubin_sha256"), "cubin digest mismatch")
+    return binary
+
+
 class _Driver:
     def __init__(self, library=None):
         candidates = [library] if library else [ctypes.util.find_library("cuda"),
@@ -410,18 +506,7 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
     _require(isinstance(codegen, dict), "codegen receipt must be an object")
     host_input, host_output = _host_buffers(values, size, dtype)
     arch = artifact["target"]["arch"]
-    _require(codegen.get("entry") == entry and codegen.get("arch") == arch
-             and codegen.get("invocation") == invocation and codegen.get("element_type") == dtype
-             and codegen.get("fp_contract") == _fp_contract(artifact, dtype),
-             "codegen and execution contracts disagree")
-    _require(codegen.get("artifact_sha256") == _artifact_digest(artifact),
-             "artifact digest differs from the compiled artifact")
-    llvm_digest = _digest(artifact["payload"].encode("utf-8"))
-    _require(llvm_digest == codegen.get("llvm_sha256")
-             and _digest(Path(codegen["llvm_ir"]).read_bytes()) == llvm_digest,
-             "LLVM input digest differs from the compiled IR")
-    binary = Path(codegen["cubin"]).read_bytes()
-    _require(_digest(binary) == codegen.get("cubin_sha256"), "cubin digest mismatch")
+    binary = _validated_image(artifact, codegen)
     driver = _Driver(driver_library)
     driver.call("cuInit", 0)
     device, driver_version = ctypes.c_int(), ctypes.c_int()
@@ -435,8 +520,10 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
         _check_device_dtype(intermediate_type, major, minor, name.value.decode())
     # Cubin compatibility for ordinary sm targets is within the same major
     # family with an equal or newer minor revision; do not assume across-major.
-    _require(major == arch // 10 and minor >= arch % 10,
-             f"sm_{arch} cubin is incompatible with device capability {major}.{minor}; "
+    compatible = (10 * major + minor >= arch if artifact["format"] == "ptx"
+                  else major == arch // 10 and minor >= arch % 10)
+    _require(compatible,
+             f"sm_{arch} code is incompatible with device capability {major}.{minor}; "
              "compile the graph for the selected device's target architecture")
     grid = invocation["grid"]
     _require(all(value <= driver.attribute(device, attr) for value, attr in zip(grid, (5, 6, 7))),
@@ -491,8 +578,11 @@ def execute(artifact, codegen, values, *, device_ordinal=0, driver_library=None)
                            "compute_capability": [major, minor], "driver_version": driver_version.value},
                 "grid": grid, "block": invocation["block"],
                 "parameter_layout": parameter_layout, "registers_per_thread": registers,
-                "llvm_sha256": codegen["llvm_sha256"], "cubin_sha256": codegen["cubin_sha256"],
-                "device_execution_performed": True, "original_producer_binary_used": False}
+                "code_sha256": _digest(binary),
+                **({"llvm_sha256": codegen["llvm_sha256"], "cubin_sha256": codegen["cubin_sha256"]}
+                   if artifact["format"] == "llvm-ir" else {artifact["format"] + "_sha256": _digest(binary)}),
+                "device_execution_performed": True,
+                "original_producer_binary_used": artifact["format"] == "cubin"}
     finally:
         # Best-effort cleanup must not hide the original compiler/launch error.
         for allocation in reversed(allocations):

@@ -24,10 +24,10 @@ def check_report(path: Path, expected: set[str]) -> None:
             raise ValueError(f"CTest suite did not pass: {name}")
         output = case.findtext("system-out", "")
         # CTest considers a unittest process successful even when all its tests
-        # are skipped. Do not let absent native tools or Triton pass this gate.
+        # are skipped. Do not let absent native tools or the compiler pass this gate.
         if re.search(r"\bskipped=[1-9]\d*|\.\.\. skipped ", output):
             raise ValueError(f"CTest suite contains skipped Python tests: {name}")
-        if name in {"ask-unit", "ask-triton"} and not re.search(
+        if name == "ask-unit" and not re.search(
                 r"^Ran [1-9]\d* tests? in .+$", output, re.MULTILINE):
             raise ValueError(f"CTest suite did not run Python tests: {name}")
 
@@ -35,13 +35,10 @@ def check_report(path: Path, expected: set[str]) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
-    parser.add_argument("--with-triton", action="store_true")
     args = parser.parse_args(argv)
     build_dir = args.build_dir.resolve()
     report = build_dir / "ci-tests.xml"
-    expected = {"ask-compiler-adapter", "ask-boundary-inline", "ask-unit"}
-    if args.with_triton:
-        expected.add("ask-triton")
+    expected = {"ask-unit"}
     report.unlink(missing_ok=True)
     result = subprocess.run([
         "ctest", "--test-dir", str(build_dir), "--verbose", "--no-tests=error",

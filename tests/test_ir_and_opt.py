@@ -1,4 +1,4 @@
-"""ASK IR verification, ASK IR graph optimization, LLVM IR cleanup, and boundary helper execution."""
+"""ASK IR verification, ASK IR graph optimization, LLVM IR cleanup."""
 from __future__ import annotations
 
 import ctypes
@@ -21,7 +21,6 @@ from ask import Compiler, CompilerError, Module, ScalarType, TensorType
 from support.host_runner import (
     STORAGE,
     ask_opt_path,
-    boundary_inline_test_path,
     compile_llvm_to_cdll,
     decode_scalar,
     encode_scalar,
@@ -145,7 +144,7 @@ class IRVerificationTests(unittest.TestCase):
                 self.assertGreater(result.returncode, 0, result.stdout)
                 self.assertIn(needle.lower(), result.stderr.lower(), result.stderr)
 
-    def test_llir_check_and_disabled_exporter_guards(self):
+    def test_llir_check_and_external_codegen_boundary(self):
         ptx_ll = 'target triple = "nvptx64-nvidia-cuda"\ndefine void @f() { call void asm sideeffect "bar.sync 0;", ""() ret void }\n'
         ok = run_ask_opt("-", "--check-llir", source=ptx_ll)
         self.assertEqual(ok.returncode, 0, ok.stderr)
@@ -158,13 +157,8 @@ class IRVerificationTests(unittest.TestCase):
         self.assertIn("external", ext_lower.stderr)
 
         caps = json.loads(run_ask_opt("--capabilities").stdout)
-        if "triton" not in caps["third_party_compilers"]:
-            with tempfile.TemporaryDirectory() as directory:
-                dest = Path(directory) / "exports"
-                rejected = run_ask_opt(ROOT / "tests/ir/pipeline.mlir", "--export-external", "--export-dir", dest)
-                self.assertGreater(rejected.returncode, 0)
-                self.assertIn("not enabled", rejected.stderr)
-                self.assertFalse(dest.exists())
+        self.assertTrue(caps["external_execution"])
+        self.assertEqual(caps["external_formats"], ["cubin", "ptx"])
 
 
 class GraphOptimizationTests(unittest.TestCase):
@@ -292,58 +286,12 @@ class LLIROptimizationAndBoundaryExecutionTests(unittest.TestCase):
 
         meta_ir, meta_rep = self.optimize_llir(
             'define i32 @api(i32 %x) {\n  %r = add i32 %x, 1, !ask.trace !1, !ask.value_id !1\n  ret i32 %r\n}\n'
-            '!ask.shape_snapshot = !{!0}\n!ask.boundary_map = !{!1}\n!0 = !{!"s"}\n!1 = !{!"t"}\n'
+            '!ask.shape_snapshot = !{!0}\n!ask.trace = !{!1}\n!0 = !{!"s"}\n!1 = !{!"t"}\n'
         )
         self.assertIn("!ask.shape_snapshot", meta_ir)
         self.assertNotIn("!ask.trace", meta_ir)
-        self.assertNotIn("!ask.boundary_map", meta_ir)
-        self.assertIn("BoundaryMap", meta_rep["invalidated_analyses"])
+        self.assertIn("trace", meta_rep["invalidated_analyses"])
 
-    def test_boundary_inliner_generated_llvm_executes_all_casts_and_masks(self):
-        binary = boundary_inline_test_path()
-        with tempfile.TemporaryDirectory(prefix="ask-inline-exec-") as directory:
-            work = Path(directory)
-            ll_path = work / "fused.ll"
-            emitted = subprocess.run([binary, str(ll_path)], capture_output=True, text=True, timeout=60)
-            self.assertEqual(emitted.returncode, 0, emitted.stderr)
-            lib = compile_llvm_to_cdll(ll_path, work, stem="fused")
-
-            lib.twice_i64.argtypes = [ctypes.c_int64]
-            lib.twice_i64.restype = ctypes.c_int64
-            for v in (0, -123, 2**63 - 1, -(2**63)):
-                self.assertEqual(lib.twice_i64(v), ctypes.c_int64(v + 14).value)
-
-            lib.guarded_i64.argtypes = [ctypes.c_int64, ctypes.c_int32]
-            lib.guarded_i64.restype = ctypes.c_int64
-            self.assertEqual(lib.guarded_i64(-123, 1), 122)
-            # Masked lane must never branch on nsw-overflow poison.
-            self.assertEqual(lib.guarded_i64(2**63 - 1, 0), 2**63 - 1)
-
-            vec = ctypes.c_float * 4
-            lib.masked_vector.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float)]
-            inp, out = vec(-3.0, 4.0, 1.5, -9.0), vec()
-            lib.masked_vector(inp, out)
-            self.assertEqual(list(out), [2.0, 4.0, 6.5, -9.0])
-
-            for source in DTYPES:
-                values = input_values(20, source)
-                if source == "i64":
-                    values += [(2**40 + 2**32 + d) * s for d in (-1, 0, 1) for s in (-1, 1)]
-                if source == "f32":
-                    values += [2**-134, 3 * 2**-134, 65504.0, 65520.0, 2**31, -(2**31), 2**63, -(2**63)]
-                values = [round_reference(v, source) for v in values]
-                for target in DTYPES:
-                    fn = getattr(lib, f"cast_{source}_{target}")
-                    fn.argtypes = [ctypes.POINTER(STORAGE[source]), ctypes.POINTER(STORAGE[target])]
-                    fn.restype = None
-                    for v in values:
-                        in_buf = STORAGE[source](encode_scalar(v, source))
-                        out_buf = STORAGE[target]()
-                        fn(ctypes.byref(in_buf), ctypes.byref(out_buf))
-                        actual = decode_scalar(out_buf.value, target)
-                        expected = cast_reference(v, source, target)
-                        self.assertTrue(numerically_equal([actual], [expected], target),
-                                        (source, target, v, actual, expected))
 
 
 if __name__ == "__main__":
