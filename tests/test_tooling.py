@@ -19,8 +19,9 @@ spec.loader.exec_module(fetcher)
 
 
 def make_llvm_archive(parent: Path, record: dict) -> Path:
-    archive = parent / "test-sdk.tar.gz"
-    with tarfile.open(archive, "w:gz") as stream:
+    record["url"] = "https://example.invalid/test-sdk.tar.xz"
+    archive = parent / "test-sdk.tar.xz"
+    with tarfile.open(archive, "w:xz") as stream:
         for name in fetcher.LLVM_REQUIRED_FILES:
             data = (f"set(LLVM_PACKAGE_VERSION {record['version']})\n"
                     if name.endswith("LLVMConfig.cmake") else "fixture").encode()
@@ -72,7 +73,7 @@ class FetchDepsTests(unittest.TestCase):
 
             # Tampered receipt refuses overwrite.
             receipt = json.loads((target / fetcher.LLVM_RECEIPT).read_text(encoding="utf-8"))
-            receipt["revision"] = "bad"
+            receipt["version"] = "bad"
             (target / fetcher.LLVM_RECEIPT).write_text(json.dumps(receipt), encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "refusing overwrite"):
                 fetcher.fetch_llvm(record, parent)

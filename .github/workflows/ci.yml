@@ -27,13 +27,13 @@ jobs:
       - name: Install build tools
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends -y g++ cmake ninja-build zlib1g-dev libxml2-dev
+          sudo apt-get install --no-install-recommends -y g++ cmake ninja-build zlib1g-dev libxml2-dev libzstd-dev
       - name: Check dependency tooling
         run: python3 -m unittest discover -s tests -p test_tooling.py -v
       - name: Cache the locked LLVM archive
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
-          path: .deps/*.tar.gz
+          path: .deps/*.tar.xz
           key: ${{ runner.os }}-${{ runner.arch }}-llvm-${{ hashFiles('cmake/llvm.lock.json') }}
       - name: Fetch and verify LLVM
         run: python3 tools/fetch_deps.py
@@ -47,17 +47,18 @@ jobs:
         run: |
           sdk="$(python3 -c 'import json, pathlib; print((pathlib.Path(".deps") / json.load(open("cmake/llvm.lock.json"))["directory"]).resolve())')"
           cmake --install build/core --prefix "$RUNNER_TEMP/ask-install"
-          cmake -S examples/cpp -B "$RUNNER_TEMP/ask-core-consumer" -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install;$sdk"
+          cmake -S tests/cpp -B "$RUNNER_TEMP/ask-core-consumer" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DASK_TEST_COMPONENT=Core \
+            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install;$sdk"
           cmake --build "$RUNNER_TEMP/ask-core-consumer"
-          "$RUNNER_TEMP/ask-core-consumer/ask-frontend-example" --optimize
-          cmake -S examples/cpp -B "$RUNNER_TEMP/ask-compiler-consumer" -G Ninja \
-            -DASK_EXAMPLE_CORE=OFF -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install" \
+          ctest --test-dir "$RUNNER_TEMP/ask-core-consumer" --output-on-failure
+          cmake -S tests/cpp -B "$RUNNER_TEMP/ask-compiler-consumer" -G Ninja \
+            -DASK_TEST_COMPONENT=Compiler -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install" \
             -DCMAKE_DISABLE_FIND_PACKAGE_LLVM=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_MLIR=TRUE
           cmake --build "$RUNNER_TEMP/ask-compiler-consumer"
-          "$RUNNER_TEMP/ask-compiler-consumer/ask-compiler-example" "$RUNNER_TEMP/native.o"
-          cmake -S examples/cpp-runtime -B "$RUNNER_TEMP/ask-runtime-consumer" -G Ninja \
-            -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install" \
+          ctest --test-dir "$RUNNER_TEMP/ask-compiler-consumer" --output-on-failure
+          cmake -S tests/cpp -B "$RUNNER_TEMP/ask-runtime-consumer" -G Ninja \
+            -DASK_TEST_COMPONENT=Runtime -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/ask-install" \
             -DCMAKE_DISABLE_FIND_PACKAGE_LLVM=TRUE -DCMAKE_DISABLE_FIND_PACKAGE_MLIR=TRUE
           cmake --build "$RUNNER_TEMP/ask-runtime-consumer"
       - name: Keep native test reports

@@ -20,6 +20,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import urllib.parse
 
 ROOT = Path(__file__).resolve().parents[1]
 LLVM_RECEIPT = ".ask-sdk.json"
@@ -31,6 +32,7 @@ LLVM_REQUIRED_FILES = (
     "lib/libLLVMCore.a",
     "lib/libMLIRIR.a",
     "bin/llvm-config",
+    "bin/llc",
     "bin/mlir-tblgen",
     "bin/opt",
 )
@@ -54,7 +56,7 @@ def _validate_common_lock(lock: dict, required_fields: set[str], label: str) -> 
 def load_llvm_lock(path: Path | str = ROOT / "cmake" / "llvm.lock.json") -> dict:
     lock = json.loads(Path(path).read_text(encoding="utf-8"))
     required = {
-        "schema_version", "version", "cmake_version", "revision", "platform",
+        "schema_version", "version", "platform",
         "directory", "url", "sha256", "size_bytes", "unpacked_size_limit_bytes",
     }
     _validate_common_lock(lock, required, "LLVM")
@@ -66,7 +68,7 @@ def load_llvm_lock(path: Path | str = ROOT / "cmake" / "llvm.lock.json") -> dict
 def llvm_receipt_for(lock: dict) -> dict:
     return {
         key: lock[key]
-        for key in ("schema_version", "version", "revision", "directory", "url", "sha256", "size_bytes")
+        for key in ("schema_version", "version", "directory", "url", "sha256", "size_bytes")
     }
 
 
@@ -166,7 +168,7 @@ def archive_filter(lock: dict, *, allow_links: bool = True):
 
 
 def _extract_archive(archive: Path, staging: Path, checker) -> None:
-    with tarfile.open(archive, "r:gz") as stream:
+    with tarfile.open(archive, "r:*") as stream:
         if _EXTRACTALL_SUPPORTS_FILTER:
             stream.extractall(staging, filter=checker)
         else:
@@ -184,7 +186,7 @@ def validate_llvm_sdk(path: Path, lock: dict, *, require_receipt: bool = True) -
         if not candidate.resolve().is_relative_to(path.resolve()):
             raise ValueError(f"SDK required file points outside its directory: {candidate}")
     config = (path / "lib/cmake/llvm/LLVMConfig.cmake").read_text(encoding="utf-8")
-    if not re.search(r"set\(LLVM_PACKAGE_VERSION\s+" + re.escape(lock["version"]) + r"\)", config):
+    if not re.search(r'set\(LLVM_PACKAGE_VERSION\s+"?' + re.escape(lock["version"]) + r'"?\)', config):
         raise ValueError(f"SDK version does not match lock: {path}")
     if require_receipt:
         try:
@@ -202,7 +204,7 @@ def fetch_llvm(lock: dict, destination: Path | str) -> Path:
     if target.exists() or target.is_symlink():
         validate_llvm_sdk(target, lock)
         return target
-    archive = destination / (lock["directory"] + ".tar.gz")
+    archive = destination / PurePosixPath(urllib.parse.urlsplit(lock["url"]).path).name
     _download_archive(archive, lock)
     with tempfile.TemporaryDirectory(dir=destination, prefix=".ask-llvm-extract-") as temporary:
         staging = Path(temporary)

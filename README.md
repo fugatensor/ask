@@ -9,11 +9,11 @@ ASK 是面向张量框架的 C++ 编译与运行时引擎。它接收 MLIR `ask`
 
 ASK 只交付 C++ SDK 与 `ask-opt`，不交付 Python 包或绑定。FugaTensor 保留 Python 用户 API、图语义、薄适配器及编译编排，自己的原生扩展直接链接 ASK。第三方 worker 调用、磁盘缓存和编译包校验由调用方实现，协议与 JSON Schema 由 ASK 维护。
 
-接口从 [用户 API](docs/用户API.md) 开始；职责见 [核心思想](docs/核心思想.md)，FugaTensor 接入见 [上层执行说明](../fugatensor/docs/architecture/04-ASK桥接与多后端执行.md)。
+接口从 [用户 API](docs/用户API.md) 开始；职责见 [核心思想](docs/核心思想.md)。推荐以 [FugaTensor](../fugatensor/README.md) 作为完整接入示例：从 [Tensor API](../fugatensor/docs/API/README.md) 了解使用方式，再看[图降级、原生绑定与执行](../fugatensor/docs/architecture/04-ASK桥接与多后端执行.md)。
 
 ## 构建、安装与验证
 
-锁定 SDK 面向 Linux x86-64。构建需要 C++17、CMake 3.28+、Ninja 和匹配 [llvm.lock.json](cmake/llvm.lock.json) 的 LLVM/MLIR；依赖下载脚本使用 Python 标准库，库本身不依赖 Python。
+默认 SDK 面向 Linux x86-64，使用 LLVM/MLIR 23.1.4 稳定发行版。构建需要 C++17、CMake 3.28+、Ninja；LLVM 与 MLIR 必须来自同一套受支持的 23.1.x SDK。[依赖记录](cmake/llvm.lock.json)固定默认下载的版本与摘要以便复现，不要求跟随 Triton 的 LLVM 提交。依赖获取脚本使用 Python 标准库，库本身不依赖 Python。
 
 ```bash
 python3 tools/fetch_deps.py
@@ -45,6 +45,6 @@ ctest --preset core --output-on-failure
 
 默认 CTest 包含 `ask-core` 与 `ask-compiler`；显式启用 GPU 后增加 `ask-runtime`。断言与测试输入位于 `tests/`，SDK 独立消费验证也由该目录提供；示例代码写在[用户 API 文档](docs/用户API.md)中。测试入口与覆盖范围见[测试体系](docs/06-工程结构与测试体系.md)。
 
-Python 集成、数值矩阵、外部 worker 与 FugaTensor JIT 测试位于调用方的 [tests/backend](../fugatensor/tests/backend)。缺少工具或驱动而跳过的测试不能作为对应功能通过的证据。
+FugaTensor 的[端到端测试](../fugatensor/docs/测试.md)覆盖图降级、原生调用、数值矩阵和外部 kernel 调度。缺少工具或驱动而跳过的测试不能作为对应功能通过的证据。
 
 [文档目录](docs/README.md) · [外部 Worker 协议](docs/09-外部编译器适配接入规范.md) · [执行计划](docs/08-图切分与多Kernel执行计划.md)

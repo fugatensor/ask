@@ -2,7 +2,7 @@
 
 返回核心思想：[构建与进程内接入](核心思想.md#ask-frontend-build) · 相关细节：[安装](安装.md) · [外部编译器接入](09-外部编译器适配接入规范.md) · [常驻运行时](05-常驻运行时与多级缓存.md)
 
-本文描述 ASK 的公开 C++ 接口。ASK 不提供 Python 包；需要 Python Tensor API、自动组图或自动微分时使用 [FugaTensor](../../fugatensor/README.md)。FugaTensor 的原生扩展直接链接这里的 Compiler 与 Runtime 共享库。
+本文描述 ASK 的公开 C++ 接口。推荐接入示例是 [FugaTensor](../../fugatensor/README.md)：它提供 Tensor API、自动组图和自动微分，原生扩展直接链接这里的 Compiler 与 Runtime 共享库。Python 用法见 [FugaTensor API](../../fugatensor/docs/API/README.md)。
 
 <a id="api-entrypoints"></a>
 
@@ -17,7 +17,7 @@ target_link_libraries(my_framework PRIVATE ASK::Compiler ASK::Runtime)
 | --- | --- |
 | 图校验、优化、分区、自有代码生成 | `ask/Frontend/CompilerAPI.h`，链接 `ASK::Compiler` |
 | 设备缓冲区、kernel、计划、CUDA Graph、事件 | `ask/Runtime/CUDA.h`，链接 `ASK::Runtime` |
-| 直接构造或变换 MLIR | `ask/Frontend/Compiler.h` 等，链接 `ASK::Core` 并准备锁定 LLVM/MLIR SDK |
+| 直接构造或变换 MLIR | `ask/Frontend/Compiler.h` 等，链接 `ASK::Core` 并准备与 ASK 实际构建版本匹配的 LLVM/MLIR SDK |
 
 Compiler 与 Runtime 的公开接口不包含 LLVM、MLIR 或 Python 类型，消费这两个组件无需安装 LLVM 开发头文件。代码生成库内部使用 LLVM；CUDA runtime 按需加载驱动。编译请求和 GPU 执行均为同进程调用。
 

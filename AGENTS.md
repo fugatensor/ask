@@ -38,8 +38,8 @@
     - 核心构建与测试：`cmake --preset core && cmake --build --preset core && ctest --preset core --output-on-failure`
 - **测试组织**：
   - 原生测试源码位于 `tests/cpp/`，默认 CTest 为 `ask-core`、`ask-compiler`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`。
-  - Python 集成与通用后端测试位于 FugaTensor `tests/backend/`，第三方编译器专属测试也由调用方维护。新增数值与多精度测试优先复用调用方现有独立参考与 `plan_matrix`，避免重复实现。
-  - SDK 使用 `cmake --install build/core --prefix /path/to/ask-sdk` 安装；验证独立消费 Compiler/Runtime 时不依赖 LLVM 开发 SDK，消费 Core 时使用锁定 SDK。
+  - 推荐以 FugaTensor 的生产接口和实现作为完整接入示例，文档不使用测试目录充当示例，也不叙述测试迁移历史。端到端数值、图组合和第三方编译器验证由 FugaTensor 维护；新增覆盖优先复用独立参考与 `plan_matrix`，避免重复实现。
+  - SDK 使用 `cmake --install build/core --prefix /path/to/ask-sdk` 安装；验证独立消费 Compiler/Runtime 时不依赖 LLVM 开发 SDK，消费 Core 时匹配 ASK 实际构建的 LLVM/MLIR 版本。默认依赖记录用于复现稳定发行版；自有 LLVM/MLIR 与第三方编译器内部 LLVM 独立选择。
   - 因缺少 `ASK_OPT`、GPU 驱动或编译工具而 `skipped` 的测试不能视作功能验证通过。
 
 ---

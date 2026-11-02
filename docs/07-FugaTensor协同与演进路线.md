@@ -6,7 +6,7 @@
 
 ## 1. 两个仓库的职责
 
-ASK 独立交付 C++ SDK，FugaTensor 构建时链接 `ASK::Compiler` 与 `ASK::Runtime`，并将共享库装入自己的 wheel。Python 用户 API 和原生绑定只有 FugaTensor 一份；ASK 不依赖 FugaTensor。消费这两个 SDK 组件不读取 ASK 源码或 LLVM SDK。安装方式见 [ASK 安装](安装.md#framework-install)与 [FugaTensor 安装](../../fugatensor/docs/安装.md)。
+推荐以 [FugaTensor](../../fugatensor/README.md) 了解 ASK 的完整接入方式，用户用法见 [API](../../fugatensor/docs/API/README.md)。ASK 独立交付 C++ SDK，FugaTensor 构建时链接 `ASK::Compiler` 与 `ASK::Runtime`，并将共享库装入自己的 wheel。Python 用户 API 和原生绑定只有 FugaTensor 一份；ASK 不依赖 FugaTensor。消费这两个 SDK 组件不读取 ASK 源码或 LLVM SDK。安装方式见 [ASK 安装](安装.md#framework-install)与 [FugaTensor 安装](../../fugatensor/docs/安装.md)。
 
 | 关注点 | FugaTensor | ASK |
 | --- | --- | --- |
