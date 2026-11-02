@@ -26,7 +26,7 @@
 - 外部 cubin/PTX 接入与协议 v2；调用方运行 worker，每个外部节点是独立计划步骤。
 - 原生常驻会话、设备缓冲区、整计划提交、异步事件与资源复用、CUDA Graph replay；FugaTensor 在此基础上提供 CAI 借用、磁盘缓存和可迁移多 kernel 编译包。
 
-复杂外部算法由上层实现。例如 [注意力 API](../../fugatensor/docs/API/注意力.md) 的算法、梯度和适用条件由 FugaTensor 维护，ASK 只处理其端口、编译产物和步骤依赖。
+复杂外部算法由上层实现。例如 [attention API](../../fugatensor/docs/API/attention.md) 的算法、梯度和适用条件由 FugaTensor 维护，ASK 只处理其端口、编译产物和步骤依赖。
 
 <a id="roadmap"></a>
 

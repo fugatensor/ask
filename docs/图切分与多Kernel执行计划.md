@@ -76,6 +76,6 @@ FugaTensor 在自动组图后直接提交完整静态图，由 ASK 在外部边�
 
 ASK 只定义外部 kernel 的产物、端口、缓存与调度接口，不在仓内实现注意力、矩阵乘或归约算法。外部步骤可使用多输入、多输出、不同形状或存储类型、内部 FP32 累加和动态共享内存；调用方 worker 负责生成可执行产物并声明实际资源需求。支持范围受通用参数 ABI 与普通 CUDA 启动契约约束，见[外部执行接口](外部产物与执行接口.md#binary-artifact)。
 
-复杂算子的算法语义和训练接口属于上层框架。例如 FugaTensor 维护 [内置注意力 API](../../fugatensor/docs/API/注意力.md)的 FlashAttention 实现与 Triton kernel，通过 `ft.fun` 的显式反向规则注册为多个 `ask.external`；ASK 将其切分为前向、统计量、dQ、dK、dV 等独立步骤并在同一会话 stream 上调度。其反向公式与适用边界由上层 API 定义，数值验证由上层结构化测试负责，ASK 不依赖或内置该算法。
+复杂算子的算法语义和训练接口属于上层框架。例如 FugaTensor 维护 [内置 attention API](../../fugatensor/docs/API/attention.md)的 FlashAttention 实现与 Triton kernel，通过 `ft.fun` 的显式反向规则注册为多个 `ask.external`；ASK 将其切分为前向、统计量、dQ、dK、dV 等独立步骤并在同一会话 stream 上调度。其反向公式与适用边界由上层 API 定义，数值验证由上层结构化测试负责，ASK 不依赖或内置该算法。
 
 适配器接入新 DSL 的规范见[外部编译器适配接入规范](外部编译器适配接入规范.md#adapter-contract)，公开的 worker 请求与 artifact 结构见 [schemas/](../schemas/)。
