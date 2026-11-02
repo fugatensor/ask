@@ -1,6 +1,6 @@
-# 01. ASK IR 与数值语义
+# ASK IR 与数值语义
 
-返回核心思想：[双层 IR 模型](核心思想.md#ask-ir-model) · 相关细节：[前端接入与构建配置](02-前端接入与构建配置.md) · [图优化与自有代码生成](03-图优化与自有代码生成.md) · [Fuga IR 降级到 ASK](../../fugatensor/docs/ir/03-降级到ASK.md)
+返回核心思想：[双层 IR 模型](核心思想.md#ask-ir-model) · 相关细节：[前端接入与构建配置](前端接入与构建配置.md) · [图优化与自有代码生成](图优化与自有代码生成.md) · [Fuga IR 降级到 ASK](../../fugatensor/docs/ir/降级到ASK.md)
 
 高层 ASK IR 是上层框架向 ASK 提交计算图的接口，基于 MLIR `ask` dialect 实现（`include/ask/IR/`、`lib/IR/`），用于表达张量形状、精确元素类型、显式类型转换、追踪标记与外部 DSL 边界，不包含设备指针、stream 句柄或隐式广播。
 
@@ -35,7 +35,7 @@
 %matrix = "ask.reshape"(%flat) {shape = array<i64: 2, 2>} : (tensor<4xf32>) -> tensor<2x2xf32>
 ```
 
-`shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，用户接口见 [FugaTensor reshape](../../fugatensor/docs/API/01-张量与数据交换.md#reshape)。reshape 不做类型转换、广播或元素重排，外部 kernel 的端口保持 reshape 后的真实形状。自有降级在逐元素循环内直接复用输入值；公开输出仍遵循独立缓冲区契约，不承诺返回与输入共享存储的 view。
+`shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，用户接口见 [FugaTensor reshape](../../fugatensor/docs/API/张量与数据交换.md#reshape)。reshape 不做类型转换、广播或元素重排，外部 kernel 的端口保持 reshape 后的真实形状。自有降级在逐元素循环内直接复用输入值；公开输出仍遵循独立缓冲区契约，不承诺返回与输入共享存储的 view。
 
 <a id="types-and-precision"></a>
 
@@ -84,4 +84,4 @@
 - `ask.semantics` 描述图级接口（输入输出秩与 dtype、形状规则及 `effects = "none"`），供图校验和端口连接使用。当前不支持有状态外部算子或 token；高层 DCE 保守保留 `ask.external`。
 - `ask.implementation` 描述具体编译配置（`compiler = "triton"`、DSL 源码、`entry`、`signature`、`source_bindings`、`constants`、`options`、`target`、`grid`）。
 
-ASK 构建始终可以验证和准备含 `ask.external` 的图，并在 `report["external_requests"]` 中导出协议 v2 请求。`compiler` 是调用方提供的 worker 映射键，不对应构建白名单；更换编译配置无需改动外层图语义。实际产物通过[外部执行接口](04-外部产物与执行接口.md)进入运行时。
+ASK 构建始终可以验证和准备含 `ask.external` 的图，并在 `report["external_requests"]` 中导出协议 v2 请求。`compiler` 是调用方提供的 worker 映射键，不对应构建白名单；更换编译配置无需改动外层图语义。实际产物通过[外部执行接口](外部产物与执行接口.md)进入运行时。

@@ -1,6 +1,6 @@
 # ASK 用户 API
 
-返回核心思想：[构建与进程内接入](核心思想.md#ask-frontend-build) · 相关细节：[安装](安装.md) · [外部编译器接入](09-外部编译器适配接入规范.md) · [常驻运行时](05-常驻运行时与多级缓存.md)
+返回核心思想：[构建与进程内接入](核心思想.md#ask-frontend-build) · 相关细节：[安装](安装.md) · [外部编译器接入](外部编译器适配接入规范.md) · [常驻运行时](常驻运行时与多级缓存.md)
 
 本文描述 ASK 的公开 C++ 接口。推荐接入示例是 [FugaTensor](../../fugatensor/README.md)：它提供 Tensor API、自动组图和自动微分，原生扩展直接链接这里的 Compiler 与 Runtime 共享库。Python 用法见 [FugaTensor API](../../fugatensor/docs/API/README.md)。
 
@@ -40,7 +40,7 @@ module attributes {ask.schema_version = 1 : i64} {
 }
 ```
 
-支持 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 拼写为 `i1`。类型转换与广播必须显式表达；设备执行前所有形状须为具体值。`tensor<f32>` 是单元素 0-D 张量，仍通过指针传递；Host 标量 `f32` 输入按值传递。图语义、舍入与溯源规则见 [ASK IR](01-ASK-IR与数值语义.md)。
+支持 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 拼写为 `i1`。类型转换与广播必须显式表达；设备执行前所有形状须为具体值。`tensor<f32>` 是单元素 0-D 张量，仍通过指针传递；Host 标量 `f32` 输入按值传递。图语义、舍入与溯源规则见 [ASK IR](ASK-IR与数值语义.md)。
 
 形状变化使用 `ask.reshape`，例如 `"ask.reshape"(%x) {shape = array<i64: 2, 2>} : (tensor<4xi32>) -> tensor<2x2xi32>`。输入输出元素类型和总数必须一致，保持连续元素次序；目标形状中的 `-1` 须先由调用方解析。该操作属于自有图计算，外部 kernel 接收到的端口形状保持为 `2×2`。
 
@@ -129,7 +129,7 @@ outputs.front()->copyToHost(result, sizeof(result));
 
 ASK 不导入第三方 DSL，也不融合第三方 LLVM。调用方的薄适配器提供 cubin/PTX、入口、端口契约和启动描述，再通过 `load` 与 `prepareProgram` 接入。高层 `ask.external` 的语义声明与实现请求由编译器验证，`partitionJSON` 将每个外部节点分成独立步骤；自有区域仍可融合。
 
-worker 请求、产物 schema 与冻结标量类型见[外部适配规范](09-外部编译器适配接入规范.md)。worker 启动、工具链环境、磁盘缓存和图到原生程序的安装由调用方管理；FugaTensor 已提供这层编排，不要求 ASK 持有 Python 解释器。
+worker 请求、产物 schema 与冻结标量类型见[外部适配规范](外部编译器适配接入规范.md)。worker 启动、工具链环境、磁盘缓存和图到原生程序的安装由调用方管理；FugaTensor 已提供这层编排，不要求 ASK 持有 Python 解释器。
 
 借用外部设备指针时，调用方必须让实际存储所有者活到完成事件之后。`importBuffer` 的引用只保活 ASK 包装对象，不能替代外部框架的所有权。使用 `session->waitForExternalStream(producerStream)` 建立生产者依赖；外部框架再次访问该缓冲区前，也须等待 ASK 完成或建立等价依赖。
 
@@ -141,7 +141,7 @@ worker 请求、产物 schema 与冻结标量类型见[外部适配规范](09-�
 
 会话保留待完成事件，事件保留程序、参数缓冲区和工作区。丢弃调用方持有的程序或事件不会提前释放在途资源；已完成工作区和事件句柄可以复用，旧事件对象仍维持已完成状态。`run` 不覆盖调用方仍持有的旧结果。
 
-编译缓存与包序列化由调用方维护，原生共享库不要求某个 Python 缓存实现。保存编译产物时应保留目标、端口与参数 ABI、启动配置及内容摘要；加载之前仍须验证完整契约。执行计划 JSON v1 见[图切分与计划](08-图切分与多Kernel执行计划.md#plan-v1)。
+编译缓存与包序列化由调用方维护，原生共享库不要求某个 Python 缓存实现。保存编译产物时应保留目标、端口与参数 ABI、启动配置及内容摘要；加载之前仍须验证完整契约。执行计划 JSON v1 见[图切分与计划](图切分与多Kernel执行计划.md#plan-v1)。
 
 <a id="errors-and-limits"></a>
 

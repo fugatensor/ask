@@ -9,7 +9,7 @@ ASK 是面向张量框架的 C++ 编译与运行时引擎。它接收 MLIR `ask`
 
 ASK 只交付 C++ SDK 与 `ask-opt`，不交付 Python 包或绑定。FugaTensor 保留 Python 用户 API、图语义、薄适配器及编译编排，自己的原生扩展直接链接 ASK。第三方 worker 调用、磁盘缓存和编译包校验由调用方实现，协议与 JSON Schema 由 ASK 维护。
 
-接口从 [用户 API](docs/用户API.md) 开始；职责见 [核心思想](docs/核心思想.md)。推荐以 [FugaTensor](../fugatensor/README.md) 作为完整接入示例：从 [Tensor API](../fugatensor/docs/API/README.md) 了解使用方式，再看[图降级、原生绑定与执行](../fugatensor/docs/architecture/04-ASK桥接与多后端执行.md)。
+接口从 [用户 API](docs/用户API.md) 开始；职责见 [核心思想](docs/核心思想.md)。推荐以 [FugaTensor](../fugatensor/README.md) 作为完整接入示例：从 [Tensor API](../fugatensor/docs/API/README.md) 了解使用方式，再看[图降级、原生绑定与执行](../fugatensor/docs/architecture/ASK桥接与多后端执行.md)。
 
 ## 构建、安装与验证
 
@@ -43,8 +43,8 @@ cmake --build --preset core
 ctest --preset core --output-on-failure
 ```
 
-默认 CTest 包含 `ask-core` 与 `ask-compiler`；显式启用 GPU 后增加 `ask-runtime`。断言与测试输入位于 `tests/`，SDK 独立消费验证也由该目录提供；示例代码写在[用户 API 文档](docs/用户API.md)中。测试入口与覆盖范围见[测试体系](docs/06-工程结构与测试体系.md)。
+默认 CTest 包含 `ask-core` 与 `ask-compiler`；显式启用 GPU 后增加 `ask-runtime`。断言与测试输入位于 `tests/`，SDK 独立消费验证也由该目录提供；示例代码写在[用户 API 文档](docs/用户API.md)中。测试入口与覆盖范围见[测试体系](docs/工程结构与测试体系.md)。
 
 FugaTensor 的[端到端测试](../fugatensor/docs/测试.md)覆盖图降级、原生调用、数值矩阵和外部 kernel 调度。缺少工具或驱动而跳过的测试不能作为对应功能通过的证据。
 
-[文档目录](docs/README.md) · [外部 Worker 协议](docs/09-外部编译器适配接入规范.md) · [执行计划](docs/08-图切分与多Kernel执行计划.md)
+[文档目录](docs/README.md) · [外部 Worker 协议](docs/外部编译器适配接入规范.md) · [执行计划](docs/图切分与多Kernel执行计划.md)
