@@ -1,0 +1,2 @@
+# ASK instantiates only the live edges needed by each queried buffer.
+all b: @TYPE@ => available(b, @FROM@) -> available(b, @TO@)

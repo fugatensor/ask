@@ -22,9 +22,9 @@
   - 第三方 worker、版本策略、编译编排、磁盘缓存和 Python 产物校验由调用方维护；FugaTensor 通过自己的原生绑定直接链接 ASK。ASK 维护协议 v2/schema、标准化请求、cubin/PTX 加载与原生调度，不硬编码 DSL 或扫描 Python entrypoints。
 - **图切分与执行计划**：
   - 高层 MLIR 分区函数与 JSON v1 记录缓冲区、步骤依赖和单 stream 调度；自有区域内部保留融合，每个外部节点始终独立执行。非法 IR、损坏产物和工具失败直接报错。
-  - `Session::prepareProgram` 使用 SUKA PASS 的有限步骤规则证明读端口与公开输出的可用性；ASK 继续校验索引、单一生产者、kernel ABI、完成事件和在途资源。未证成的计划直接拒绝。
+  - ASK 自有 `ASK::Pass` 静态库和 `rules/pass/` 规则；SUKA 提供通用证明接口。`Session::prepareProgram` 使用 ASK PASS 校验整份执行与内存槽位计划，包括读端口、公开输出、容量和同槽生存期；ASK 继续校验索引、单一生产者、kernel ABI、完成事件和在途资源。未证成的计划直接拒绝。
   - 外部 kernel 通过显存缓冲区连接；支持静态连续多输出张量、指针/null 与按值标量参数，使用普通单 stream 启动，不实现第三方代码融合。编译期配置使用递归 JSON，编译器专属值由调用方编码解释。
-  - `PreparedProgram` 在 C++ 中一次绑定并提交整段计划，完成事件保留在途资源。工作区、分配和事件按完成状态复用；CUDA Graph replay 允许公开端口地址变化，不修改在途 graph 实例，不覆盖仍被调用方持有的输出。
+  - `PreparedProgram` 在 C++ 中一次绑定并提交整段计划。内部逻辑缓冲区按已验证的生存期共享物理槽位；公开端口保持独立。完成事件保留在途资源，工作区、分配和事件按完成状态复用；CUDA Graph replay 允许公开端口地址变化，不修改在途 graph 实例，不覆盖仍被调用方持有的输出。
 - **数值语义**：
   - 6 种基础类型（`bool`、`i32`、`i64`、`f32`、`f16`、`bf16`）不做隐式类型提升或隐式广播。
   - `ask.constant` 按单步最近偶数舍入（RNE）编码浮点字面量，64 位整数保持完整精度。
@@ -39,7 +39,7 @@
   - 拉取依赖使用 `python3 tools/fetch_deps.py`（支持 `--only llvm`）。`CMakeLists.txt` 根据 `cmake/llvm.lock.json` 自动识别 `.deps/` 下的 LLVM/MLIR：
     - 核心构建与测试：`cmake --preset core && cmake --build --preset core && ctest --preset core --output-on-failure`
 - **测试组织**：
-  - 原生测试源码位于 `tests/cpp/`，默认 CTest 为 `ask-core`、`ask-compiler`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`。
+  - 原生测试源码位于 `tests/cpp/`，默认 CTest 为 `ask-core`、`ask-compiler`、`ask-pass`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`。
   - 推荐以 FugaTensor 的生产接口和实现作为完整接入示例，文档不使用测试目录充当示例，也不叙述测试迁移历史。端到端数值、图组合和第三方编译器验证由 FugaTensor 维护；新增覆盖优先复用独立参考与 `plan_matrix`，避免重复实现。
   - SDK 使用 `cmake --install build/core --prefix /path/to/ask-sdk` 安装；验证独立消费 Compiler/Runtime 时不依赖 LLVM 开发 SDK，消费 Core 时匹配 ASK 实际构建的 LLVM/MLIR 版本。默认依赖记录用于复现稳定发行版；自有 LLVM/MLIR 与第三方编译器内部 LLVM 独立选择。
   - 因缺少 `ASK_OPT`、GPU 驱动或编译工具而 `skipped` 的测试不能视作功能验证通过。

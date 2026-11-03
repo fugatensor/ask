@@ -1,0 +1,6 @@
+# ASK checks mapping completeness and emits observations from static lifetimes.
+all b: internal, s: slot =>
+    assigned(b, s) & capacity_sufficient(b, s) -> fits(b, s)
+
+all a: internal, b: internal =>
+    same_slot(a, b) & ordered_nonoverlap(a, b) -> compatible(a, b)

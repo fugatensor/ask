@@ -45,8 +45,8 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Suka's rule library is linked into the Runtime shared library, so installed
-# Compiler/Runtime consumers do not need Suka headers or a separate Suka SDK.
+# The generic Suka proof engine is linked through ASK's own PASS library into
+# the Runtime shared library. Installed Runtime consumers need no Suka SDK.
 include(FetchContent)
 set(ASK_SUKA_SOURCE_DIR "" CACHE PATH "Use a local Suka checkout for development")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/suka.lock.json" ASK_SUKA_LOCK)
@@ -111,6 +111,25 @@ target_include_directories(ask_compiler PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(ask_compiler PRIVATE ASK::Core ${CMAKE_DL_LIBS})
 
+set(ASK_PASS_RULE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rules/pass")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  "${ASK_PASS_RULE_DIR}/plan_availability.suka"
+  "${ASK_PASS_RULE_DIR}/buffer_reuse.suka"
+  "${ASK_PASS_RULE_DIR}/allocation_plan.suka")
+file(READ "${ASK_PASS_RULE_DIR}/plan_availability.suka" ASK_PLAN_AVAILABILITY_RULES)
+file(READ "${ASK_PASS_RULE_DIR}/buffer_reuse.suka" ASK_BUFFER_REUSE_RULES)
+file(READ "${ASK_PASS_RULE_DIR}/allocation_plan.suka" ASK_ALLOCATION_PLAN_RULES)
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass")
+configure_file(lib/Pass/Rules.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass/Rules.h" @ONLY)
+
+add_library(ask_pass STATIC lib/Pass/Pass.cpp)
+add_library(ASK::Pass ALIAS ask_pass)
+set_target_properties(ask_pass PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_compile_features(ask_pass PUBLIC cxx_std_17)
+target_include_directories(ask_pass PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/lib/Pass>)
+target_include_directories(ask_pass PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass")
+target_link_libraries(ask_pass PRIVATE Suka::Pass)
+
 add_library(ask_runtime SHARED lib/Runtime/CUDA.cpp)
 add_library(ASK::Runtime ALIAS ask_runtime)
 set_target_properties(ask_runtime PROPERTIES EXPORT_NAME Runtime POSITION_INDEPENDENT_CODE ON
@@ -120,7 +139,7 @@ target_compile_features(ask_runtime PUBLIC cxx_std_17)
 target_include_directories(ask_runtime PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(ask_runtime PRIVATE Suka::Pass ${CMAKE_DL_LIBS})
+target_link_libraries(ask_runtime PRIVATE ASK::Pass ${CMAKE_DL_LIBS})
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
   # The proof engine is an implementation detail of the Runtime shared ABI.
   target_link_options(ask_runtime PRIVATE "LINKER:--exclude-libs,ALL")
@@ -148,6 +167,9 @@ install(FILES cmake/suka.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMP
 
 option(ASK_TEST_CUDA "Run hardware CUDA runtime tests (requires an NVIDIA GPU)" OFF)
 if(BUILD_TESTING)
+  add_executable(ask-pass-test tests/cpp/pass.cpp)
+  target_link_libraries(ask-pass-test PRIVATE ASK::Pass)
+  add_test(NAME ask-pass COMMAND ask-pass-test)
   add_executable(ask-compiler-test tests/cpp/compiler.cpp)
   target_link_libraries(ask-compiler-test PRIVATE ASK::Compiler ${CMAKE_DL_LIBS})
   add_test(NAME ask-compiler COMMAND ask-compiler-test "${CMAKE_CURRENT_BINARY_DIR}/compiler-test.o")
@@ -162,5 +184,5 @@ if(BUILD_TESTING)
 endif()
 
 message(STATUS "ASK target backends: ${ASK_TARGET_BACKENDS}; LLVM/MLIR ${LLVM_PACKAGE_VERSION}")
-message(STATUS "ASK Suka rules: ${ASK_SUKA_COMMIT}")
+message(STATUS "ASK Suka proof engine: ${ASK_SUKA_COMMIT}")
 message(STATUS "ASK interfaces: native Compiler, Runtime and Core; no Python build dependency")

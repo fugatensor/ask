@@ -1,0 +1,17 @@
+# ASK supplies observed facts for one candidate.
+candidate: reuse_candidate
+
+all c: reuse_candidate =>
+    same_submission(c) & strictly_after_last_use(c) -> c: prior_idle
+    different_submission(c) & prior_completion_finished(c) -> c: prior_idle
+
+all c: reuse_candidate =>
+    prior_idle(c) & same_allocation_domain(c) & allocator_owned(c) & same_device(c) & capacity_sufficient(c) & output_released(c) -> c: legal_reuse
+
+verify SCHEDULE = candidate: prior_idle
+verify DOMAIN = same_allocation_domain(candidate)
+verify OWNED = allocator_owned(candidate)
+verify DEVICE = same_device(candidate)
+verify CAPACITY = capacity_sufficient(candidate)
+verify RELEASE = output_released(candidate)
+verify REUSE = candidate: legal_reuse

@@ -1,5 +1,5 @@
 #include "ask/Runtime/CUDA.h"
-#include "suka/pass.h"
+#include "Pass.h"
 
 #include <algorithm>
 #include <cstring>
@@ -273,6 +273,8 @@ struct PreparedProgram::Impl {
   };
   std::weak_ptr<Session> session;
   std::vector<std::size_t> sizes, inputs, outputs;
+  // Public ports use caller-owned storage; only internal buffers have slots.
+  std::vector<std::size_t> slotOfBuffer, slotCapacities;
   std::vector<PlanStep> steps;
   std::vector<std::shared_ptr<Workspace>> workspaces;
   bool graph = false;
@@ -470,7 +472,9 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
     std::vector<std::size_t> sizes,std::vector<std::size_t> inputs,
     std::vector<std::size_t> outputs,std::vector<PlanStep> steps,bool graph) {
   auto &s=*impl->state;
-  suka::pass::Plan proof;
+  pass::AllocationPlan proof;
+  const std::size_t noSlot=std::numeric_limits<std::size_t>::max();
+  std::vector<std::size_t> slotOfBuffer(sizes.size(),noSlot);
   {
     std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
     require(!graph || s.driver->graphs(),"CUDA driver does not support graph replay");
@@ -506,18 +510,50 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
       available.insert(step.outputs.begin(),step.outputs.end());
     }
     require(available.size()==sizes.size(),"program contains an undefined buffer");
-    proof.buffer_count=sizes.size();proof.public_inputs=inputs;proof.public_outputs=outputs;
-    proof.steps.reserve(steps.size());
-    for(const auto &step:steps) proof.steps.push_back({step.inputs,step.outputs});
+    proof.plan.buffer_count=sizes.size();
+    proof.plan.public_inputs=inputs;proof.plan.public_outputs=outputs;
+    proof.plan.steps.reserve(steps.size());
+    for(const auto &step:steps) proof.plan.steps.push_back({step.inputs,step.outputs});
+    proof.buffer_sizes=sizes;
+
+    // A kernel may retain an input pointer for its entire launch, so a slot
+    // is reused only when the previous buffer's last use is in an earlier step.
+    std::vector<std::size_t> lastUse(sizes.size(),0);
+    for(std::size_t stepIndex=0;stepIndex<steps.size();++stepIndex) {
+      for(auto buffer:steps[stepIndex].inputs)
+        lastUse[buffer]=std::max(lastUse[buffer],stepIndex);
+      for(auto buffer:steps[stepIndex].outputs)
+        lastUse[buffer]=std::max(lastUse[buffer],stepIndex);
+    }
+    std::set<std::size_t> publicPorts(inputs.begin(),inputs.end());
+    publicPorts.insert(outputs.begin(),outputs.end());
+    std::vector<std::size_t> slotLastUse;
+    for(std::size_t stepIndex=0;stepIndex<steps.size();++stepIndex)
+      for(auto buffer:steps[stepIndex].outputs) {
+        if(publicPorts.count(buffer)) continue;
+        std::size_t slot=0;
+        while(slot<slotLastUse.size() && slotLastUse[slot]>=stepIndex) ++slot;
+        if(slot==slotLastUse.size()) {
+          slotLastUse.push_back(lastUse[buffer]);
+          proof.slot_capacity_bytes.push_back(sizes[buffer]);
+        } else {
+          slotLastUse[slot]=lastUse[buffer];
+          proof.slot_capacity_bytes[slot]=std::max(proof.slot_capacity_bytes[slot],sizes[buffer]);
+        }
+        slotOfBuffer[buffer]=slot;
+        proof.assignments.push_back({buffer,slot});
+      }
   }
-  // Proving a large plan can be expensive; no CUDA session lock is held while
-  // SUKA derives step availability. Recheck session lifetime before publishing.
-  auto decision=suka::pass::checkPlan(proof);
-  require(decision.verdict==suka::pass::Verdict::Pass,
-          "Suka execution plan availability proof failed: "+decision.explanation);
+  // The complete slot map and step availability are proved without holding
+  // the CUDA session lock; recheck its lifetime before publishing the plan.
+  auto decision=pass::checkAllocationPlan(proof);
+  require(decision.verdict==pass::Verdict::Pass,
+          "ASK execution plan proof failed: "+decision.explanation);
   std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   auto p=std::make_unique<PreparedProgram::Impl>();p->session=shared_from_this();
   p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
+  p->slotOfBuffer=std::move(slotOfBuffer);
+  p->slotCapacities=std::move(proof.slot_capacity_bytes);
   p->steps=std::move(steps);p->graph=graph;
   return std::shared_ptr<PreparedProgram>(new PreparedProgram(std::move(p)));
 }
@@ -557,11 +593,17 @@ std::shared_ptr<Event> PreparedProgram::submit(
   if(workspace) ++s.counters["workspace_reuses"];
   else {
     workspace=std::make_shared<Impl::Workspace>();workspace->state=session->impl->state;
-    workspace->buffers.resize(bound.size());
-    for(std::size_t i=0;i<bound.size();++i) if(!bound[i]) workspace->buffers[i]=session->allocate(impl->sizes[i]);
+    workspace->buffers.reserve(impl->slotCapacities.size());
+    for(auto capacity:impl->slotCapacities)
+      workspace->buffers.push_back(session->allocate(capacity));
     impl->workspaces.push_back(workspace);
   }
-  for(std::size_t i=0;i<bound.size();++i) if(!bound[i]) bound[i]=workspace->buffers[i];
+  for(std::size_t i=0;i<bound.size();++i)
+    if(!bound[i]) {
+      auto slot=impl->slotOfBuffer[i];
+      require(slot<workspace->buffers.size(),"internal program buffer has no workspace slot");
+      bound[i]=workspace->buffers[slot];
+    }
   // All storage and argument vectors are prepared before the first launch.
   std::vector<std::vector<DevicePointer>> values(impl->steps.size());
   std::vector<std::vector<void *>> parameters(impl->steps.size());

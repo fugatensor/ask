@@ -110,7 +110,7 @@ auto host = ask::compiler::codegen(source, hostOptions);
 | `session->allocate(bytes)` | 分配原生设备缓冲区，可复用同字节数的空闲分配 |
 | `session->importBuffer(pointer, bytes, readonly=false)` | 借用外部设备存储，不取得其实际分配的所有权 |
 | `session->load(binary, entry, requiredTypes, arch, parameterWidths)` | 加载 cubin 字节或 PTX 文本，校验设备与 kernel ABI，复用驻留模块 |
-| `session->prepareProgram(bufferSizes, inputs, outputs, steps, graph=false)` | 创建不可变参数布局和逻辑端口表，返回原生 `PreparedProgram` |
+| `session->prepareProgram(bufferSizes, inputs, outputs, steps, graph=false)` | 校验执行计划和内部缓冲区槽位映射，创建不可变 `PreparedProgram` |
 | `program->submit(inputs, outputs)` | 绑定公开缓冲区，一次提交完整计划，返回完成事件 |
 | `program->run(inputs)` | 自动分配公开输出，返回 `{outputs, event}`；计划中的输入别名与重复输出保持原存储 |
 | `event->query()` / `event->wait()` | 查询完成或等待完成 |
@@ -142,7 +142,7 @@ std::int32_t result[4];
 outputs.front()->copyToHost(result, sizeof(result));
 ```
 
-缓冲区字节数按执行计划和 kernel ABI 中的形状、元素类型计算。输入允许共享存储；不同逻辑输出须与其它公开端口分离。计划中的输入别名和重复输出须绑定同一存储。全部端口通过检查后才启动 kernel。
+缓冲区字节数按执行计划和 kernel ABI 中的形状、元素类型计算。输入允许共享存储；不同逻辑输出须与其它公开端口分离。计划中的输入别名和重复输出须绑定同一存储。ASK PASS 在准备时校验所有内部缓冲区的物理槽位容量与生存期；公开端口不参与槽位共享。全部端口通过检查后才启动 kernel。
 
 传 `graph=true` 使用 CUDA Graph replay：首次为工作区实例化 graph，后续更新 kernel 的输入输出地址后复用。拓扑、kernel、形状和启动配置固定，地址可变化。在途调用各用独立工作区和 graph 实例，完成后复用中间缓冲区和事件。顺序提交和 graph 共用参数绑定、校验及资源管理；驱动能力不足或调用失败会报错。验证见[运行时测试](../tests/cpp/runtime.cpp)。
 

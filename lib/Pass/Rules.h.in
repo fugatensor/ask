@@ -1,0 +1,13 @@
+#pragma once
+
+constexpr char kPlanAvailabilityRule[] = R"ASK_PASS_RULES(
+@ASK_PLAN_AVAILABILITY_RULES@
+)ASK_PASS_RULES";
+
+constexpr char kBufferReuseRules[] = R"ASK_PASS_RULES(
+@ASK_BUFFER_REUSE_RULES@
+)ASK_PASS_RULES";
+
+constexpr char kAllocationPlanRules[] = R"ASK_PASS_RULES(
+@ASK_ALLOCATION_PLAN_RULES@
+)ASK_PASS_RULES";
