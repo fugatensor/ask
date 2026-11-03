@@ -17,8 +17,7 @@ inline llvm::Type *scalarLLVMType(mlir::Type type, llvm::LLVMContext &context) {
   return llvm::Type::getFloatTy(context);
 }
 
-// BF16 has the same exponent as f32. Integer rounding preserves subnormals,
-// unlike x86 VCVTNEPS2BF16, which flushes them regardless of the FP environment.
+// BF16 has the same exponent as f32. Integer rounding preserves subnormals.
 inline llvm::Value *extendBF16(llvm::IRBuilder<> &b, llvm::Value *value) {
   auto *bits = b.CreateZExt(b.CreateBitCast(value, b.getInt16Ty()), b.getInt32Ty());
   return b.CreateBitCast(b.CreateShl(bits, b.getInt32(16)), b.getFloatTy());
