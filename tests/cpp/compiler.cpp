@@ -4,6 +4,7 @@
 #include <future>
 #include <iostream>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 namespace {
@@ -20,6 +21,91 @@ const std::string source = R"mlir(module attributes {ask.schema_version = 1 : i6
 
 void require(bool condition, const char *message) {
   if (!condition) throw std::runtime_error(message);
+}
+
+void checkDiagnostics(const std::string &diagnostics) {
+  for (const auto *field : {"shape_snapshot", "external_requests", "execution_plan",
+                            "step_sources", "abi", "cuda_artifact"})
+    require(diagnostics.find(std::string("\"") + field + "\":") == std::string::npos,
+            "diagnostics contains a machine contract");
+  require(diagnostics.find("\"phase\":") != std::string::npos, "diagnostics lost its phase");
+}
+
+void checkTypedCompiler(bool host, const std::string &objectPath) {
+  using namespace ask::compiler;
+  static_assert(!std::is_same_v<PrepareResult, PartitionResult>);
+  static_assert(!std::is_same_v<PrepareResult, CodegenResult>);
+  PrepareOptions preparation;
+  preparation.optimize = true;
+  preparation.optimization = {false, false, false};
+  auto prepared = prepare(source, preparation);
+  auto wire = ask::prepareJSON(source, true, false, false, false);
+  require(prepared.ir == wire.first, "typed prepare options disagree with wire entrypoint");
+  require(wire.second.find("\"shape_snapshot\":" + prepared.shapeSnapshotJSON) != std::string::npos,
+          "typed shape snapshot differs from wire contract");
+  require(prepared.externalRequestsJSON == "[]", "owned graph has external requests");
+  checkDiagnostics(prepared.diagnosticsJSON);
+
+  PartitionOptions partitioning;
+  partitioning.optimization = preparation.optimization;
+  auto partitioned = partition(source, partitioning);
+  auto planWire = ask::partitionJSON(source, true, false, false, false);
+  require(partitioned.ir == planWire.first, "typed partition options disagree with wire entrypoint");
+  require(planWire.second.find("\"execution_plan\":" + partitioned.executionPlanJSON) != std::string::npos,
+          "typed execution plan differs from wire contract");
+  require(partitioned.stepSources.size() == 1, "owned graph should have one step source");
+  require(!prepare(partitioned.stepSources.begin()->second).ir.empty(), "step source is not standalone");
+  checkDiagnostics(partitioned.diagnosticsJSON);
+
+  CodegenOptions cudaOptions;
+  cudaOptions.target = CodegenTarget::CUDALLVM;
+  cudaOptions.architecture = 86;
+  auto cuda = codegen(source, cudaOptions);
+  auto cudaWire = ask::codegenJSON(source, "cuda-llvm", "", 86);
+  require(cuda.target == CodegenTarget::CUDALLVM && cuda.outputPath.empty() && !cuda.ir.empty(),
+          "CUDA result lost its target or assembly");
+  require(cuda.ir == cudaWire.first && cuda.cudaArtifactJSON && !cuda.abiJSON,
+          "CUDA result has wrong payload kind");
+  require(cudaWire.second.find("\"cuda_artifact\":" + *cuda.cudaArtifactJSON) != std::string::npos,
+          "typed CUDA artifact differs from wire contract");
+  require(cuda.ir.find("9223372036854775807") != std::string::npos &&
+              cuda.ir.find("-0.000000e+00") != std::string::npos,
+          "typed codegen changed literal precision");
+  checkDiagnostics(cuda.diagnosticsJSON);
+
+  for (auto bad : {CodegenOptions{}, cudaOptions}) {
+    bad.outputPath = objectPath;
+    bool rejected = false;
+    try { codegen(source, bad); } catch (const std::runtime_error &) { rejected = true; }
+    require(rejected, "LLVM target accepted an object output path");
+  }
+  CodegenOptions invalid;
+  invalid.target = static_cast<CodegenTarget>(-1);
+  bool rejected = false;
+  try { codegen(source, invalid); } catch (const std::runtime_error &) { rejected = true; }
+  require(rejected, "invalid codegen enum was accepted");
+  invalid.target = CodegenTarget::HostObject;
+  rejected = false;
+  try { codegen(source, invalid); } catch (const std::runtime_error &) { rejected = true; }
+  require(rejected, "object mode accepted a missing output path");
+
+  if (host) {
+    CodegenOptions hostOptions;
+    auto hostLLVM = codegen(source, hostOptions);
+    require(hostLLVM.abiJSON && !hostLLVM.cudaArtifactJSON && !hostLLVM.ir.empty() && hostLLVM.outputPath.empty(),
+            "Host LLVM result has wrong payload kind");
+    checkDiagnostics(hostLLVM.diagnosticsJSON);
+    hostOptions.target = CodegenTarget::HostObject;
+    hostOptions.outputPath = objectPath;
+    auto object = codegen(source, hostOptions);
+    require(object.target == CodegenTarget::HostObject && object.outputPath == objectPath && object.ir.empty() &&
+                object.abiJSON && !object.cudaArtifactJSON, "Host object result has wrong output contract");
+    checkDiagnostics(object.diagnosticsJSON);
+    std::ifstream file(object.outputPath, std::ios::binary);
+    char magic[4]{};
+    file.read(magic, sizeof(magic));
+    require(std::string(magic, 4) == "\x7f" "ELF", "typed codegen did not write a host object");
+  }
 }
 
 void checkReshape(bool host) {
@@ -64,7 +150,7 @@ void checkReshape(bool host) {
   }
   const std::string external = R"mlir(module {
     "ask.semantics"() {sym_name = "sem", function_type = (tensor<2x2xf32>) -> tensor<2x2xf32>, shape_rule = "fixed", effects = "none"} : () -> ()
-    "ask.implementation"() {sym_name = "impl", compiler = "test", source = "source", entry = "kernel", signature = {X = "*fp32", Y = "*fp32"}, source_bindings = {X = "input:0", Y = "output:0"}, constants = {}, options = {}, target = {backend = "cuda", arch = 86 : i64}, grid = array<i64: 1, 1, 1>} : () -> ()
+    "ask.implementation"() {sym_name = "impl", compiler = "test", source = "source", entry = "kernel", signature = {X = "*fp32", Y = "*fp32"}, source_bindings = {X = "input:0", Y = "output:0"}, constants = {whole = 1.0 : f64, nested = {values = [-0.0 : f64, 9223372036854775807 : i64]}}, options = {}, target = {backend = "cuda", arch = 86 : i64}, grid = array<i64: 1, 1, 1>} : () -> ()
     func.func @external_shape(%x: tensor<4xf32>) -> tensor<2x2xf32> {
       %matrix = "ask.reshape"(%x) {shape = array<i64: 2, 2>, ask.id = "matrix", ask.value_id = "reshaped"} : (tensor<4xf32>) -> tensor<2x2xf32>
       %marked = "ask.mark"(%matrix) {mark_id = "matrix_shape", value_id = "reshaped", role = "value"} : (tensor<2x2xf32>) -> tensor<2x2xf32>
@@ -79,6 +165,19 @@ void checkReshape(bool host) {
   require(plan.second.find("\"kind\":\"owned\"") != std::string::npos &&
               plan.second.find("\"kind\":\"external\"") != std::string::npos,
           "reshape was not partitioned as owned computation");
+  auto typedPlan = ask::compiler::partition(external);
+  auto typedPreparation = ask::compiler::prepare(external);
+  for (const auto &requests : {typedPlan.externalRequestsJSON, typedPreparation.externalRequestsJSON}) {
+    require(requests.find("\"whole\":1.00000000000000000e+00") != std::string::npos,
+            "typed external requests changed an integral float to an integer");
+    require(requests.find("[-0.00000000000000000e+00,9223372036854775807]") != std::string::npos,
+            "typed external requests lost nested negative zero or i64 precision");
+    require(plan.second.find("\"external_requests\":" + requests) != std::string::npos,
+            "typed external requests differ from the wire contract");
+  }
+  require(typedPlan.stepSources.size() == 2, "mixed graph lost partition source modules");
+  checkDiagnostics(typedPlan.diagnosticsJSON);
+  checkDiagnostics(typedPreparation.diagnosticsJSON);
 }
 } // namespace
 
@@ -99,6 +198,7 @@ int main(int argc, char **argv) {
     catch (const std::runtime_error &) { rejected = true; }
     require(rejected, "invalid source was accepted");
     const auto capabilities = ask::compilerCapabilitiesJSON();
+    checkTypedCompiler(capabilities.find("\"host_codegen\":true") != std::string::npos, argv[1]);
     checkReshape(capabilities.find("\"host_codegen\":true") != std::string::npos);
     require(std::ifstream(ask::compilerLibraryPath()).good(), "loaded compiler library is not identifiable");
     if (capabilities.find("\"host_codegen\":true") != std::string::npos) {

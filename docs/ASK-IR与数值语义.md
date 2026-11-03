@@ -69,11 +69,13 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 
 ## 4. 形状推导、稳定身份与 `ask.mark` 擦除
 
-`compiler.prepare(module)`（`lib/Frontend/Prepare.cpp`）依次执行以下步骤：
+`ask::compiler::prepare` 通过 `lib/Frontend/Prepare.cpp` 依次执行以下步骤：
 
 1. **校验符号与操作 ID**：模块内的 `ask.id` 不可重复；`ask.external` 引用的 `@semantics` 和 `@implementation` 必须存在，且端口数量与元素类型一致。
-2. **推导形状快照**：检查逐元素算子的输入输出形状一致、reshape 前后元素数相同，按 `same_as`（跟随指定输入操作数形状）或 `fixed`（使用语义签名中的静态形状）确定 `ask.external` 的输出形状，在 `report["shape_snapshot"]["shape_bindings"]` 中输出张量值的形状，并记录输入特化、语义修订与快照摘要。
-3. **提取并擦除 `ask.mark`**：收集 `mark_id`、`value_id`、`role`（`value` / `input` / `output`）与可选 `port_id` 到 `report["markers"]`，随后从 IR 中移除 `ask.mark` 并将原值直连下游算子。对准备后的 IR 再次运行 `--prepare`，IR 与修订计数保持不变；新的报告不再含已擦除的标记。
+2. **推导形状快照**：检查逐元素算子的输入输出形状一致、reshape 前后元素数相同，按 `same_as`（跟随指定输入操作数形状）或 `fixed`（使用语义签名中的静态形状）确定 `ask.external` 的输出形状，在 `shapeSnapshotJSON` 的 `shape_bindings` 中输出张量值的形状，并记录输入特化、语义修订与快照摘要。
+3. **提取并擦除 `ask.mark`**：收集 `mark_id`、`value_id`、`role`（`value` / `input` / `output`）与可选 `port_id` 到 `diagnosticsJSON` 的 `markers` 字段，随后从 IR 中移除 `ask.mark` 并将原值直连下游算子。对准备后的 IR 再次运行 `--prepare`，IR 与修订计数保持不变；新的报告不再含已擦除的标记。
+
+CLI 和兼容 JSON 接口将形状快照保存在完整报告的 `shape_snapshot` 字段，标记保存在 `markers` 字段。具名结果见[编译接口](用户API.md#compiler-api)。
 
 <a id="external-declaration"></a>
 
@@ -84,4 +86,4 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 - `ask.semantics` 描述图级接口（输入输出秩与 dtype、形状规则及 `effects = "none"`），供图校验和端口连接使用。当前不支持有状态外部算子或 token；高层 DCE 保守保留 `ask.external`。
 - `ask.implementation` 描述具体编译配置（`compiler = "triton"`、DSL 源码、`entry`、`signature`、`source_bindings`、`constants`、`options`、`target`、`grid`）。
 
-`prepare` 在 `report["external_requests"]` 中导出协议 v2 请求，调用方按 `compiler` 选择 worker。编译后的产物通过[外部执行接口](外部产物与执行接口.md)交给运行时。
+`prepare` 通过结果的 `externalRequestsJSON` 导出协议 v2 请求，调用方按 `compiler` 选择 worker；CLI 和兼容接口对应完整报告的 `external_requests` 字段。编译后的产物通过[外部执行接口](外部产物与执行接口.md)交给运行时。

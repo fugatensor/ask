@@ -15,7 +15,7 @@ ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态�
 - 执行计划：一次提交整段计算，按完成状态复用缓冲区和事件，支持 CUDA Graph replay。
 - 外部 kernel：通过设备缓冲区连接独立步骤，支持多输入、多输出、指针和按值标量。
 
-项目提供 C++ SDK 与 `ask-opt`。[FugaTensor](../fugatensor/README.md) 在此基础上实现 Python API、自动组图、求导和第三方编译器适配。
+项目提供 C++ SDK 与 `ask-opt`。Compiler SDK 使用具名编译选项和按阶段区分的结果，将执行计划、ABI、产物与诊断分开返回。[FugaTensor](../fugatensor/README.md) 在此基础上实现 Python API、自动组图、求导和第三方编译器适配。
 
 接口见[用户 API](docs/用户API.md)，设计见[核心思想](docs/核心思想.md)。接入示例推荐看 FugaTensor 的 [Tensor API](../fugatensor/docs/API/README.md) 和[图降级、原生绑定与执行](../fugatensor/docs/architecture/ASK桥接与多后端执行.md)。
 

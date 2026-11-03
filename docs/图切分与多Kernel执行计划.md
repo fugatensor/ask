@@ -8,7 +8,9 @@
 
 ASK 图描述数据依赖，执行计划确定 kernel 及其间的设备缓冲区。切分器先在 MLIR 中检查类型、推导形状并优化图，再划分 kernel。每个分区使用 `func.func` 和 `ask` 算子，以 `ask.kernel_id`、`ask.kernel_kind` 属性记录身份和类型；模块的 `ask.execution_plan` 字符串属性保存 JSON 计划。
 
-`ask::partitionJSON(...)` 返回切分后的 MLIR 和 JSON 报告；CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。报告中的 `execution_plan` 保存计划，`step_sources` 按步骤 ID 保存可单独编译的 MLIR，包含该步骤引用的语义和实现声明。原始 `ask.id`、值身份和溯源记录用于关联切分前后的图。
+`ask::compiler::partition(source, options)` 返回 `PartitionResult`：`ir` 是切分后的 MLIR，`executionPlanJSON` 保存计划，`stepSources` 按步骤 ID 保存可单独编译的 MLIR，包含该步骤引用的语义和实现声明；`externalRequestsJSON` 提供外部编译请求。原始 `ask.id`、值身份及 `diagnosticsJSON` 中的溯源记录用于关联切分前后的图。接口字段见[用户 API](用户API.md#compiler-api)。
+
+CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。CLI 与 `ask::partitionJSON` 的完整报告保留 `execution_plan`、`step_sources` 和 `external_requests` 字段。
 
 步骤分为两类：`owned` 包含 ASK 自有计算，可在内部优化和融合；`external` 对应单个外部 kernel。
 

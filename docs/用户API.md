@@ -48,30 +48,53 @@ module attributes {ask.schema_version = 1 : i64} {
 
 ## 3. 编译接口
 
-以下函数位于 `namespace ask`。除 capabilities 和库路径外，返回类型均为 `std::pair<std::string, std::string>`：第一项是 IR，第二项是 JSON 报告。
+编译入口位于 `namespace ask::compiler`，使用具名选项和按阶段区分的结果类型。所有公开类型仅依赖 C++17 标准库。
 
 | 调用 | 结果 |
 | --- | --- |
-| `compilerCapabilitiesJSON()` | 构建版本、类型、目标后端与运行时能力的 JSON 文本 |
-| `compilerLibraryPath()` | 当前实际载入的 Compiler 共享库路径，可用于内容摘要与编译缓存身份 |
-| `prepareJSON(source, optimize=false, foldConstants=true, eliminateDeadCode=true, fuseElementwise=true)` | 校验、静态形状与溯源报告；可选自有图优化 |
-| `partitionJSON(source, optimize=true, foldConstants=true, eliminateDeadCode=true, fuseElementwise=true)` | 分区后 MLIR；报告提供 `execution_plan`、`step_sources` 和外部请求 |
-| `codegenJSON(source, target, output="", architecture=0, blockSize=128, ptxVersion=80, optimize=true)` | 生成自有 Host/CUDA 代码与 ABI 报告 |
+| `prepare(source, options={})` | `PrepareResult`：校验后的 `ir`、`shapeSnapshotJSON`、`externalRequestsJSON` 与 `diagnosticsJSON` |
+| `partition(source, options={})` | `PartitionResult`：上述字段，以及 `executionPlanJSON` 和按步骤 ID 索引 MLIR 的 `stepSources` |
+| `codegen(source, options)` | `CodegenResult`：`target`、`outputPath`、`ir`、形状快照、外部请求、诊断，以及按目标提供的 `abiJSON` 或 `cudaArtifactJSON` |
 
-`codegenJSON` 的 target 有三种：
+`PrepareOptions.optimize` 默认 `false`，`PartitionOptions.optimize` 和 `CodegenOptions.optimize` 默认 `true`。三个选项类型都通过 `optimization` 指定 `OptimizationOptions`，其中 `foldConstants`、`eliminateDeadCode`、`fuseElementwise` 默认 `true`。
 
-- `"host-llvm"`：第一项返回本机 LLVM 文本，JSON 含 `abi`。
-- `"host-object"`：将本机 `.o` 写入必填 `output`，第一项为空，JSON 含 `abi`。链接和加载由调用方负责。
-- `"cuda-llvm"`：必须指定 architecture，例如 `86`；返回 CUDA LLVM 文本与含 `cuda_artifact` 的报告。调用方继续用 `llc` / `ptxas` 生成 PTX/cubin，自有计算保持 `-fp-contract=off`。
+`CodegenOptions.target` 使用 `CodegenTarget` 枚举，默认 `HostLLVM`：
+
+- `HostLLVM`：`ir` 返回本机 LLVM 文本，`abiJSON` 有值。
+- `HostObject`：将本机 `.o` 写入必填 `outputPath`，`ir` 为空，`abiJSON` 有值。链接和加载由调用方负责。
+- `CUDALLVM`：必须指定 `architecture`，例如 `86`；`ir` 返回 CUDA LLVM 文本，`cudaArtifactJSON` 有值。`blockSize` 默认 `128`，`ptxVersion` 默认 `80`。调用方继续用 `llc` / `ptxas` 生成 PTX/cubin，自有计算保持 `-fp-contract=off`。
+
+`outputPath` 只用于 `HostObject`，LLVM 文本目标须保持为空。`abiJSON` 与 `cudaArtifactJSON` 为 `std::optional<std::string>`，仅对应目标的字段有值。其它 JSON 字段为 `std::string`，保留现有版本化契约；`stepSources` 为 `std::map<std::string, std::string>`。`shapeSnapshotJSON` 供形状校验与编译缓存使用，`externalRequestsJSON` 是外部请求数组。`diagnosticsJSON` 保存阶段、溯源和优化统计，编译编排通过上述具名字段获取产物。
 
 ```cpp
 #include <ask/Frontend/CompilerAPI.h>
 
 // source 为上面的 ASK MLIR 字符串。
-auto [preparedIR, preparationReport] = ask::prepareJSON(source, true);
-auto [cudaIR, cudaReport] = ask::codegenJSON(source, "cuda-llvm", "", 86);
-auto [unused, hostReport] = ask::codegenJSON(source, "host-object", "increment.o");
+ask::compiler::PrepareOptions preparation;
+preparation.optimize = true;
+auto prepared = ask::compiler::prepare(source, preparation);
+auto partitioned = ask::compiler::partition(source);
+
+ask::compiler::CodegenOptions cudaOptions;
+cudaOptions.target = ask::compiler::CodegenTarget::CUDALLVM;
+cudaOptions.architecture = 86;
+auto cuda = ask::compiler::codegen(source, cudaOptions);
+
+ask::compiler::CodegenOptions hostOptions;
+hostOptions.target = ask::compiler::CodegenTarget::HostObject;
+hostOptions.outputPath = "increment.o";
+auto host = ask::compiler::codegen(source, hostOptions);
 ```
+
+`ask::compilerCapabilitiesJSON()` 返回构建版本、类型、目标后端与运行时能力；`ask::compilerLibraryPath()` 返回当前实际载入的 Compiler 共享库路径，可用于内容摘要与编译缓存身份。
+
+`namespace ask` 下的 `prepareJSON`、`partitionJSON`、`codegenJSON` 保留兼容接口，返回 `{ir, reportJSON}` 字符串对。`ask-opt --report-json` 同样输出含形状快照、外部请求、执行计划和目标产物的完整报告。具名结果与完整报告使用相同的序列化规则，保留浮点配置的词法类型、负零和 64 位整数精度。
+
+| 兼容接口 | 默认参数 |
+| --- | --- |
+| `prepareJSON(source, optimize, foldConstants, eliminateDeadCode, fuseElementwise)` | `false, true, true, true` |
+| `partitionJSON(source, optimize, foldConstants, eliminateDeadCode, fuseElementwise)` | `true, true, true, true` |
+| `codegenJSON(source, target, output, architecture, blockSize, ptxVersion, optimize)` | `output="", architecture=0, blockSize=128, ptxVersion=80, optimize=true`；`target` 为 `"host-llvm"`、`"host-object"` 或 `"cuda-llvm"` |
 
 各请求使用独立 MLIR context，支持并发调用。失败抛出带原生诊断的 `std::runtime_error`。接口验证见[编译器测试](../tests/cpp/compiler.cpp)。
 
@@ -119,7 +142,7 @@ std::int32_t result[4];
 outputs.front()->copyToHost(result, sizeof(result));
 ```
 
-缓冲区字节数按编译报告中的形状和元素类型计算。输入允许共享存储；不同逻辑输出须与其它公开端口分离。计划中的输入别名和重复输出须绑定同一存储。全部端口通过检查后才启动 kernel。
+缓冲区字节数按执行计划和 kernel ABI 中的形状、元素类型计算。输入允许共享存储；不同逻辑输出须与其它公开端口分离。计划中的输入别名和重复输出须绑定同一存储。全部端口通过检查后才启动 kernel。
 
 传 `graph=true` 使用 CUDA Graph replay：首次为工作区实例化 graph，后续更新 kernel 的输入输出地址后复用。拓扑、kernel、形状和启动配置固定，地址可变化。在途调用各用独立工作区和 graph 实例，完成后复用中间缓冲区和事件。顺序提交和 graph 共用参数绑定、校验及资源管理；驱动能力不足或调用失败会报错。验证见[运行时测试](../tests/cpp/runtime.cpp)。
 
@@ -127,7 +150,7 @@ outputs.front()->copyToHost(result, sizeof(result));
 
 ## 5. 第三方 kernel 与外部存储
 
-适配器提供 cubin/PTX、入口、端口和启动配置，通过 `load` 与 `prepareProgram` 接入。编译器检查 `ask.external` 的声明，`partitionJSON` 将每个外部节点分为独立步骤，自有区域内部继续融合。
+适配器提供 cubin/PTX、入口、端口和启动配置，通过 `load` 与 `prepareProgram` 接入。编译器检查 `ask.external` 的声明，`ask::compiler::partition` 将每个外部节点分为独立步骤，自有区域内部继续融合。
 
 worker 请求、产物格式和标量类型见[外部适配规范](外部编译器适配接入规范.md)。调用方负责 worker、工具环境、磁盘缓存和原生程序准备，FugaTensor 已提供相应实现。
 
