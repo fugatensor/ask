@@ -9,6 +9,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <string_view>
 #include <utility>
 #ifdef _WIN32
 #include <windows.h>
@@ -30,8 +31,8 @@ struct KernelNodeParams {
   void **parameters = nullptr, **extra = nullptr;
 };
 constexpr int notReady = 600;
-void require(bool condition, const std::string &message) {
-  if (!condition) throw CUDAError(message);
+void require(bool condition, std::string_view message) {
+  if (!condition) throw CUDAError(std::string(message));
 }
 struct Driver {
   Handle library = nullptr;
