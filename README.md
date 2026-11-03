@@ -1,5 +1,7 @@
 # ASK
 
+<img src="docs/assets/ask-logo-inverse.svg" alt="ASK logo" width="100%">
+
 [![Version](https://img.shields.io/badge/version-0.1.0-2563eb)](VERSION)
 [![C++17](https://img.shields.io/badge/C%2B%2B-17-00599c)](docs/安装.md#requirements)
 [![LLVM 23.1.x](https://img.shields.io/badge/LLVM-23.1.x-64748b)](docs/前端接入与构建配置.md#version-contract)
