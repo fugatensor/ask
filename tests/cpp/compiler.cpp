@@ -196,7 +196,7 @@ void checkHostTypes(const std::string &capabilities, const std::string &objectPa
         bool rejected = false;
         try { codegen(graph, options); }
         catch (const std::runtime_error &error) {
-          rejected = std::string(error.what()).find("bf16 is not supported by the Host backend") != std::string::npos;
+          rejected = std::string(error.what()).find("Host backend supports only bool/i32/i64/f32/f16") != std::string::npos;
         }
         require(rejected, "Host codegen accepted a bf16 graph");
       }
@@ -214,7 +214,7 @@ void checkHostTypes(const std::string &capabilities, const std::string &objectPa
     bool rejected = false;
     try { codegen(graph, {}); }
     catch (const std::runtime_error &error) {
-      rejected = std::string(error.what()).find("bf16 is not supported by the Host backend") != std::string::npos;
+      rejected = std::string(error.what()).find("Host backend supports only bool/i32/i64/f32/f16") != std::string::npos;
     }
     require(rejected, "Host optimization bypassed its bf16 dtype boundary");
     require(!prepare(graph).ir.empty(), "target-independent preparation rejected bf16");

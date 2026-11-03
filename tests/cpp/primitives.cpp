@@ -21,7 +21,7 @@ void compile(const std::string &source, bool host) {
       bool rejected = false;
       try { ask::compiler::codegen(source, options); }
       catch (const std::exception &error) {
-        rejected = std::string(error.what()).find("bf16 is not supported by the Host backend") != std::string::npos;
+        rejected = std::string(error.what()).find("Host backend supports only bool/i32/i64/f32/f16") != std::string::npos;
       }
       require(rejected, "unsupported Host bf16 must be rejected");
     } else require(!ask::compiler::codegen(source, options).ir.empty(), "missing Host LLVM");

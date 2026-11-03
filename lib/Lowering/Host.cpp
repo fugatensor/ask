@@ -270,16 +270,20 @@ llvm::Error validateFunction(mlir::func::FuncOp function) {
 } // namespace
 
 llvm::Error validateHostElementTypes(mlir::ModuleOp module) {
-  auto bf16 = [](mlir::Type type) { return elementType(type).isBF16(); };
+  auto supported = [](mlir::Type type) {
+    type = elementType(type);
+    return type.isSignlessInteger(1) || type.isSignlessInteger(32) ||
+           type.isSignlessInteger(64) || type.isF32() || type.isF16();
+  };
   auto result = module.walk([&](mlir::Operation *op) {
     if (auto function = mlir::dyn_cast<mlir::func::FuncOp>(op))
-      if (llvm::any_of(function.getArgumentTypes(), bf16) ||
-          llvm::any_of(function.getResultTypes(), bf16))
+      if (!llvm::all_of(function.getArgumentTypes(), supported) ||
+          !llvm::all_of(function.getResultTypes(), supported))
         return mlir::WalkResult::interrupt();
-    return llvm::any_of(op->getResultTypes(), bf16)
-        ? mlir::WalkResult::interrupt() : mlir::WalkResult::advance();
+    return llvm::all_of(op->getResultTypes(), supported)
+        ? mlir::WalkResult::advance() : mlir::WalkResult::interrupt();
   });
-  return result.wasInterrupted() ? error("bf16 is not supported by the Host backend")
+  return result.wasInterrupted() ? error("Host backend supports only bool/i32/i64/f32/f16")
                                  : llvm::Error::success();
 }
 
