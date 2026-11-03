@@ -24,6 +24,11 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 | `ask.add` / `ask.mul` | `func.func` 内 | 同形状、同数值元素类型的逐元素加/乘；整数采用二补数回绕（`overflow = "wrap"`）。 |
 | `ask.cast` | `func.func` 内 | 转换元素类型，保持形状；支持全部 6×6 方向。 |
 | `ask.reshape` | `func.func` 内 | 改变张量形状，保持元素类型、总数和连续行主序次序；支持 0-D 和空张量。 |
+| `ask.broadcast_in_dim` / `ask.transpose` | `func.func` 内 | 显式扩展维度或重排轴，保持元素类型。 |
+| `ask.reduce_sum` / `ask.reduce_max` | `func.func` 内 | 按指定轴归约，移除这些轴。 |
+| `ask.div` / `ask.exp` / `ask.log` / `ask.sqrt` | `func.func` 内 | 同类型浮点逐元素计算。 |
+| `ask.compare` / `ask.select` | `func.func` 内 | 比较产生同形状 bool；按 bool 条件选择同形状、同类型的值。 |
+| `ask.matmul` | `func.func` 内 | 连续矩阵或同批次矩阵相乘，CUDA 使用 cuBLASLt。 |
 | `ask.mark` | `func.func` 内 | 追踪透传标记，记录逻辑值身份（`value_id`）或端口绑定（`port_id`），在 `prepare` 提取报告后擦除。 |
 | `ask.external` | `func.func` 内 | 引用一对 `@semantics` 与 `@implementation` 符号，表示第三方编译器负责的外部算子节点。 |
 
@@ -36,6 +41,42 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 ```
 
 `shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，见 [FugaTensor reshape](../../fugatensor/docs/API/张量与数据交换.md#reshape)。reshape 保持元素类型和线性次序，外部 kernel 接收变换后的形状。自有逐元素循环复用对应的输入值，公开输出使用独立缓冲区。
+
+<a id="tensor-primitives"></a>
+
+## 显式形状变换与归约
+
+`broadcast_in_dim` 的 `shape` 给出目标形状，`dimensions` 将每个输入轴映射到目标轴，按严格递增顺序排列。映射轴的输入维度须等于目标维度或为 1；标量使用空映射。例如：
+
+```mlir
+%wide = "ask.broadcast_in_dim"(%row) {shape = array<i64: 2, 3>, dimensions = array<i64: 0, 1>} : (tensor<1x3xf32>) -> tensor<2x3xf32>
+%swapped = "ask.transpose"(%wide) {permutation = array<i64: 1, 0>} : (tensor<2x3xf32>) -> tensor<3x2xf32>
+%sum = "ask.reduce_sum"(%swapped) {axes = array<i64: 1>} : (tensor<3x2xf32>) -> tensor<3xf32>
+```
+
+`transpose` 的 `permutation` 列出各输出轴对应的输入轴。归约的 `axes` 严格递增且唯一，结果移除指定轴；全部轴被移除时结果为标量，可用 `splat` 或 `broadcast_in_dim` 扩展。正秩张量的空轴列表保持原值。
+
+`reduce_sum` 按归约轴的行主序累计，每步使用输入类型舍入，整数回绕，空域结果为零。需要 f32 累加时先 `cast`。`reduce_max` 接受整数和浮点，传播 NaN，区分正负零，要求归约域非空。
+
+<a id="elementwise-primitives"></a>
+
+## 浮点计算与条件选择
+
+`div`、`exp`、`log`、`sqrt` 接受 f32/f16/bf16；低精度超越函数先扩展至 f32，再 RNE 回原类型。CUDA 的 exp/log 使用 NVIDIA libdevice。比较的 `predicate` 为 `eq`、`ne`、`lt`、`le`、`gt` 或 `ge`；浮点 NaN 仅使 `ne` 成立。`select(condition, yes, no)` 三个操作数形状相同，条件为 bool，两个分支类型相同。
+
+相邻逐元素操作由共享循环执行，广播和转置映射读取下标。具体物化边界见[图切分](图切分与多Kernel执行计划.md#partition-boundaries)。
+
+<a id="matmul-semantics"></a>
+
+## 矩阵乘法
+
+```mlir
+%c = "ask.matmul"(%a, %b) : (tensor<32x64xf16>, tensor<64x48xf16>) -> tensor<32x48xf16>
+```
+
+输入使用相同的 f32、f16 或 bf16，秩至少为 2，前导批次维度逐项相同。`transpose_a`、`transpose_b` 是默认 false 的布尔属性，作用于最后两轴；逻辑形状满足 `[..., M, K] × [..., K, N] → [..., M, N]`。CUDA 库步骤的批次数上限为有符号 32 位整数。`K=0` 产生零，空批次或空输出保持空张量。
+
+结果保持输入类型，累加使用 f32。CUDA cuBLASLt 的 f32 输入采用 `CUBLAS_COMPUTE_32F_PEDANTIC`；f16/bf16 使用 f32 累加及 f32 分段归约中间值。库算法决定归约顺序。Host 通过行主序循环计算，f32 乘法和加法分别舍入。末两轴的转置可在优化时吸收到 matmul 标志中。
 
 <a id="types-and-precision"></a>
 

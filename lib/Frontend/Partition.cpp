@@ -24,6 +24,7 @@ struct Partition {
   llvm::SmallVector<Operation *> operations;
   std::string kind = "owned";
   ExternalOp external;
+  MatmulOp matmul;
 };
 struct Ports {
   llvm::SmallVector<Value> inputs, outputs;
@@ -42,22 +43,27 @@ std::string identity(Value value) {
           llvm::Twine(result.getResultNumber())).str();
 }
 
-Ports ports(const Partition &part) {
+Ports ports(const Partition &part, const llvm::DenseSet<Value> &runtimeValues) {
   Ports result;
   if (part.kind == "external") {
     result.inputs.append(part.external->operand_begin(), part.external->operand_end());
     result.outputs.append(part.external->result_begin(), part.external->result_end());
     return result;
   }
+  if (part.matmul) {
+    result.inputs.append(part.matmul->operand_begin(), part.matmul->operand_end());
+    result.outputs.append(part.matmul->result_begin(), part.matmul->result_end());
+    return result;
+  }
   llvm::DenseSet<Operation *> members(part.operations.begin(), part.operations.end());
   llvm::DenseSet<Value> seenInputs;
   for (auto *operation : part.operations) {
     for (Value operand : operation->getOperands())
-      if (isa<RankedTensorType>(operand.getType()) && !members.contains(operand.getDefiningOp()) &&
+      if (runtimeValues.contains(operand) && !members.contains(operand.getDefiningOp()) &&
           seenInputs.insert(operand).second)
         result.inputs.push_back(operand);
     for (Value value : operation->getResults())
-      if (isa<RankedTensorType>(value.getType()) && llvm::any_of(value.getUsers(),
+      if (llvm::any_of(value.getUsers(),
           [&](Operation *user) { return !members.contains(user); }))
         result.outputs.push_back(value);
   }
@@ -84,16 +90,50 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
       return function.emitError("CUDA partition ports must be static ranked tensors; use tensor<...> for 0-D scalars");
 
   std::vector<Partition> parts;
+  // Scalar constants can be cloned into their consumer. Scalar values derived
+  // from tensors are runtime data and cross partition boundaries as one-element
+  // device buffers, using the existing CUDA pointer ABI.
+  llvm::DenseSet<Value> runtimeValues(function.getArguments().begin(), function.getArguments().end());
+  llvm::DenseMap<Value, std::size_t> reductionRegion;
+  auto elementCount = [](Type type) -> uint64_t {
+    if (auto tensor = dyn_cast<RankedTensorType>(type)) return tensor.getNumElements();
+    return 1;
+  };
   for (Operation &operation : function.front()) {
     if (isa<func::ReturnOp>(operation)) continue;
     if (auto external = dyn_cast<ExternalOp>(operation)) {
       for (Type type : llvm::concat<const Type>(external->getOperandTypes(), external->getResultTypes()))
         if (!isa<RankedTensorType>(type))
           return external.emitError("CUDA external ports must be static ranked tensors");
-      parts.push_back({{&operation}, "external", external});
-    } else if (llvm::any_of(operation.getResultTypes(), [](Type type) { return isa<RankedTensorType>(type); })) {
+      parts.push_back({{&operation}, "external", external, {}});
+      runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
+    } else if (auto matmul = dyn_cast<MatmulOp>(operation)) {
+      parts.push_back({{&operation}, "library", {}, matmul});
+      runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
+    } else if (llvm::any_of(operation.getResultTypes(), [](Type type) { return isa<RankedTensorType>(type); }) ||
+               llvm::any_of(operation.getOperands(), [&](Value value) { return runtimeValues.contains(value); })) {
       if (parts.empty() || parts.back().kind != "owned") parts.emplace_back();
+      // A reduction can fuse into same-sized consumers. Expanding its result
+      // would repeat the reduction for each expanded element, so materialize
+      // that result once before the broadcast and its elementwise consumers.
+      const auto region = parts.size() - 1;
+      if (llvm::any_of(operation.getOperands(), [&](Value value) {
+            auto found = reductionRegion.find(value);
+            return found != reductionRegion.end() && found->second == region &&
+                   elementCount(operation.getResult(0).getType()) > elementCount(value.getType());
+          }))
+        parts.emplace_back();
       parts.back().operations.push_back(&operation);
+      runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
+      const auto current = parts.size() - 1;
+      const bool reducesMultipleElements = isa<ReduceSumOp, ReduceMaxOp>(operation) &&
+          elementCount(operation.getOperand(0).getType()) > elementCount(operation.getResult(0).getType());
+      if (reducesMultipleElements ||
+          llvm::any_of(operation.getOperands(), [&](Value value) {
+            auto found = reductionRegion.find(value);
+            return found != reductionRegion.end() && found->second == current;
+          }))
+        for (Value value : operation.getResults()) reductionRegion[value] = current;
     }
   }
   llvm::json::Array buffers, inputs, outputs, steps;
@@ -101,9 +141,10 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
   auto registerBuffer = [&](Value value) {
     std::string id = identity(value);
     if (registeredBuffers.insert(id).second) {
-      auto type = cast<RankedTensorType>(value.getType());
       llvm::json::Array shape;
-      for (int64_t dimension : type.getShape()) shape.push_back(dimension);
+      auto type = value.getType();
+      if (auto tensor = dyn_cast<RankedTensorType>(type))
+        for (int64_t dimension : tensor.getShape()) shape.push_back(dimension);
       buffers.push_back(llvm::json::Object{{"id", id}, {"shape", std::move(shape)},
           {"element_type", elementTypeName(type).str()}});
     }
@@ -130,7 +171,7 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
     return name;
   };
   for (const auto &part : parts) {
-    Ports boundary = ports(part);
+    Ports boundary = ports(part, runtimeValues);
     if (part.kind == "owned" && boundary.outputs.empty()) continue;
     unsigned number = steps.size();
     std::string id = "kernel" + std::to_string(number);
@@ -191,6 +232,27 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
         {"inputs", std::move(stepInputs)}, {"outputs", std::move(stepOutputs)},
         {"depends_on", std::move(dependencies)}};
     if (part.external) step["external_id"] = part.external->getAttrOfType<StringAttr>("ask.id").getValue().str();
+    if (part.matmul) {
+      auto a = cast<RankedTensorType>(part.matmul->getOperand(0).getType());
+      auto b = cast<RankedTensorType>(part.matmul->getOperand(1).getType());
+      auto flag = [&](const char *name) {
+        auto attribute = part.matmul->getAttrOfType<BoolAttr>(name);
+        return attribute && attribute.getValue();
+      };
+      const bool transposeA = flag("transpose_a"), transposeB = flag("transpose_b");
+      const auto rank = a.getRank();
+      int64_t batch = 1;
+      auto batchShape = a.getShape().drop_back(2);
+      if (llvm::is_contained(batchShape, int64_t(0))) batch = 0;
+      else for (int64_t extent : batchShape) batch *= extent;
+      step["library"] = "cublaslt";
+      step["matmul"] = llvm::json::Object{
+          {"element_type", elementTypeName(a).str()},
+          {"m", a.getDimSize(rank - (transposeA ? 1 : 2))},
+          {"n", b.getDimSize(rank - (transposeB ? 2 : 1))},
+          {"k", a.getDimSize(rank - (transposeA ? 2 : 1))},
+          {"batch_count", batch}, {"transpose_a", transposeA}, {"transpose_b", transposeB}};
+    }
     steps.push_back(std::move(step));
     OwningOpRef<ModuleOp> single(ModuleOp::create(original.getLoc()));
     (*single)->setAttrs((*result)->getAttrs());

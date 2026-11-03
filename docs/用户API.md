@@ -144,6 +144,32 @@ outputs.front()->copyToHost(result, sizeof(result));
 
 </details>
 
+<a id="matmul-api"></a>
+
+## 矩阵乘法计划
+
+在图中写 `ask.matmul`，分区器会生成 `library = "cublaslt"` 步骤。直接使用 Runtime 时，填写矩阵描述和三个缓冲区索引即可：
+
+```cpp
+PlanStep mm;
+mm.matmul = MatmulDescription{"f16", 32, 48, 64}; // M、N、K
+mm.inputs = {0, 1};
+mm.outputs = {2};
+auto program = session->prepareProgram(
+    {32 * 64 * 2, 64 * 48 * 2, 32 * 48 * 2}, {0, 1}, {2}, {mm});
+```
+
+准备时创建 cuBLASLt 描述和算法，执行时绑定 A、B、C 地址。矩阵按连续行主序存储；批次、转置和数值约定见[矩阵语义](ASK-IR与数值语义.md#matmul-semantics)。构建依赖见[CUDA 工具](安装.md#cuda-and-adapters)。
+
+<details>
+<summary>批次与工作区</summary>
+
+`batchCount` 默认为 1，是相同前导批次维度的乘积。`transposeA` / `transposeB` 默认为 false，改变最后两轴的逻辑方向。公开缓冲区地址须按元素宽度对齐。
+
+`workspaceLimit` 默认 4 MiB，是算法选择的上限；运行时只分配算法实际要求的字节数。临时存储加入同一份槽位证明，串行步骤可复用生存期分离的槽位。设为 0 可选择零工作区算法。改变这些准备参数时创建新计划。
+
+</details>
+
 <a id="external-api"></a>
 
 ## 5. 第三方 kernel 与外部存储
@@ -167,7 +193,7 @@ worker 请求、产物格式和标量类型见[外部适配规范](外部编译�
 | `copyToHost()` | 将缓冲区复制为 `std::string` 字节 |
 | `Event::query()` / `wait()` | 查询完成状态或等待完成 |
 | `Session::reap()` / `synchronize()` / `close()` | 回收完成事件、同步 stream、同步关闭会话 |
-| `Session::stats()` | 查看模块、分配、工作区、事件和 graph 的累计计数 |
+| `Session::stats()` | 查看模块、分配、工作区、事件和 graph 的计数，以及自有显存当前值和峰值 |
 
 会话保留待完成事件，事件保留程序、参数缓冲区和工作区，直到设备工作结束。完成后的工作区和事件句柄可复用，旧事件对象保持已完成状态，调用方持有的旧结果继续使用原存储。
 
@@ -179,4 +205,4 @@ worker 请求、产物格式和标量类型见[外部适配规范](外部编译�
 
 编译接口抛出 `std::runtime_error`，设备层抛出 `ask::runtime::CUDAError`。启动失败时，前序步骤可能已提交；运行时等待这些工作结束，再释放引用并传播错误，设备写入不回滚。
 
-计划使用静态连续缓冲区，在单 stream 上执行普通 kernel。FugaTensor 负责 Python API 和框架级控制流，CUDA Graph 用于减少计划提交开销。
+计划使用静态连续缓冲区，在单 stream 上执行 kernel 和 cuBLASLt 步骤。FugaTensor 负责 Python API 和框架级控制流，CUDA Graph 用于减少计划提交开销。

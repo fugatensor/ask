@@ -116,7 +116,8 @@
         "kind": {
           "enum": [
             "owned",
-                        "external"
+            "external",
+            "library"
           ]
         },
         "function": {
@@ -146,6 +147,12 @@
         "external_id": {
           "type": "string",
           "minLength": 1
+        },
+        "library": {
+          "const": "cublaslt"
+        },
+        "matmul": {
+          "$ref": "#/$defs/matmul"
         }
       },
       "allOf": [
@@ -153,21 +160,62 @@
           "if": {
             "properties": {
               "kind": {
-                "const": "owned"
+                "const": "external"
               }
             }
           },
           "then": {
+            "required": [
+              "external_id"
+            ]
+          },
+          "else": {
             "not": {
               "required": [
                 "external_id"
               ]
             }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "library"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "library",
+              "matmul"
+            ],
+            "properties": {
+              "inputs": {
+                "minItems": 2,
+                "maxItems": 2
+              },
+              "outputs": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
           },
           "else": {
-            "required": [
-              "external_id"
-            ]
+            "not": {
+              "anyOf": [
+                {
+                  "required": [
+                    "library"
+                  ]
+                },
+                {
+                  "required": [
+                    "matmul"
+                  ]
+                }
+              ]
+            }
           }
         }
       ]
@@ -175,7 +223,55 @@
     "buffer_id": {
       "type": "string",
       "minLength": 1
+    },
+    "matmul": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "element_type",
+        "m",
+        "n",
+        "k",
+        "batch_count",
+        "transpose_a",
+        "transpose_b"
+      ],
+      "properties": {
+        "element_type": {
+          "enum": [
+            "f32",
+            "f16",
+            "bf16"
+          ]
+        },
+        "m": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "n": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "k": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "batch_count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "transpose_a": {
+          "type": "boolean"
+        },
+        "transpose_b": {
+          "type": "boolean"
+        }
+      }
     }
   },
-  "$comment": "The Python validator additionally enforces globally unique IDs, SSA definitions, topological order, exact producer dependencies, defined output references, and signed-int64 byte counts. Kernel ABI agreement is validated against compiled artifacts."
+  "$comment": "Consumers additionally enforce globally unique IDs, SSA definitions, topological order, exact producer dependencies, defined output references, and signed-int64 byte counts. Kernel ABI agreement is validated against compiled artifacts."
 }

@@ -14,7 +14,8 @@ struct CUDALoweringOptions {
   unsigned ptxVersion = 80;
 };
 
-// Lower one prepared static pointwise graph. All public arguments are pointers:
+// Lower one prepared static indexed graph, including reductions.
+// All public arguments are pointers:
 // inputs first, then disjoint output buffers. Scalars use shape [] and one
 // element; bool storage uses one byte. No external compiler is involved.
 // The returned artifact contains the normalized CUDA invocation (version 2).

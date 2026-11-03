@@ -14,7 +14,7 @@
 | [常驻运行时与多级缓存](常驻运行时与多级缓存.md) | Session、原生计划、资源复用、Graph replay 与调用方缓存 | `lib/Runtime/` |
 | [工程结构与测试体系](工程结构与测试体系.md) | C++ 工程、CTest 和上层集成测试边界 | `tests/cpp/`、`tests/ir/` |
 | [FugaTensor、ASK 与 SUKA 的职责](FugaTensor协同与演进路线.md) | 框架、编译运行时与证明器的分工和依赖 | FugaTensor、ASK、SUKA |
-| [图切分与多 Kernel 执行计划](图切分与多Kernel执行计划.md) | owned/external 分区、JSON v1 与原生调度 | `lib/Frontend/Partition.cpp`、`lib/Runtime/` |
+| [图切分与多 Kernel 执行计划](图切分与多Kernel执行计划.md) | owned/external/library 分区、JSON v1 与原生调度 | `lib/Frontend/Partition.cpp`、`lib/Runtime/` |
 | [ASK PASS 规则证明与计划校验](规则证明与计划校验.md) | 计划可用性、整份槽位映射与构建依赖 | `lib/Pass/`、`rules/pass/` |
 | [外部编译器适配接入规范](外部编译器适配接入规范.md) | 通用 worker 请求/响应协议 v2 与缓存身份 | `schemas/` |
 | [跨项目审查报告](跨项目审查报告.md) | 2026-11-04 的依赖、证明、参数准备改动与测量结果 | ASK、FugaTensor、SUKA |

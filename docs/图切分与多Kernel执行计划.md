@@ -12,7 +12,7 @@ ASK 图描述数据依赖，执行计划确定 kernel 及其间的设备缓冲�
 
 CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。CLI 与 `ask::partitionJSON` 的完整报告保留 `execution_plan`、`step_sources` 和 `external_requests` 字段。
 
-步骤分为两类：`owned` 包含 ASK 自有计算，可在内部优化和融合；`external` 对应单个外部 kernel。
+步骤分为三类：`owned` 包含 ASK 自有计算，可在内部优化和融合；`external` 对应单个外部 kernel；`library` 对应 cuBLASLt 矩阵乘法。
 
 <a id="plan-v1"></a>
 
@@ -46,17 +46,20 @@ CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。
 - 顶层 `inputs`、`outputs` 的顺序就是公开张量 ABI。输出可引用输入，也可重复引用同一缓冲区；这些别名端口须绑定同一存储。
 - `steps` 按执行顺序排列。每个结果只有一个生产者，输入来自图输入或更早步骤，`depends_on` 须恰好列出这些输入的生产者。内部常量保留在子图中。
 - `function` 指向切分 MLIR 中的函数，步骤输入输出的形状、类型必须逐项匹配实际编译 kernel 的端口。外部步骤的 `external_id` 指回原始算子，便于关联源码和报告失败原因。
-- v1 在同一 `Session` 的单条 stream 上顺序提交，支持静态设备计算；多 stream、主机计算、动态形状和控制流不在该格式的支持范围内。校验失败会报错。
+- `library` 步骤设置 `library = "cublaslt"` 和 `matmul` 描述（`element_type`、`m/n/k`、`batch_count`、`transpose_a/b`），输入为 A、B，输出为 C。
+- v1 在同一 `Session` 的单条 stream 上顺序提交静态设备计算。校验失败会报错。
 
 运行时将读端口、公开输出和内部槽位映射交由 [ASK PASS 规则证明](规则证明与计划校验.md#plan-proof)检查；索引、单一生产者和 kernel ABI 由 ASK 检查。
 
 <a id="partition-boundaries"></a>
 
-## 3. 外部边界与自有区域
+## 3. 物化边界与自有区域
 
-切分器按外部节点划分自有区域。例如 `P → F → Q` 生成 `owned → external → owned`。各自有区域可包含多个逐元素算子。
+切分器按外部节点划分自有区域。例如 `P → F → Q` 生成 `owned → external → owned`。各自有区域可包含多个逐元素算子。matmul 同样形成独立 library 步骤，例如 `mul → matmul → add` 生成 `owned → library → owned`。
 
-external 步骤交给调用方 worker 编译为 cubin/PTX，owned 步骤经 ASK 的 LLVM 管线编译。非法 MLIR、缺失 worker、导出失败、损坏产物和代码生成错误都会使编译失败。
+广播和转置通过索引参与自有融合。归约与同尺寸消费者可同核执行；归约结果被广播到更大形状时先物化，以免每个输出重复执行归约。跨步骤的归约标量使用 `shape=[]` 的设备缓冲区。
+
+external 步骤交给调用方 worker 编译为 cubin/PTX，owned 步骤经 ASK 的 LLVM 管线编译，library 步骤由 Runtime 在准备时选择 cuBLASLt 算法。非法 MLIR、缺失 worker、导出失败、损坏产物和代码生成错误都会使编译失败。
 
 外部步骤支持多输入、多输出，以及不同形状和类型的端口。`source_bindings` 将指针参数连到逻辑端口，将标量参数绑定到固定启动值；调用方根据请求的 `signature` 和 `port_shapes` 构造执行 ABI。一个外部 kernel 可写出多个结果。
 
@@ -64,9 +67,9 @@ external 步骤交给调用方 worker 编译为 cubin/PTX，owned 步骤经 ASK 
 
 ## 4. 编译包与常驻调度
 
-FugaTensor 将计划和各步骤产物保存为 `CUDAProgram`。包中使用相对路径：`execution_plan.json` 保存逻辑计划，`program.json` 记录步骤对应的子目录产物和摘要。保存和加载时检查路径范围、摘要、计划和 kernel ABI，自有与外部步骤分别使用对应的磁盘缓存。校验后，将内存中的计划描述交给 ASK Runtime。
+FugaTensor 将计划和各步骤产物保存为 `CUDAProgram`。包中使用相对路径：`execution_plan.json` 保存逻辑计划，`program.json` 记录步骤对应的子目录产物和摘要。保存和加载时检查路径范围、摘要、计划和 kernel ABI，自有与外部步骤分别使用对应的磁盘缓存；library 的矩阵描述保存在计划中。校验后，将内存中的计划描述交给 ASK Runtime。
 
-调用方加载各个 kernel，按逻辑缓冲区构造字节数表、公开端口索引与 `PlanStep`，交给 `Session::prepareProgram(..., graph)`。`PreparedProgram::submit(inputs, outputs)` 一次完成所有步骤；C++ 先校验公开端口的设备归属、字节数、可写性和别名，再更新公开端口地址并提交，只记录一个完成事件。`run(inputs)` 还负责分配本次输出，供 FugaTensor 的薄原生桥直接调用。
+调用方加载 owned/external kernel，并为 library 填写 `MatmulDescription`，按逻辑缓冲区构造字节数表、公开端口索引与 `PlanStep`，交给 `Session::prepareProgram(..., graph)`。`PreparedProgram::submit(inputs, outputs)` 一次完成所有步骤；C++ 先校验公开端口的设备归属、字节数、可写性和别名，再更新公开端口地址并提交，只记录一个完成事件。`run(inputs)` 还负责分配本次输出，供 FugaTensor 的薄原生桥直接调用。
 
 每个在途调用占用独立工作区，事件完成后才能复用。工作区内按已验证的步骤生存期共享物理槽位，公开端口单独绑定。事件保留程序和缓冲区，会话保留待完成事件，因此调用方释放对象后，在途资源仍然有效。启动失败时，运行时等待已排队的步骤结束再传播异常；设备写入不回滚。零步骤别名计划记录完成事件，覆盖此前的 stream 依赖，保持异步提交。
 

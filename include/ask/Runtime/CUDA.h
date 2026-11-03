@@ -64,6 +64,7 @@ public:
   std::shared_ptr<DeviceBuffer> allocate(std::size_t bytes);
   std::shared_ptr<DeviceBuffer> importBuffer(std::uint64_t pointer, std::size_t bytes,
                                             bool readonly = false);
+  // parameterWidths: 0 denotes a device pointer; 1/2/4/8 denote scalar ABI bytes.
   std::shared_ptr<Kernel> load(const std::string &cubin, const std::string &entry,
                                const std::vector<std::string> &requiredTypes,
                                int arch, const std::vector<unsigned> &parameterWidths);

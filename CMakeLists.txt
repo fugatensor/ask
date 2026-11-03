@@ -127,7 +127,7 @@ target_include_directories(ask_pass PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOU
 target_include_directories(ask_pass PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass")
 target_link_libraries(ask_pass PRIVATE Suka::Pass)
 
-add_library(ask_runtime SHARED lib/Runtime/CUDA.cpp)
+add_library(ask_runtime SHARED lib/Runtime/CUDA.cpp lib/Runtime/CUBLASLt.cpp)
 add_library(ASK::Runtime ALIAS ask_runtime)
 set_target_properties(ask_runtime PROPERTIES EXPORT_NAME Runtime POSITION_INDEPENDENT_CODE ON
   VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR}
@@ -137,6 +137,18 @@ target_include_directories(ask_runtime PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(ask_runtime PRIVATE ASK::Pass ${CMAKE_DL_LIBS})
+option(ASK_ENABLE_CUBLASLT "Enable the optional cuBLASLt matrix multiplication provider" ON)
+if(ASK_ENABLE_CUBLASLT)
+  find_path(ASK_CUBLASLT_INCLUDE_DIR cublasLt.h
+    HINTS "$ENV{CUDA_PATH}/include" "$ENV{CUDA_HOME}/include"
+    PATHS /usr/local/cuda/include)
+endif()
+if(ASK_ENABLE_CUBLASLT AND ASK_CUBLASLT_INCLUDE_DIR)
+  target_include_directories(ask_runtime SYSTEM PRIVATE "${ASK_CUBLASLT_INCLUDE_DIR}")
+  target_compile_definitions(ask_runtime PRIVATE ASK_WITH_CUBLASLT=1)
+else()
+  target_compile_definitions(ask_runtime PRIVATE ASK_WITH_CUBLASLT=0)
+endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
   # The proof engine is an implementation detail of the Runtime shared ABI.
   target_link_options(ask_runtime PRIVATE "LINKER:--exclude-libs,ALL")
@@ -176,6 +188,9 @@ if(BUILD_TESTING)
   add_executable(ask-compiler-test tests/cpp/compiler.cpp)
   target_link_libraries(ask-compiler-test PRIVATE ASK::Compiler ${CMAKE_DL_LIBS})
   add_test(NAME ask-compiler COMMAND ask-compiler-test "${CMAKE_CURRENT_BINARY_DIR}/compiler-test.o")
+  add_executable(ask-primitives-test tests/cpp/primitives.cpp)
+  target_link_libraries(ask-primitives-test PRIVATE ASK::Compiler)
+  add_test(NAME ask-primitives COMMAND ask-primitives-test)
   add_executable(ask-core-test tests/cpp/frontend.cpp)
   target_link_libraries(ask-core-test PRIVATE ASK::Core)
   add_test(NAME ask-core COMMAND ask-core-test --optimize)
@@ -185,6 +200,13 @@ if(BUILD_TESTING)
     target_compile_definitions(ask-runtime-test PRIVATE
       ASK_RUNTIME_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/runtime/double_i32.ptx")
     add_test(NAME ask-runtime COMMAND ask-runtime-test)
+    if(ASK_ENABLE_CUBLASLT AND ASK_CUBLASLT_INCLUDE_DIR)
+      add_executable(ask-matmul-test tests/cpp/matmul.cpp)
+      target_link_libraries(ask-matmul-test PRIVATE ASK::Runtime)
+      target_compile_definitions(ask-matmul-test PRIVATE
+        ASK_MATMUL_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/runtime/mixed_matmul.ptx")
+      add_test(NAME ask-matmul COMMAND ask-matmul-test)
+    endif()
   endif()
 endif()
 
