@@ -15,6 +15,7 @@
 - **双层 IR 分工**：
   - 高层 MLIR `ask` dialect（`include/ask/IR/`、`lib/IR/`）负责显式类型、静态形状推导、图级优化（折叠、DCE、逐元素融合分组）、`ask.mark` 溯源导出与 `ask.external` 外部算子契约检查。
   - 低层原生 LLVM IR（`lib/Lowering/`、`lib/LLIR/`）负责自有 CPU/CUDA 算子降级、LLVM 校验与优化及目标机器码（`.o` / `cubin`）生成。
+  - 前端自动微分与停止梯度由 FugaTensor 的 Fuga IR 处理；`fuga.stop_gradient` 降级时映射为输入值，ASK 接收处理后的数值计算图。
 - **核心与第三方适配器隔离**：
   - ASK 只交付 C++ SDK 与 CLI，不包含 Python 包或 nanobind 绑定；`core` 构建不依赖 Python、Triton、NumPy 或 PyTorch，自有 CPU/CUDA 降级属于基础核心。Python 仅用于可选的依赖获取和工程脚本。
   - `ASK::Compiler` 提供不暴露 LLVM 类型的编译门面，`ASK::Runtime` 提供原生计划与设备资源管理；消费两者不要求 LLVM 开发 SDK。直接操作 MLIR/LLVM 的调用方使用 `ASK::Core`。

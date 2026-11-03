@@ -10,11 +10,13 @@
 
 | 关注点 | FugaTensor | ASK |
 | --- | --- | --- |
-| 用户 API 与微分 | Tensor、自动组图、`ft.fun`、前向/反向规则与求值触发。 | 静态图接口与编译执行。 |
+| 用户 API 与微分 | Tensor、自动组图、`ft.grad` 纯 IR 变换、`ft.fun` 前向与 VJP 规则、求值触发。 | 静态图接口与编译执行。 |
 | 控制流与 IR | Fuga IR 表达区域和函数边界；静态展开或按需执行后提交 ASK 图。 | 单基本块、形状具体的 MLIR `ask` 图，自有计算降级到 LLVM。 |
 | 外部编译器 | 保存源码和编译配置，运行 worker，校验并缓存产物。 | 生成编译请求，检查产物和启动参数。 |
 | 执行 | 选择后端，管理 Tensor 引用，触发求值并提交计划。 | 生成自有代码，切分计划，管理显存、事件和 CUDA Graph。 |
 | 溯源 | 输出 `fuga-to-ask.json` 映射，见 [降级到 ASK](../../fugatensor/docs/ir/降级到ASK.md)。 | 保留稳定节点/值身份，提取 `ask.mark` 并关联分区报告。 |
+
+停止梯度由 Fuga IR 的 `fuga.stop_gradient` 表达，JVP/VJP 在该节点停止传播；[降级到 ASK](../../fugatensor/docs/ir/降级到ASK.md#type-and-op-mapping)时直接使用输入值，ASK 执行保留的数值依赖。
 
 <a id="implemented-scope"></a>
 
