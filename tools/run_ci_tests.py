@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the CPU CTest suites and reject missing tests or skipped coverage."""
+"""Run native CTest suites and reject missing tests or skipped coverage."""
 
 from __future__ import annotations
 
@@ -27,12 +27,15 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--cuda", action="store_true", help="also require the hardware CUDA runtime suite")
+    parser.add_argument("--cublaslt", action="store_true", help="also require the CUDA runtime and cuBLASLt suites")
     args = parser.parse_args(argv)
     build_dir = args.build_dir.resolve()
     report = build_dir / "ci-tests.xml"
-    expected = {"ask-core", "ask-compiler"}
-    if args.cuda:
+    expected = {"ask-core", "ask-compiler", "ask-pass", "ask-primitives"}
+    if args.cuda or args.cublaslt:
         expected.add("ask-runtime")
+    if args.cublaslt:
+        expected.add("ask-matmul")
     report.unlink(missing_ok=True)
     result = subprocess.run([
         "ctest", "--test-dir", str(build_dir), "--verbose", "--no-tests=error",

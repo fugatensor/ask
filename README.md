@@ -51,7 +51,7 @@ cmake --build --preset core
 ctest --preset core --output-on-failure
 ```
 
-默认 CTest 运行 `ask-core`、`ask-compiler` 和 `ask-pass`，启用 GPU 后增加 `ask-runtime`。源码与 SDK 消费测试位于 `tests/`，覆盖范围见[测试体系](docs/工程结构与测试体系.md)。
+默认 CTest 运行 `ask-core`、`ask-compiler`、`ask-pass` 和 `ask-primitives`，启用 GPU 后增加 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。源码与 SDK 消费测试位于 `tests/`，覆盖范围见[测试体系](docs/工程结构与测试体系.md)。
 
 FugaTensor 的[端到端测试](../fugatensor/docs/测试.md)覆盖图降级、数值、求导和外部 kernel 调度。
 
