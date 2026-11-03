@@ -27,7 +27,7 @@ int main() {
     }
     {
       // Both logical buffers are eventually produced; the first step still
-      // reads buffer 1 before its producer, which the Suka proof must reject.
+      // reads buffer 1 before its producer, which the Rin proof must reject.
       auto early = steps[0];
       early.inputs = {1}; early.outputs = {2};
       early.arguments = {{1, {}}, {2, {}}};

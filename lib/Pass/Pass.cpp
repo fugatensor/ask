@@ -1,6 +1,6 @@
 #include "Pass.h"
 #include "Rules.h"
-#include "suka/pass.h"
+#include "rin/pass.h"
 
 #include <algorithm>
 #include <deque>
@@ -10,8 +10,8 @@
 
 namespace ask::pass {
 namespace {
-using suka::pass::Fact;
-using suka::pass::Obligation;
+using rin::pass::Fact;
+using rin::pass::Obligation;
 
 Decision invalid(std::string reason) { return {Verdict::Fail, std::move(reason)}; }
 
@@ -34,16 +34,16 @@ struct Evidence {
 };
 
 Decision prove(const Evidence &evidence) {
-  static const suka::pass::Program rules(
+  static const rin::pass::Program rules(
       std::string(kPlanAvailabilityRules) + kAllocationPlanRules);
   auto result = rules.check(evidence.facts, evidence.obligations);
   switch (result.verdict) {
-  case suka::pass::Verdict::Pass: return {Verdict::Pass, std::move(result.explanation)};
-  case suka::pass::Verdict::Fail: return {Verdict::Fail, std::move(result.explanation)};
-  case suka::pass::Verdict::Unknown: return {Verdict::Unknown, std::move(result.explanation)};
-  case suka::pass::Verdict::Error: return {Verdict::Error, std::move(result.explanation)};
+  case rin::pass::Verdict::Pass: return {Verdict::Pass, std::move(result.explanation)};
+  case rin::pass::Verdict::Fail: return {Verdict::Fail, std::move(result.explanation)};
+  case rin::pass::Verdict::Unknown: return {Verdict::Unknown, std::move(result.explanation)};
+  case rin::pass::Verdict::Error: return {Verdict::Error, std::move(result.explanation)};
   }
-  return {Verdict::Error, "unknown SUKA proof verdict"};
+  return {Verdict::Error, "unknown Rin proof verdict"};
 }
 
 std::string appendPlan(const Plan &plan, Evidence &evidence) {

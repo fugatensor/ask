@@ -1,4 +1,4 @@
-# Numeric facts are observations; Suka compares the values in each obligation.
+# Numeric facts are observations; Rin compares the values in each obligation.
 all b: internal, s: slot, required: byte_count, allocated: byte_count =>
     assigned(b, s) & size(b, required) & capacity(s, allocated) & less_equal(required, allocated) -> fits(b, s)
 
