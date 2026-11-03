@@ -104,6 +104,12 @@ LogicalResult inferOperation(Operation *op, bool &changed) {
                                << lhs << " and " << rhs;
     return refine(op, 0, lhs, changed);
   }
+  if (isa<BroadcastInDimOp, TransposeOp, ReduceSumOp, ReduceMaxOp, CompareOp,
+          SelectOp, DivOp, ExpOp, LogOp, SqrtOp, MatmulOp>(op)) {
+    auto inferred = inferComputeResultType(op);
+    if (failed(inferred)) return failure();
+    return refine(op, 0, *inferred, changed);
+  }
   if (auto mark = dyn_cast<MarkOp>(op))
     return refine(op, 0, mark.getOperand().getType(), changed);
   if (auto external = dyn_cast<ExternalOp>(op)) {
@@ -220,8 +226,8 @@ LogicalResult prepareModule(ModuleOp module, llvm::json::Object &report,
     for (Operation &op : function.front()) {
       if (isa<func::ReturnOp>(op))
         continue;
-      if (!isa<ConstantOp, SplatOp, CastOp, ReshapeOp, AddOp, MulOp, ExternalOp, MarkOp>(op))
-        return op.emitOpError("unsupported graph operation; supported subset is constant, splat, cast, reshape, add, mul, external, and mark");
+      if (!isPureComputeOperation(&op) && !isa<ExternalOp, MarkOp>(op))
+        return op.emitOpError("unsupported ASK graph operation");
       auto id = op.getAttrOfType<StringAttr>("ask.id");
       if (op.hasAttr("ask.id") && (!id || id.getValue().empty()))
         return op.emitOpError("ask.id must be a nonempty string");

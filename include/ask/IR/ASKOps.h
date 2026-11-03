@@ -89,6 +89,31 @@ public:
   ASK_NO_MEMORY_EFFECTS
 };
 
+#define ASK_COMPUTE_OP(CLASS, NAME, OPERANDS)                                      \
+class CLASS final                                                             \
+    : public mlir::Op<CLASS, OPERANDS,              \
+                      mlir::OpTrait::OneResult, mlir::OpTrait::ZeroRegions,     \
+                      mlir::OpTrait::ZeroSuccessors,                           \
+                      mlir::MemoryEffectOpInterface::Trait> {                 \
+public:                                                                       \
+  ASK_OP_COMMON(NAME);                                                        \
+  ASK_SINGLE_RESULT                                                           \
+  ASK_NO_MEMORY_EFFECTS                                                       \
+};
+
+ASK_COMPUTE_OP(BroadcastInDimOp, "ask.broadcast_in_dim", mlir::OpTrait::OneOperand)
+ASK_COMPUTE_OP(TransposeOp, "ask.transpose", mlir::OpTrait::OneOperand)
+ASK_COMPUTE_OP(ReduceSumOp, "ask.reduce_sum", mlir::OpTrait::OneOperand)
+ASK_COMPUTE_OP(ReduceMaxOp, "ask.reduce_max", mlir::OpTrait::OneOperand)
+ASK_COMPUTE_OP(CompareOp, "ask.compare", mlir::OpTrait::NOperands<2>::Impl)
+ASK_COMPUTE_OP(SelectOp, "ask.select", mlir::OpTrait::NOperands<3>::Impl)
+ASK_COMPUTE_OP(DivOp, "ask.div", mlir::OpTrait::NOperands<2>::Impl)
+ASK_COMPUTE_OP(ExpOp, "ask.exp", mlir::OpTrait::OneOperand)
+ASK_COMPUTE_OP(LogOp, "ask.log", mlir::OpTrait::OneOperand)
+ASK_COMPUTE_OP(SqrtOp, "ask.sqrt", mlir::OpTrait::OneOperand)
+ASK_COMPUTE_OP(MatmulOp, "ask.matmul", mlir::OpTrait::NOperands<2>::Impl)
+#undef ASK_COMPUTE_OP
+
 class SemanticsOp final
     : public mlir::Op<SemanticsOp, mlir::OpTrait::ZeroOperands,
                       mlir::OpTrait::ZeroResults, mlir::OpTrait::ZeroRegions,
@@ -137,6 +162,8 @@ bool isSupportedElementType(mlir::Type type);
 bool isSupportedValueType(mlir::Type type);
 bool haveCompatibleShapes(mlir::Type lhs, mlir::Type rhs);
 bool haveCompatibleShapeOnly(mlir::Type lhs, mlir::Type rhs);
+bool isPureComputeOperation(mlir::Operation *op);
+mlir::FailureOr<mlir::Type> inferComputeResultType(mlir::Operation *op);
 
 #undef ASK_OP_COMMON
 #undef ASK_NO_MEMORY_EFFECTS

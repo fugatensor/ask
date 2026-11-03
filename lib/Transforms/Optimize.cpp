@@ -34,7 +34,7 @@ std::string valueId(Value value) {
 }
 
 bool isKnownPure(Operation *op) {
-  return isa<ConstantOp, SplatOp, CastOp, ReshapeOp, AddOp, MulOp>(op);
+  return isPureComputeOperation(op);
 }
 
 bool namesPort(StringRef port, Operation *op) {
@@ -173,13 +173,13 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
                               op.getAttrOfType<TypedAttr>("value"));
         continue;
       }
-      if (isa<SplatOp, ReshapeOp>(op)) {
+      if (isa<SplatOp, ReshapeOp, BroadcastInDimOp, TransposeOp>(op)) {
         auto known = constants.find(op.getOperand(0));
         if (known != constants.end())
           constants.try_emplace(op.getResult(0), known->second);
         continue;
       }
-      if (!isa<CastOp, AddOp, MulOp>(op))
+      if (!isa<CastOp, AddOp, MulOp, DivOp, CompareOp, SelectOp>(op))
         continue;
       auto lhs = constants.find(op.getOperand(0));
       if (lhs == constants.end()) continue;
@@ -189,10 +189,33 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
         Type target = op.getResult(0).getType();
         if (auto tensor = dyn_cast<RankedTensorType>(target)) target = tensor.getElementType();
         folded = foldCast(lhs->second, target, builder);
+      } else if (isa<SelectOp>(op)) {
+        const bool condition = !cast<IntegerAttr>(lhs->second).getValue().isZero();
+        auto branch = constants.find(op.getOperand(condition ? 1 : 2));
+        if (branch == constants.end()) continue;
+        folded = branch->second;
       } else {
         auto rhs = constants.find(op.getOperand(1));
         if (rhs == constants.end()) continue;
-        if (auto left = dyn_cast<IntegerAttr>(lhs->second)) {
+        if (isa<CompareOp>(op)) {
+          auto predicate = op.getAttrOfType<StringAttr>("predicate").getValue();
+          bool equal, less, greater;
+          if (auto left = dyn_cast<IntegerAttr>(lhs->second)) {
+            const auto &a = left.getValue(), &b = cast<IntegerAttr>(rhs->second).getValue();
+            equal = a == b;
+            less = a.getBitWidth() == 1 ? a.ult(b) : a.slt(b);
+            greater = a.getBitWidth() == 1 ? a.ugt(b) : a.sgt(b);
+          } else {
+            auto order = cast<FloatAttr>(lhs->second).getValue().compare(cast<FloatAttr>(rhs->second).getValue());
+            equal = order == llvm::APFloat::cmpEqual;
+            less = order == llvm::APFloat::cmpLessThan;
+            greater = order == llvm::APFloat::cmpGreaterThan;
+          }
+          bool value = predicate == "eq" ? equal : predicate == "ne" ? !equal :
+                       predicate == "lt" ? less : predicate == "le" ? (less || equal) :
+                       predicate == "gt" ? greater : (greater || equal);
+          folded = builder.getIntegerAttr(builder.getI1Type(), llvm::APInt(1, value));
+        } else if (auto left = dyn_cast<IntegerAttr>(lhs->second)) {
           // APInt arithmetic wraps at the verified signed integer width.
           const llvm::APInt &right = cast<IntegerAttr>(rhs->second).getValue();
           llvm::APInt bits = isa<AddOp>(op) ? left.getValue() + right
@@ -203,6 +226,7 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
           llvm::APFloat bits = floating.getValue();
           const llvm::APFloat &right = cast<FloatAttr>(rhs->second).getValue();
           if (isa<AddOp>(op)) bits.add(right, llvm::APFloat::rmNearestTiesToEven);
+          else if (isa<DivOp>(op)) bits.divide(right, llvm::APFloat::rmNearestTiesToEven);
           else bits.multiply(right, llvm::APFloat::rmNearestTiesToEven);
           folded = builder.getFloatAttr(floating.getType(), bits);
         }
@@ -212,6 +236,7 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
       Operation *replacement = nullptr;
       Type type = op.getResult(0).getType();
       NamedAttrList attributes(op.getAttrs());
+      attributes.erase("predicate");
       if (isSupportedElementType(type)) {
         replacement = createConstant(builder, op.getLoc(), type, folded, attributes);
       } else {
@@ -239,6 +264,32 @@ int64_t foldConstants(ModuleOp module, llvm::StringSet<> &rewrittenOperations,
     }
   }
   return folds;
+}
+
+int64_t absorbMatmulTransposes(ModuleOp module, llvm::StringSet<> &rewrittenOperations) {
+  int64_t absorbed = 0;
+  module.walk([&](MatmulOp matmul) {
+    for (unsigned operand = 0; operand < 2; ++operand) {
+      while (auto transpose = matmul->getOperand(operand).getDefiningOp<TransposeOp>()) {
+        auto permutation = transpose->getAttrOfType<DenseI64ArrayAttr>("permutation").asArrayRef();
+        if (permutation.size() < 2) break;
+        const auto rank = permutation.size();
+        bool matrixTranspose = true;
+        for (unsigned axis = 0; axis < rank; ++axis) {
+          auto expected = axis < rank - 2 ? axis : rank - 1 - (axis - (rank - 2));
+          matrixTranspose &= permutation[axis] == int64_t(expected);
+        }
+        if (!matrixTranspose) break;
+        StringRef flag = operand == 0 ? "transpose_a" : "transpose_b";
+        auto current = matmul->getAttrOfType<BoolAttr>(flag);
+        matmul->setAttr(flag, BoolAttr::get(module.getContext(), !(current && current.getValue())));
+        matmul->setOperand(operand, transpose->getOperand(0));
+        rewrittenOperations.insert(operationId(matmul));
+        ++absorbed;
+      }
+    }
+  });
+  return absorbed;
 }
 
 int64_t eliminateDeadCode(ModuleOp module) {
@@ -292,7 +343,7 @@ llvm::json::Array planFusion(ModuleOp module, bool enabled, bool &changed) {
         auto type = dyn_cast<RankedTensorType>(op.getResult(0).getType());
         if (!type)
           continue; // Scalar arithmetic may occur between tensor operations.
-        if (!type.hasStaticShape() || !isa<SplatOp, CastOp, ReshapeOp, AddOp, MulOp>(op)) {
+        if (!type.hasStaticShape() || isa<MatmulOp>(op)) {
           finish();
           continue;
         }
@@ -372,10 +423,11 @@ LogicalResult optimizeModule(ModuleOp module, llvm::json::Object &report,
   llvm::StringSet<> rewrittenValues;
   int64_t folds = options.foldConstants
                       ? foldConstants(module, rewrittenOperations, rewrittenValues) : 0;
+  int64_t layouts = options.fuseElementwise ? absorbMatmulTransposes(module, rewrittenOperations) : 0;
   int64_t dead = options.eliminateDeadCode ? eliminateDeadCode(module) : 0;
   bool fusionChanged = false;
   llvm::json::Array groups = planFusion(module, options.fuseElementwise, fusionChanged);
-  bool semanticChanged = folds != 0 || dead != 0;
+  bool semanticChanged = folds != 0 || dead != 0 || layouts != 0;
   if (semanticChanged || fusionChanged) {
     int64_t semantic = module->getAttrOfType<IntegerAttr>("ask.semantic_revision").getInt();
     int64_t ir = module->getAttrOfType<IntegerAttr>("ask.ir_revision").getInt();
@@ -402,7 +454,7 @@ LogicalResult optimizeModule(ModuleOp module, llvm::json::Object &report,
   complete["markers"] = updateMarkers(module, inputMarkers, portOwners,
                                        rewrittenOperations, rewrittenValues);
   complete["optimization"] = llvm::json::Object{
-      {"constant_folds", folds}, {"dead_ops", dead},
+      {"constant_folds", folds}, {"dead_ops", dead}, {"absorbed_matmul_transposes", layouts},
       {"fusion_groups", std::move(groups)}};
   report = std::move(complete);
   return success();

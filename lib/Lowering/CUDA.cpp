@@ -2,6 +2,7 @@
 #include "ask/BuildConfig.h"
 #include "ask/IR/ASKOps.h"
 #include "ask/LLIR/Numeric.h"
+#include "ScalarEmitter.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
@@ -86,8 +87,10 @@ llvm::Error validateFunction(mlir::func::FuncOp graph,
   for (mlir::Operation &op : graph.front()) {
     if (mlir::isa<ExternalOp>(op))
       return error("ASK-owned CUDA lowering cannot compile ask.external; provide an external executable through an execution plan");
-    if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, ReshapeOp, mlir::func::ReturnOp>(op))
-      return error("CUDA lowering requires prepared constant/splat/add/mul/cast/reshape graphs; unsupported operation " + op.getName().getStringRef());
+    if (mlir::isa<MatmulOp>(op))
+      return error("CUDA matmul requires a partitioned library step");
+    if (!isPureComputeOperation(&op) && !mlir::isa<mlir::func::ReturnOp>(op))
+      return error("unsupported CUDA graph operation " + op.getName().getStringRef());
     for (auto type : op.getResultTypes())
       if (auto failure = checkType(type)) return failure;
     if (mlir::isa<AddOp, MulOp>(op) &&
@@ -193,7 +196,7 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     auto *thread = registerValue("llvm.nvvm.read.ptx.sreg.tid.x");
     start = builder.CreateAdd(builder.CreateMul(block, builder.getInt64(options.blockSize)), thread, "start");
   }
-  uint64_t inputLoads = 0;
+  uint64_t inputLoads = 0, reductionLoops = 0;
   llvm::json::Array groups;
   for (const Batch &batch : batches) {
     auto *before = builder.GetInsertBlock();
@@ -203,55 +206,21 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     builder.SetInsertPoint(body);
     auto *index = builder.CreatePHI(builder.getInt64Ty(), 2, "index");
     index->addIncoming(start, before);
-    llvm::DenseMap<mlir::Value, llvm::Value *> emitted;
-    std::function<llvm::Value *(mlir::Value)> emit = [&](mlir::Value value) -> llvm::Value * {
-      auto cached = emitted.find(value);
-      if (cached != emitted.end()) return cached->second;
-      llvm::Value *computed;
-      if (auto argument = mlir::dyn_cast<mlir::BlockArgument>(value)) {
-        auto *type = storageType(value.getType(), context);
-        llvm::Value *offset = mlir::isa<mlir::RankedTensorType>(value.getType())
-                                ? static_cast<llvm::Value *>(index) : builder.getInt64(0);
-        auto *address = builder.CreateGEP(type, function->getArg(argument.getArgNumber()), offset, "input.address");
-        computed = builder.CreateAlignedLoad(type, address, llvm::Align(elementByteWidth(value.getType())), "input");
-        ++inputLoads;
-        if (llir::scalarLLVMType(value.getType(), context)->isIntegerTy(1))
-          computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
-      } else {
-        auto *producer = value.getDefiningOp();
-        if (auto constant = mlir::dyn_cast<ConstantOp>(producer)) {
-          if (auto integer = constant->getAttrOfType<mlir::IntegerAttr>("value"))
-            computed = llvm::ConstantInt::get(context, integer.getValue());
-          else computed = llvm::ConstantFP::get(context, constant->getAttrOfType<mlir::FloatAttr>("value").getValue());
-        } else if (mlir::isa<SplatOp, ReshapeOp>(producer)) {
-          computed = emit(producer->getOperand(0));
-        } else if (mlir::isa<CastOp>(producer)) {
-          computed = llir::createNumericCast(builder, emit(producer->getOperand(0)),
-                                              llir::scalarLLVMType(value.getType(), context));
-        } else {
-          auto *lhs = emit(producer->getOperand(0));
-          auto *rhs = emit(producer->getOperand(1));
-          if (lhs->getType()->isFloatingPointTy()) {
-            const bool bf16 = lhs->getType()->isBFloatTy();
-            if (bf16) {
-              lhs = llir::extendBF16(builder, lhs);
-              rhs = llir::extendBF16(builder, rhs);
-            }
-            computed = mlir::isa<AddOp>(producer) ? builder.CreateFAdd(lhs, rhs, "add")
-                                                  : builder.CreateFMul(lhs, rhs, "mul");
-            if (bf16) computed = llir::truncateBF16(builder, computed);
-          } else {
-            computed = mlir::isa<AddOp>(producer) ? builder.CreateAdd(lhs, rhs, "add.wrap")
-                                                  : builder.CreateMul(lhs, rhs, "mul.wrap");
-          }
-        }
-      }
-      emitted[value] = computed;
+    lowering::ScalarEmitter emitter(builder, function, true,
+        [&](mlir::Value value, llvm::Value *offset) -> llvm::Value * {
+      auto argument = mlir::cast<mlir::BlockArgument>(value);
+      auto *type = storageType(value.getType(), context);
+      auto *address = builder.CreateGEP(type, function->getArg(argument.getArgNumber()), offset, "input.address");
+      llvm::Value *computed = builder.CreateAlignedLoad(type, address,
+          llvm::Align(elementByteWidth(value.getType())), "input");
+      ++inputLoads;
+      if (llir::scalarLLVMType(value.getType(), context)->isIntegerTy(1))
+        computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
       return computed;
-    };
+    });
     llvm::json::Array outputIndices;
     for (unsigned outputIndex : batch.outputs) {
-      auto *computed = emit(returned.getOperand(outputIndex));
+      auto *computed = emitter.emit(returned.getOperand(outputIndex), index);
       if (computed->getType()->isIntegerTy(1)) computed = builder.CreateZExt(computed, builder.getInt8Ty(), "output.bool");
       auto *pointer = function->getArg(graph.getNumArguments() + outputIndex);
       auto *address = builder.CreateGEP(computed->getType(), pointer, index, "output.address");
@@ -259,8 +228,9 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
           llvm::Align(elementByteWidth(returned.getOperand(outputIndex).getType())));
       outputIndices.push_back(int64_t(outputIndex));
     }
+    reductionLoops += emitter.reductionLoops;
     auto *next = builder.CreateAdd(index, builder.getInt64(stride), "next");
-    index->addIncoming(next, body);
+    index->addIncoming(next, builder.GetInsertBlock());
     builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(batch.count)), body, after);
     builder.SetInsertPoint(after);
     groups.push_back(llvm::json::Object{{"outputs", std::move(outputIndices)}, {"element_count", int64_t(batch.count)}});
@@ -289,7 +259,8 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       {"validation", llvm::json::Object{{"llvm_module_verified", true}, {"device_execution_performed", false}, {"stage", "ask_cuda_llvm"}}}};
   report = llvm::json::Object{{"statistics_stage", "cuda_lowering"}, {"kernel_count", 1},
       {"indexing", "linear_grid_stride"}, {"output_loop_count", int64_t(batches.size())},
-      {"input_load_count", int64_t(inputLoads)}, {"zero_element_outputs", int64_t(emptyOutputs)},
+      {"input_load_count", int64_t(inputLoads)}, {"reduction_loop_count", int64_t(reductionLoops)},
+      {"zero_element_outputs", int64_t(emptyOutputs)},
       {"temporary_buffer_count", 0}, {"groups", std::move(groups)},
       {"bool_storage", "one-byte-zero-or-one"}, {"cast_semantics", "rne-saturating-fptosi-nan-zero-v1"}};
   return std::move(result);

@@ -2,6 +2,7 @@
 #include "ask/BuildConfig.h"
 #include "ask/IR/ASKOps.h"
 #include "ask/LLIR/Numeric.h"
+#include "ScalarEmitter.h"
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
@@ -169,8 +170,8 @@ llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
                       ? mlir::dyn_cast<mlir::RankedTensorType>(op.getResult(0).getType())
                       : mlir::RankedTensorType();
     if (!name || name.getValue().empty() || !tensor || !tensor.hasStaticShape() ||
-        !mlir::isa<SplatOp, AddOp, MulOp, CastOp, ReshapeOp>(op))
-      return error("ask.fusion_group requires a nonempty string on a static tensor splat/add/mul/cast/reshape");
+        (!isPureComputeOperation(&op) || mlir::isa<MatmulOp>(op)))
+      return error("ask.fusion_group requires a nonempty string on a static tensor computation");
     llvm::StringRef id = name.getValue();
     if (active != id) {
       if (!active.empty()) closedGroups.insert(active);
@@ -203,8 +204,8 @@ llvm::Error validateFunction(mlir::func::FuncOp function, bool supportsBF16) {
   for (mlir::Operation &op : function.front()) {
     if (mlir::isa<ExternalOp>(op))
       return error("host lowering cannot compile ask.external; export its DSL through the selected compiler separately");
-    if (!mlir::isa<ConstantOp, SplatOp, AddOp, MulOp, CastOp, ReshapeOp, mlir::func::ReturnOp>(op))
-      return error("host lowering requires prepared constant/splat/add/mul/cast/reshape graphs; unsupported operation " + op.getName().getStringRef());
+    if (!isPureComputeOperation(&op) && !mlir::isa<mlir::func::ReturnOp>(op))
+      return error("unsupported host graph operation " + op.getName().getStringRef());
     for (mlir::Type type : op.getResultTypes()) {
       if (elementType(type).isBF16() && !supportsBF16)
         return error("bf16 requires hardware support; this native CPU does not report a supported BF16 instruction feature");
@@ -243,7 +244,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   auto *pointer = llvm::PointerType::getUnqual(context);
   llvm::json::Array functions;
   uint64_t totalLoops = 0, totalUnfusedLoops = 0, totalFusedOutputGroups = 0;
-  uint64_t totalInputLoads = 0;
+  uint64_t totalInputLoads = 0, totalReductionLoops = 0;
 
   for (mlir::Operation &op : source.getBody()->getOperations()) {
     if (mlir::isa<SemanticsOp, ImplementationOp>(op))
@@ -302,7 +303,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     llvm::SmallVector<OutputBatch> batches;
     llvm::StringMap<unsigned> batchForGroup;
     uint64_t loopCount = 0, unfusedLoops = 0, fusedOutputGroups = 0;
-    uint64_t inputLoads = 0, emptyOutputs = 0;
+    uint64_t inputLoads = 0, emptyOutputs = 0, reductionLoops = 0;
     for (auto [outputIndex, value] : llvm::enumerate(returned.getOperands())) {
       auto count = elementCount(value.getType());
       if (!count)
@@ -352,73 +353,34 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       builder.SetInsertPoint(body);
       auto *index = builder.CreatePHI(builder.getInt64Ty(), 2, "i");
       index->addIncoming(builder.getInt64(0), before);
-      llvm::DenseMap<mlir::Value, llvm::Value *> emitted;
-      std::function<llvm::Value *(mlir::Value)> emit = [&](mlir::Value current) -> llvm::Value * {
-        auto cached = emitted.find(current);
-        if (cached != emitted.end())
-          return cached->second;
-        llvm::Value *computed = nullptr;
-        auto argument = arguments.find(current);
-        if (argument != arguments.end()) {
-          if (mlir::isa<mlir::RankedTensorType>(current.getType())) {
-            auto *element = llvmStorageType(current.getType(), context);
-            auto *address = builder.CreateGEP(element, argument->second, index, "input.address");
-            computed = builder.CreateAlignedLoad(element, address, llvm::Align(elementByteWidth(current.getType())), "input");
-            ++inputLoads;
-          } else {
-            computed = argument->second;
-          }
-          if (elementType(current.getType()).isInteger(1))
-            computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
-        } else {
-          mlir::Operation *producer = current.getDefiningOp();
-          if (auto constant = mlir::dyn_cast<ConstantOp>(producer)) {
-            if (auto value = constant->getAttrOfType<mlir::IntegerAttr>("value"))
-              computed = llvm::ConstantInt::get(context, value.getValue());
-            else
-              computed = llvm::ConstantFP::get(
-                  context, constant->getAttrOfType<mlir::FloatAttr>("value").getValue());
-          } else if (mlir::isa<SplatOp, ReshapeOp>(producer)) {
-            computed = emit(producer->getOperand(0));
-          } else if (mlir::isa<CastOp>(producer)) {
-            computed = llir::createNumericCast(builder, emit(producer->getOperand(0)),
-                                               llvmElementType(current.getType(), context));
-          } else {
-            llvm::Value *lhs = emit(producer->getOperand(0));
-            llvm::Value *rhs = emit(producer->getOperand(1));
-            if (lhs->getType()->isFloatingPointTy()) {
-              // No reassociation or contraction: each ASK operation rounds
-              // independently at its declared floating-point width.
-              bool bf16 = lhs->getType()->isBFloatTy();
-              if (bf16) {
-                lhs = llir::extendBF16(builder, lhs);
-                rhs = llir::extendBF16(builder, rhs);
-              }
-              computed = mlir::isa<AddOp>(producer) ? builder.CreateFAdd(lhs, rhs, "add")
-                                                   : builder.CreateFMul(lhs, rhs, "mul");
-              if (bf16) computed = llir::truncateBF16(builder, computed);
-            } else {
-              computed = mlir::isa<AddOp>(producer) ? builder.CreateAdd(lhs, rhs, "add.wrap")
-                                                   : builder.CreateMul(lhs, rhs, "mul.wrap");
-            }
-          }
+      lowering::ScalarEmitter emitter(builder, function, false,
+          [&](mlir::Value value, llvm::Value *offset) -> llvm::Value * {
+        llvm::Value *computed = arguments.lookup(value);
+        if (mlir::isa<mlir::RankedTensorType>(value.getType())) {
+          auto *type = llvmStorageType(value.getType(), context);
+          auto *address = builder.CreateGEP(type, computed, offset, "input.address");
+          computed = builder.CreateAlignedLoad(type, address,
+              llvm::Align(elementByteWidth(value.getType())), "input");
+          ++inputLoads;
         }
-        emitted[current] = computed;
+        if (elementType(value.getType()).isInteger(1))
+          computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
         return computed;
-      };
+      });
       // The memo is shared only within this iteration of the same-shape batch.
       // Every public output still gets its own store under the existing noalias
       // contract, including repeated returns of the same logical value.
       for (unsigned outputIndex : batch.outputs) {
-        llvm::Value *computed = emit(returned.getOperand(outputIndex));
+        llvm::Value *computed = emitter.emit(returned.getOperand(outputIndex), index);
         if (computed->getType()->isIntegerTy(1))
           computed = builder.CreateZExt(computed, builder.getInt8Ty(), "output.bool");
         llvm::Value *output = function->getArg(graph.getNumArguments() + outputIndex);
         auto *address = builder.CreateGEP(computed->getType(), output, index, "output.address");
         builder.CreateAlignedStore(computed, address, llvm::Align(computed->getType()->getScalarSizeInBits() / 8));
       }
+      reductionLoops += emitter.reductionLoops;
       llvm::Value *next = builder.CreateAdd(index, builder.getInt64(1), "next");
-      index->addIncoming(next, body);
+      index->addIncoming(next, builder.GetInsertBlock());
       builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(batch.count)), body, after);
       builder.SetInsertPoint(after);
     }
@@ -439,12 +401,14 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
             {"unfused_output_loop_count", int64_t(unfusedLoops)},
             {"fused_output_groups", int64_t(fusedOutputGroups)},
             {"input_load_count", int64_t(inputLoads)},
+            {"reduction_loop_count", int64_t(reductionLoops)},
             {"zero_element_outputs", int64_t(emptyOutputs)},
             {"groups", std::move(fusedGroups)}}}});
     totalLoops += loopCount;
     totalUnfusedLoops += unfusedLoops;
     totalFusedOutputGroups += fusedOutputGroups;
     totalInputLoads += inputLoads;
+    totalReductionLoops += reductionLoops;
   }
   if (functions.empty())
     return error("host lowering requires at least one graph function");
@@ -466,7 +430,8 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
                                     {"loop_count", int64_t(totalLoops)},
                                     {"unfused_output_loop_count", int64_t(totalUnfusedLoops)},
                                     {"fused_output_groups", int64_t(totalFusedOutputGroups)},
-                                    {"input_load_count", int64_t(totalInputLoads)}}}};
+                                    {"input_load_count", int64_t(totalInputLoads)},
+                                    {"reduction_loop_count", int64_t(totalReductionLoops)}}}};
   std::string abiText;
   llvm::raw_string_ostream abiStream(abiText);
   abiStream << llvm::json::Value(llvm::json::Object(abiReport));

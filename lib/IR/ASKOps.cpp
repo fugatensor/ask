@@ -189,6 +189,186 @@ static LogicalResult verifyBinary(Operation *op) {
 LogicalResult AddOp::verify() { return verifyBinary(*this); }
 LogicalResult MulOp::verify() { return verifyBinary(*this); }
 
+bool isPureComputeOperation(Operation *op) {
+  return isa<ConstantOp, SplatOp, CastOp, ReshapeOp, AddOp, MulOp,
+             BroadcastInDimOp, TransposeOp, ReduceSumOp, ReduceMaxOp,
+             CompareOp, SelectOp, DivOp, ExpOp, LogOp, SqrtOp, MatmulOp>(op);
+}
+
+namespace {
+Type elementOf(Type type) {
+  if (auto tensor = dyn_cast<RankedTensorType>(type)) return tensor.getElementType();
+  return type;
+}
+SmallVector<int64_t> shapeOf(Type type) {
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    return {tensor.getShape().begin(), tensor.getShape().end()};
+  return {};
+}
+bool compatibleExtent(int64_t a, int64_t b) {
+  return ShapedType::isDynamic(a) || ShapedType::isDynamic(b) || a == b;
+}
+Type withElement(Type type, Type element) {
+  if (auto tensor = dyn_cast<RankedTensorType>(type))
+    return RankedTensorType::get(tensor.getShape(), element);
+  return element;
+}
+}
+
+FailureOr<Type> inferComputeResultType(Operation *op) {
+  auto invalid = [&](StringRef message) -> FailureOr<Type> {
+    op->emitOpError(message);
+    return failure();
+  };
+  if (failed(verifyDataTypes(op, op->getOperandTypes()))) return failure();
+  const Type input = op->getOperand(0).getType();
+  const Type element = elementOf(input);
+  auto shape = shapeOf(input);
+  if (isa<ReduceSumOp, ReduceMaxOp, CompareOp, DivOp, ExpOp, LogOp, SqrtOp, MatmulOp>(op)) {
+    if (op->hasAttr("fastmath") || op->hasAttr("fastmathFlags"))
+      return invalid("numerical operations use fixed ASK floating-point rules");
+    if (Attribute overflow = op->getAttr("overflow")) {
+      auto mode = dyn_cast<StringAttr>(overflow);
+      if (!isa<ReduceSumOp>(op) || !isa<IntegerType>(element) || !mode || mode.getValue() != "wrap")
+        return invalid("overflow = wrap applies to integer reduce_sum");
+    }
+  }
+  if (isa<BroadcastInDimOp>(op)) {
+    auto target = op->getAttrOfType<DenseI64ArrayAttr>("shape");
+    auto dimensions = op->getAttrOfType<DenseI64ArrayAttr>("dimensions");
+    if (!target || !dimensions || dimensions.size() != int64_t(shape.size()))
+      return invalid("requires dense i64 shape and dimensions with one dimension per input axis");
+    if (llvm::any_of(target.asArrayRef(), [](int64_t dim) { return dim < 0; }))
+      return invalid("broadcast shape requires nonnegative concrete dimensions");
+    int64_t previous = -1;
+    for (auto [index, axis] : llvm::enumerate(dimensions.asArrayRef())) {
+      if (axis <= previous || axis >= target.size())
+        return invalid("broadcast dimensions must be strictly increasing output axes");
+      if (shape[index] != 1 && !compatibleExtent(shape[index], target[axis]))
+        return invalid("broadcast input extent must be one or equal its mapped output extent");
+      previous = axis;
+    }
+    return RankedTensorType::get(target.asArrayRef(), element);
+  }
+  if (isa<TransposeOp>(op)) {
+    auto permutation = op->getAttrOfType<DenseI64ArrayAttr>("permutation");
+    if (!permutation || permutation.size() != int64_t(shape.size()))
+      return invalid("requires a dense i64 permutation containing every input axis");
+    llvm::SmallBitVector seen(shape.size());
+    SmallVector<int64_t> output;
+    for (int64_t axis : permutation.asArrayRef()) {
+      if (axis < 0 || uint64_t(axis) >= shape.size() || seen.test(axis))
+        return invalid("transpose permutation must contain each input axis exactly once");
+      seen.set(axis);
+      output.push_back(shape[axis]);
+    }
+    return isa<RankedTensorType>(input) ? Type(RankedTensorType::get(output, element)) : input;
+  }
+  if (isa<ReduceSumOp, ReduceMaxOp>(op)) {
+    if (element.isInteger(1)) return invalid("reduction requires an explicit numeric dtype");
+    auto axes = op->getAttrOfType<DenseI64ArrayAttr>("axes");
+    if (!axes) return invalid("requires dense i64 sorted unique reduction axes");
+    llvm::SmallBitVector reduced(shape.size());
+    int64_t previous = -1;
+    for (int64_t axis : axes.asArrayRef()) {
+      if (axis <= previous || uint64_t(axis) >= shape.size())
+        return invalid("reduction axes must be sorted, unique and within the input rank");
+      if (isa<ReduceMaxOp>(op) && shape[axis] == 0)
+        return invalid("reduce_max requires a nonempty reduction domain");
+      reduced.set(axis);
+      previous = axis;
+    }
+    SmallVector<int64_t> output;
+    for (auto [index, extent] : llvm::enumerate(shape))
+      if (!reduced.test(index)) output.push_back(extent);
+    return output.empty() ? element : Type(RankedTensorType::get(output, element));
+  }
+  if (isa<CompareOp>(op)) {
+    if (!haveCompatibleShapes(input, op->getOperand(1).getType()))
+      return invalid("compare operands require matching shape and dtype");
+    auto predicate = op->getAttrOfType<StringAttr>("predicate");
+    if (!predicate || !llvm::is_contained(ArrayRef<StringRef>{"eq", "ne", "lt", "le", "gt", "ge"}, predicate.getValue()))
+      return invalid("compare predicate must be eq, ne, lt, le, gt or ge");
+    return withElement(input, IntegerType::get(op->getContext(), 1));
+  }
+  if (isa<SelectOp>(op)) {
+    Type yes = op->getOperand(1).getType(), no = op->getOperand(2).getType();
+    if (!element.isInteger(1) || !haveCompatibleShapeOnly(input, yes) ||
+        !haveCompatibleShapes(yes, no))
+      return invalid("select requires a bool condition and matching condition/branch shapes and branch dtypes");
+    return yes;
+  }
+  if (isa<DivOp, ExpOp, LogOp, SqrtOp>(op)) {
+    if (!isa<FloatType>(element)) return invalid("requires f32, f16 or bf16 operands");
+    if (isa<DivOp>(op) && !haveCompatibleShapes(input, op->getOperand(1).getType()))
+      return invalid("div operands require matching shape and dtype");
+    return input;
+  }
+  if (isa<MatmulOp>(op)) {
+    auto lhs = dyn_cast<RankedTensorType>(input);
+    auto rhs = dyn_cast<RankedTensorType>(op->getOperand(1).getType());
+    if (!lhs || !rhs || lhs.getRank() < 2 || lhs.getRank() != rhs.getRank() ||
+        !isa<FloatType>(element) || element != rhs.getElementType())
+      return invalid("matmul requires same-rank tensors of rank at least two with matching floating dtypes");
+    bool transposeA = false, transposeB = false;
+    for (auto [name, flag] : {std::pair<StringRef, bool *>{"transpose_a", &transposeA}, {"transpose_b", &transposeB}}) {
+      if (auto attr = op->getAttr(name)) {
+        auto boolean = dyn_cast<BoolAttr>(attr);
+        if (!boolean) return invalid("matmul transpose_a and transpose_b must be bool attributes");
+        *flag = boolean.getValue();
+      }
+    }
+    const int64_t rank = lhs.getRank();
+    SmallVector<int64_t> output;
+    for (int64_t axis = 0; axis < rank - 2; ++axis) {
+      if (!compatibleExtent(lhs.getDimSize(axis), rhs.getDimSize(axis)))
+        return invalid("matmul batch dimensions must match");
+      output.push_back(ShapedType::isDynamic(lhs.getDimSize(axis)) ? rhs.getDimSize(axis) : lhs.getDimSize(axis));
+    }
+    if (!llvm::is_contained(output, int64_t(0)) &&
+        llvm::none_of(output, [](int64_t extent) { return ShapedType::isDynamic(extent); })) {
+      uint64_t batchCount = 1;
+      for (int64_t extent : output) {
+        if (uint64_t(extent) > uint64_t(std::numeric_limits<int64_t>::max()) / batchCount)
+          return invalid("matmul batch count exceeds the signed 64-bit size range");
+        batchCount *= uint64_t(extent);
+      }
+    }
+    const auto contractingA = lhs.getDimSize(rank - (transposeA ? 2 : 1));
+    const auto contractingB = rhs.getDimSize(rank - (transposeB ? 1 : 2));
+    if (!compatibleExtent(contractingA, contractingB))
+      return invalid("matmul contracting dimensions must match");
+    output.push_back(lhs.getDimSize(rank - (transposeA ? 1 : 2)));
+    output.push_back(rhs.getDimSize(rank - (transposeB ? 2 : 1)));
+    return RankedTensorType::get(output, element);
+  }
+  return invalid("operation has no compute shape rule");
+}
+
+static LogicalResult verifyInferredCompute(Operation *op) {
+  if (failed(verifyDataTypes(op, op->getResultTypes()))) return failure();
+  auto inferred = inferComputeResultType(op);
+  if (failed(inferred)) return failure();
+  if (!haveCompatibleShapes(*inferred, op->getResult(0).getType()))
+    return op->emitOpError("declared result conflicts with inferred shape or dtype");
+  return success();
+}
+
+#define ASK_VERIFY_COMPUTE(CLASS) \
+LogicalResult CLASS::verify() { return verifyInferredCompute(*this); }
+ASK_VERIFY_COMPUTE(BroadcastInDimOp)
+ASK_VERIFY_COMPUTE(TransposeOp)
+ASK_VERIFY_COMPUTE(ReduceSumOp)
+ASK_VERIFY_COMPUTE(ReduceMaxOp)
+ASK_VERIFY_COMPUTE(CompareOp)
+ASK_VERIFY_COMPUTE(SelectOp)
+ASK_VERIFY_COMPUTE(DivOp)
+ASK_VERIFY_COMPUTE(ExpOp)
+ASK_VERIFY_COMPUTE(LogOp)
+ASK_VERIFY_COMPUTE(SqrtOp)
+ASK_VERIFY_COMPUTE(MatmulOp)
+#undef ASK_VERIFY_COMPUTE
+
 FunctionType SemanticsOp::getFunctionType() {
   auto attribute = (*this)->getAttrOfType<TypeAttr>("function_type");
   return attribute ? dyn_cast<FunctionType>(attribute.getValue()) : FunctionType();
