@@ -17,6 +17,7 @@
 | [图切分与多 Kernel 执行计划](图切分与多Kernel执行计划.md) | owned/external 分区、JSON v1 与原生调度 | `lib/Frontend/Partition.cpp`、`lib/Runtime/` |
 | [ASK PASS 规则证明与计划校验](规则证明与计划校验.md) | 计划可用性、整份槽位映射与构建依赖 | `lib/Pass/`、`rules/pass/` |
 | [外部编译器适配接入规范](外部编译器适配接入规范.md) | 通用 worker 请求/响应协议 v2 与缓存身份 | `schemas/` |
+| [跨项目审查报告](跨项目审查报告.md) | 2026-11-04 的依赖、证明、参数准备改动与测量结果 | ASK、FugaTensor、SUKA |
 
 ## 关联仓库文档
 
