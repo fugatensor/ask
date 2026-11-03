@@ -1,0 +1,3 @@
+case,old_median_us,new_median_us,input_loads_before,input_loads_after,workspace_bytes_after
+full,18374.73,6.078,16777216,4096,0
+partial,4289.309,26.506,4194304,16384,256
