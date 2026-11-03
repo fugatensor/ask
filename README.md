@@ -1,5 +1,10 @@
 # ASK
 
+[![Version](https://img.shields.io/badge/version-0.1.0-2563eb)](VERSION)
+[![C++17](https://img.shields.io/badge/C%2B%2B-17-00599c)](docs/安装.md#requirements)
+[![LLVM 23.1.x](https://img.shields.io/badge/LLVM-23.1.x-64748b)](docs/前端接入与构建配置.md#version-contract)
+[![CPU / CUDA](https://img.shields.io/badge/backend-CPU%20%7C%20CUDA-76b900)](docs/核心思想.md#ask-owned-codegen)
+
 ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态图，生成 CPU/CUDA 代码，并调度自有及第三方 cubin/PTX。
 
 - 类型与数值：支持 `bool`、`i32`、`i64`、`f32`、`f16`、`bf16`，常量按 RNE 舍入，加乘输入须同形状、同类型。
