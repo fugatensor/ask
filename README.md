@@ -1,6 +1,6 @@
-# ASK
-
 <img src="docs/assets/ask-logo-inverse.svg" alt="ASK logo" width="100%">
+
+---
 
 <p align="center">
   <a href="docs/安装.md#requirements"><img src="https://img.shields.io/badge/C%2B%2B-17-00599c" alt="C++17"></a>
