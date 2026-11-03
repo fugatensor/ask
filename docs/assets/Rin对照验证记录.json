@@ -1,0 +1,358 @@
+{
+  "validator": {
+    "compiler": "g++ (Debian 14.2.0-19) 14.2.0",
+    "flags": "-std=c++17 -O3 -DNDEBUG; DSOs: -fPIC -fvisibility=hidden -fvisibility-inlines-hidden -fno-gnu-unique -shared -Wl,-Bsymbolic",
+    "samples": 31,
+    "warmups": 5,
+    "timing": "Uninstrumented allocator. Each case alternates Rin/direct order per pair. p50 sorted middle; p95 nearest rank. Rule Program and process/library initialization are warmed before timing.",
+    "memory": "Separate executable overrides C++ global new/new[] including aligned forms. One counted operation after 5 warmups. Requested payload bytes only, excluding allocator headers/RSS. Inputs prepared outside measurement. Noncold stages finish with zero incrementally retained bytes; cold cache keys are counted separately.",
+    "matrix": {
+      "families": [
+        "chain",
+        "wide",
+        "skip"
+      ],
+      "steps": [
+        4,
+        32,
+        128,
+        512
+      ],
+      "buffer_bytes": [
+        64,
+        4096
+      ],
+      "faults": {
+        "0": "valid",
+        "1": "read-before-write",
+        "2": "insufficient-capacity",
+        "3": "overlapping-lifetimes",
+        "4": "missing-assignment"
+      },
+      "paired_stages": {
+        "cold": 120,
+        "core": 120,
+        "hot": 24,
+        "key": 24
+      },
+      "rin_only_stages": {
+        "evidence": 24,
+        "proof": 24
+      },
+      "configurations": 336,
+      "version_rows": 624
+    },
+    "stages": {
+      "cold": "Unmodified checkAllocationPlan public boundary: complete key, bounded success cache lookup, validation, cache insertion. All equal byte sizes/capacities vary before each sample for a unique complete key; capacity fault decrements one slot.",
+      "core": "Internal checkAllocation: all structural and three arithmetic obligations; no complete-key cache.",
+      "hot": "Public checkAllocationPlan with identical valid cached plan.",
+      "key": "Complete keyFor vector construction and destruction, identical source.",
+      "evidence": "Original Rin checkAllocation preparation up to prove(evidence), including structural checks, evidence/fact/obligation construction and destruction.",
+      "proof": "Original prove(evidence) on prebuilt evidence: cached fixed Program, per-call Rin inference and result destruction. Not additive with evidence in all lifetime/peak metrics."
+    },
+    "direct": "Temporary comparator consumes original AllocationPlan, validates structural conditions, computes integer births and last uses, checks every read/capacity and sorted adjacent interval. Collects all failing obligation names in original order. keyFor, ProofCache and public checkAllocationPlan source copied verbatim from production.",
+    "correctness": "Independent oracle agent checked 3726 plans, exact diagnostics, ASan/UBSan plus resource probes. Timing cases expected Pass/Fail; any Unknown/Error aborts the driver. Rin resource-limited larger plans are excluded from timing and reported separately.",
+    "sources": {
+      "profile/rin-Pass.cpp": "105137e8fa7d2ea3c2fc7be552edf0df426563de52aa5be1d985cc383a328936",
+      "profile/direct-Pass.cpp": "8ec7902362991e96e7baf5b2aec3c4e313722c6cb3128ce01c8ca5be23fb81a8",
+      "profile/Rules.h": "091bee090f0c253d337eeedf0a827ead914d94e2af2aeb80d359fb9441709e82",
+      "profile/workload.cpp": "eaead16f811e6fe3707caebccaf5e48bf28bda6ebdd55b9c791f0168cdd5e583",
+      "profile/driver.cpp": "2a1bbf89a7742c80b34a03bb931b9410e1dfda9935adc06c93e9d0a6257e6dbc",
+      "profile/rin-evidence.inc": "09f9cdf87567d5f97d8ce35641fc874cf5a1ed9416ad1f7f8a9dcfe29fb1ef08"
+    },
+    "rin_header_sha256": "53543fb6be38c662f36e5853d7be73e8b534847762c5453da0de5761e96dd884",
+    "rin_commit": "218caf3c77e5fb31e8752d420ba3cd764f4e0bdc",
+    "ask_commit": "2ff8c5410bb65a60649bd963f6d55ec72cbb3289"
+  },
+  "semantics": {
+    "matrix": {
+      "cases": 3726,
+      "valid": 1545,
+      "invalid": 2181,
+      "groups": {
+        "orthogonal": 672,
+        "random-valid": 1200,
+        "random-map": 1200,
+        "input-index": 27,
+        "input-duplicate": 27,
+        "output-index": 27,
+        "output-empty": 27,
+        "output-duplicate-legal": 27,
+        "read-index": 27,
+        "read-before-write": 27,
+        "read-duplicate-legal": 27,
+        "writer-index": 27,
+        "writer-duplicate": 27,
+        "writer-public": 27,
+        "writer-missing": 27,
+        "size-missing": 27,
+        "size-extra": 27,
+        "assignment-missing": 27,
+        "assignment-duplicate": 27,
+        "assignment-index": 27,
+        "assignment-slot": 27,
+        "assignment-public": 27,
+        "assignment-public-output": 27,
+        "slot-unused": 27,
+        "capacity-short": 27,
+        "lifetime-overlap": 27,
+        "assignment-reversed-legal": 27,
+        "same-event-writes": 6
+      },
+      "resource_cases": []
+    },
+    "resources": {
+      "cases": 27,
+      "valid": 27,
+      "invalid": 0,
+      "groups": {
+        "chain": 9,
+        "wide": 9,
+        "skip": 9
+      },
+      "resource_cases": [
+        {
+          "family": "chain",
+          "steps": 512,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 700,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 768,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 800,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 832,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 833,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 834,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 900,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "chain",
+          "steps": 1024,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 512,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 700,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 768,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 800,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 832,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 833,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 834,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 900,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "wide",
+          "steps": 1024,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 512,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 700,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 768,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 800,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 832,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 833,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 834,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 900,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 1024,
+          "rin": 2,
+          "direct": 0
+        }
+      ]
+    },
+    "precise_boundaries": {
+      "cases": 4,
+      "valid": 4,
+      "invalid": 0,
+      "groups": {
+        "skip": 4
+      },
+      "resource_cases": [
+        {
+          "family": "skip",
+          "steps": 713,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 714,
+          "rin": 0,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 715,
+          "rin": 2,
+          "direct": 0
+        },
+        {
+          "family": "skip",
+          "steps": 716,
+          "rin": 2,
+          "direct": 0
+        }
+      ]
+    },
+    "sanitizers": "ASan+UBSan, detect_leaks=1; all matrix and resource cases passed; no findings",
+    "diagnostics": "All 3726 common-domain decisions and diagnostic strings match exactly; large-resource Rin UNKNOWN/direct PASS differences are intentionally separate.",
+    "oracle": "Independent per-buffer source/usage events and all interval pairs, not production adjacent interval proof. 672 orthogonal mappings + 1200 deterministic valid DAGs + 1200 random slot maps + 648 structure/lifetime mutations + 6 same-event writes. Random seed 0x5EED124.",
+    "sha256": {
+      "rin-Pass.cpp": "105137e8fa7d2ea3c2fc7be552edf0df426563de52aa5be1d985cc383a328936",
+      "direct-Pass.cpp": "8ec7902362991e96e7baf5b2aec3c4e313722c6cb3128ce01c8ca5be23fb81a8",
+      "Pass.h": "044ee66021fa071eb138616b644cf04c291faf2b5062d60e29e78071b23e545e",
+      "Rules.h": "091bee090f0c253d337eeedf0a827ead914d94e2af2aeb80d359fb9441709e82"
+    }
+  },
+  "runtime": {
+    "pairs": 21,
+    "matrix": "chain/wide x 4/32/128/512 x cold_prepare/hot_prepare/cold_prepare_first_complete/hot_complete",
+    "inner_warmups": {
+      "prepare": 2,
+      "first_complete": 2,
+      "hot_complete": 3
+    },
+    "inner_samples": {
+      "prepare": 7,
+      "first_complete": 5,
+      "hot_complete": 21
+    },
+    "summary": "P50 and P95 of 21 per-process medians; each pair alternates Rin/direct process order. Context creation, kernel loading and argument generation excluded. All GPU outputs checked.",
+    "memory": "resident_device_bytes and allocations measured only in hot_complete rows; other rows use zero placeholders. ASK-owned requested bytes, excluding driver storage/granularity.",
+    "kernel": "four i32 elements incremented by one per step; chain expects input+n, wide input+1",
+    "source_hashes": {
+      "/tmp/ask-rin-value-audit/profile/direct-Pass.cpp": "8ec7902362991e96e7baf5b2aec3c4e313722c6cb3128ce01c8ca5be23fb81a8",
+      "/tmp/ask-rin-value-audit/runtime.cpp": "88197970af192fdfb677c3c71d7d9a066bbd193030f4f562d29b1d4446f97a81",
+      "/tmp/ask-rin-value-audit/run-runtime.py": "e8451dcb6b8bb75e54beb18ee9d43f3041e8a470239662966219c9d51e8e1a7d",
+      "/tmp/ask-rin-value-audit/increment_i32.ptx": "26321dabb1e1491eb444de819d0a0e0a1468ec364e550a37ad97408327fc6601",
+      "/tmp/ask-rin-value-audit/runtime-direct/libask_runtime.so.0": "84be84e29c7385296adc06da6448839e6dbc23f7ccf4ca68ad0cb160b805107f",
+      "/home/asuka/ask/build/core/lib/libask_runtime.so.0": "206cdbe664a57453d722c233cdcce03095f4b185c6be76fe46a4586c922a3dfb",
+      "/home/asuka/ask/build/core/CMakeFiles/ask_runtime.dir/lib/Runtime/CUDA.cpp.o": "97b805f8a8df0fdf4572e98b966731082e6ebf5be420f5d7c775673a46225edd",
+      "/home/asuka/ask/build/core/CMakeFiles/ask_runtime.dir/lib/Runtime/CUBLASLt.cpp.o": "ac8bad2b016835383390e250b8e3df14d0e2cda24077abd6d8a47bc10172fd38"
+    },
+    "integration": {
+      "tests": [
+        "ask-runtime",
+        "ask-matmul"
+      ],
+      "result": "2/2 passed, 0 skipped",
+      "matmul_cases": 360,
+      "library_resolution": "ldd confirmed both executables resolved libask_runtime.so.0 from the temporary direct-checker directory."
+    }
+  }
+}

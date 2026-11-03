@@ -1,0 +1,5 @@
+small_bytes,large_bytes,first_fit_slot_bytes,capacity_aware_slot_bytes,saved_bytes,valid_candidates,invalid_candidates_rejected
+4096,1048576,2097152,1052672,1044480,2,2
+4096,4194304,8388608,4198400,4190208,2,2
+8192,1048576,2097152,1056768,1040384,2,2
+8192,4194304,8388608,4202496,4186112,2,2
