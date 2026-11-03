@@ -254,11 +254,20 @@ struct Session::Impl {
 };
 
 struct PreparedProgram::Impl {
+  struct Binding { std::size_t parameter, buffer; };
+  struct Step {
+    std::shared_ptr<Kernel> kernel;
+    KernelNodeParams launch;
+    std::vector<DevicePointer> constants;
+    std::vector<Binding> publicBindings, internalBindings;
+  };
   struct Workspace {
     std::shared_ptr<SessionState> state;
     std::vector<std::shared_ptr<DeviceBuffer>> buffers;
     std::vector<Handle> nodes;
-    std::vector<std::vector<DevicePointer>> values;
+    std::vector<std::vector<DevicePointer>> values, graphValues;
+    std::vector<std::vector<void *>> parameters;
+    std::vector<KernelNodeParams> launches;
     Handle graph = nullptr, executable = nullptr;
     bool busy = false;
     ~Workspace() {
@@ -274,8 +283,9 @@ struct PreparedProgram::Impl {
   std::weak_ptr<Session> session;
   std::vector<std::size_t> sizes, inputs, outputs;
   // Public ports use caller-owned storage; only internal buffers have slots.
-  std::vector<std::size_t> slotOfBuffer, slotCapacities;
-  std::vector<PlanStep> steps;
+  std::vector<std::size_t> slotCapacities;
+  std::vector<Step> steps;
+  std::vector<std::size_t> publicSteps;
   std::vector<std::shared_ptr<Workspace>> workspaces;
   bool graph = false;
 };
@@ -552,9 +562,27 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
   std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   auto p=std::make_unique<PreparedProgram::Impl>();p->session=shared_from_this();
   p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
-  p->slotOfBuffer=std::move(slotOfBuffer);
   p->slotCapacities=std::move(proof.slot_capacity_bytes);
-  p->steps=std::move(steps);p->graph=graph;
+  p->steps.reserve(steps.size());p->graph=graph && !steps.empty();
+  for(auto &source:steps) {
+    PreparedProgram::Impl::Step step;
+    step.kernel=std::move(source.kernel);
+    step.launch={step.kernel->impl->function,source.grid[0],source.grid[1],source.grid[2],
+                 source.block[0],source.block[1],source.block[2],source.sharedBytes,nullptr,nullptr};
+    step.constants.resize(source.arguments.size());
+    for(std::size_t i=0;i<source.arguments.size();++i) {
+      const auto &argument=source.arguments[i];
+      if(!argument.scalar.empty())
+        std::memcpy(&step.constants[i],argument.scalar.data(),argument.scalar.size());
+      else if(argument.buffer>=0) {
+        auto slot=slotOfBuffer[argument.buffer];
+        if(slot==noSlot) step.publicBindings.push_back({i,static_cast<std::size_t>(argument.buffer)});
+        else step.internalBindings.push_back({i,slot});
+      }
+    }
+    if(!step.publicBindings.empty()) p->publicSteps.push_back(p->steps.size());
+    p->steps.push_back(std::move(step));
+  }
   return std::shared_ptr<PreparedProgram>(new PreparedProgram(std::move(p)));
 }
 
@@ -596,31 +624,30 @@ std::shared_ptr<Event> PreparedProgram::submit(
     workspace->buffers.reserve(impl->slotCapacities.size());
     for(auto capacity:impl->slotCapacities)
       workspace->buffers.push_back(session->allocate(capacity));
+    workspace->values.resize(impl->steps.size());
+    workspace->parameters.resize(impl->steps.size());
+    workspace->launches.reserve(impl->steps.size());
+    for(std::size_t i=0;i<impl->steps.size();++i) {
+      const auto &step=impl->steps[i];
+      auto &values=workspace->values[i];values=step.constants;
+      for(const auto &binding:step.internalBindings)
+        values[binding.parameter]=workspace->buffers[binding.buffer]->pointer();
+      auto &parameters=workspace->parameters[i];parameters.reserve(values.size());
+      for(auto &value:values) parameters.push_back(&value);
+      auto launch=step.launch;launch.parameters=parameters.data();
+      workspace->launches.push_back(launch);
+    }
     impl->workspaces.push_back(workspace);
   }
-  for(std::size_t i=0;i<bound.size();++i)
-    if(!bound[i]) {
-      auto slot=impl->slotOfBuffer[i];
-      require(slot<workspace->buffers.size(),"internal program buffer has no workspace slot");
-      bound[i]=workspace->buffers[slot];
-    }
-  // All storage and argument vectors are prepared before the first launch.
-  std::vector<std::vector<DevicePointer>> values(impl->steps.size());
-  std::vector<std::vector<void *>> parameters(impl->steps.size());
-  std::vector<KernelNodeParams> nodes(impl->steps.size());
-  for(std::size_t i=0;i<impl->steps.size();++i) {
-    const auto &step=impl->steps[i];values[i].resize(step.arguments.size());parameters[i].resize(step.arguments.size());
-    for(std::size_t j=0;j<step.arguments.size();++j) {
-      const auto &argument=step.arguments[j];
-      if(!argument.scalar.empty()) std::memcpy(&values[i][j],argument.scalar.data(),argument.scalar.size());
-      else values[i][j]=argument.buffer<0 ? 0 : bound[argument.buffer]->pointer();
-      parameters[i][j]=&values[i][j];
-    }
-    nodes[i]={step.kernel->impl->function,step.grid[0],step.grid[1],step.grid[2],
-              step.block[0],step.block[1],step.block[2],step.sharedBytes,parameters[i].data(),nullptr};
+  // The verified plan fixes ABI layout, scalar bytes and internal addresses.
+  // Submissions patch only caller-owned ports in this idle workspace.
+  for(auto i:impl->publicSteps) {
+    for(const auto &binding:impl->steps[i].publicBindings)
+      workspace->values[i][binding.parameter]=bound[binding.buffer]->pointer();
   }
+  const auto &nodes=workspace->launches;
   ContextScope current(*s.driver,s.context);auto &d=*s.driver;
-  if(impl->graph && !nodes.empty()) {
+  if(impl->graph) {
     if(!workspace->executable) {
       // Retain a partially constructed graph only within this attempt.
       if(workspace->graph) { d.cuGraphDestroy(workspace->graph);workspace->graph=nullptr;workspace->nodes.clear(); }
@@ -632,17 +659,17 @@ std::shared_ptr<Event> PreparedProgram::submit(
         workspace->nodes.push_back(next);
       }
       d.check(d.cuGraphInstantiate(&workspace->executable,workspace->graph,nullptr,nullptr,0),"cuGraphInstantiate");
-      workspace->values=values;
+      workspace->graphValues=workspace->values;
       ++s.counters["graph_instantiations"];
-    } else for(std::size_t i=0;i<nodes.size();++i) if(workspace->values[i]!=values[i]) {
+    } else for(auto i:impl->publicSteps) if(workspace->graphValues[i]!=workspace->values[i]) {
       d.check(d.cuGraphExecKernelNodeSetParams(workspace->executable,workspace->nodes[i],&nodes[i]),"cuGraphExecKernelNodeSetParams");
-      workspace->values[i]=values[i];++s.counters["graph_node_updates"];
+      workspace->graphValues[i]=workspace->values[i];++s.counters["graph_node_updates"];
     }
   }
   auto event=session->completion();event->impl->buffers=bound;event->impl->program=shared_from_this();
   workspace->busy=true;event->impl->releaseWorkspace=[workspace]{workspace->busy=false;};
   try {
-    if(impl->graph && !nodes.empty()) {
+    if(impl->graph) {
       d.check(d.cuGraphLaunch(workspace->executable,s.stream),"cuGraphLaunch");++s.counters["graph_launches"];
       s.counters["launches"]+=nodes.size();
     } else for(const auto &node:nodes) {

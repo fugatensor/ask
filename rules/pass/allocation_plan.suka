@@ -1,6 +1,6 @@
-# ASK checks mapping completeness and emits observations from static lifetimes.
-all b: internal, s: slot =>
-    assigned(b, s) & capacity_sufficient(b, s) -> fits(b, s)
+# Numeric facts are observations; Suka compares the values in each obligation.
+all b: internal, s: slot, required: byte_count, allocated: byte_count =>
+    assigned(b, s) & size(b, required) & capacity(s, allocated) & less_equal(required, allocated) -> fits(b, s)
 
-all a: internal, b: internal =>
-    same_slot(a, b) & ordered_nonoverlap(a, b) -> compatible(a, b)
+all a: internal, b: internal, s: slot, start: time, end: time, next: time, finish: time =>
+    adjacent(a, b) & assigned(a, s) & assigned(b, s) & lifetime(a, start, end) & lifetime(b, next, finish) & less(end, next) -> compatible(a, b)

@@ -49,20 +49,4 @@ Decision checkPlan(const Plan &plan);
 // UNKNOWN and ERROR also reject the candidate.
 Decision checkAllocationPlan(const AllocationPlan &allocation);
 
-// Checks one reuse candidate from runtime-observed facts. Resource ownership
-// and completion state must be captured and retained by the caller.
-struct ReuseCandidate {
-  std::size_t prior_last_use_step = 0;
-  std::size_t next_first_use_step = 0;
-  std::size_t prior_capacity_bytes = 0;
-  std::size_t next_size_bytes = 0;
-  bool same_submission = false;
-  bool prior_completion_finished = false;
-  bool same_device = false;
-  bool output_released = false;
-  bool same_allocation_domain = false;
-  bool allocator_owned = false;
-};
-Decision checkReuse(const ReuseCandidate &candidate);
-
 } // namespace ask::pass

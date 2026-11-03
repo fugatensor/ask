@@ -2,6 +2,8 @@
 
 #include <array>
 #include <iostream>
+#include <fstream>
+#include <iterator>
 #include <vector>
 
 // Runtime contract test: no Python, LLVM SDK or local CUDA compiler is needed.
@@ -9,28 +11,9 @@
 int main() {
   try {
     using namespace ask::runtime;
-    const std::string ptx = R"(.version 8.0
-.target sm_80
-.address_size 64
-.visible .entry double_i32(.param .u64 src, .param .u64 dst) {
-  .reg .pred %p;
-  .reg .b32 %i, %v;
-  .reg .b64 %x, %y, %offset;
-  mov.u32 %i, %tid.x;
-  setp.ge.u32 %p, %i, 4;
-  @%p bra done;
-  ld.param.u64 %x, [src];
-  ld.param.u64 %y, [dst];
-  mul.wide.u32 %offset, %i, 4;
-  add.u64 %x, %x, %offset;
-  add.u64 %y, %y, %offset;
-  ld.global.u32 %v, [%x];
-  add.u32 %v, %v, %v;
-  st.global.u32 [%y], %v;
-done:
-  ret;
-}
-)";
+    std::ifstream source(ASK_RUNTIME_FIXTURE);
+    if (!source) throw std::runtime_error("cannot open runtime PTX fixture");
+    const std::string ptx((std::istreambuf_iterator<char>(source)), {});
     auto session = Session::create();
     auto kernel = session->load(ptx, "double_i32", {"i32"}, 80, {0, 0});
     std::vector<PlanStep> steps;

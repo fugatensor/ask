@@ -1,2 +1,3 @@
-# ASK instantiates only the live edges needed by each queried buffer.
-all b: @TYPE@ => available(b, @FROM@) -> available(b, @TO@)
+# Boundaries are zero before execution and step + 1 after each producer.
+all b: buffer, birth: time, use: time =>
+    born(b, birth) & needed(b, use) & less_equal(birth, use) -> available(b, use)

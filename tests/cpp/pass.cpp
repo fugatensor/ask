@@ -26,10 +26,44 @@ Plan chain(std::size_t steps) {
     plan.steps.push_back(PlanStep{{index}, {index + 1}});
   return plan;
 }
+
+void allocationMatrix() {
+  // Enumerate assignments independently of the runtime allocator. The oracle
+  // checks every interval pair, while production proves adjacent intervals.
+  for (std::size_t count : {2, 4, 6})
+    for (std::size_t bytes : {0, 1, 16})
+      for (bool delayedRead : {false, true})
+        for (bool shortCapacity : {false, true}) {
+          auto plan = chain(count);
+          if (delayedRead) plan.steps.back().inputs.push_back(1);
+          for (std::size_t mask = 0; mask < (std::size_t{1} << (count - 1)); ++mask) {
+            AllocationPlan allocation{plan, std::vector<std::size_t>(count + 1, bytes), {}, {}};
+            const auto capacity = shortCapacity && bytes ? bytes - 1 : bytes;
+            bool used[2] = {};
+            for (std::size_t b = 1; b < count; ++b) used[(mask >> (b - 1)) & 1] = true;
+            std::size_t slots[2] = {}, slotCount = 0;
+            for (int i = 0; i < 2; ++i) if (used[i]) slots[i] = slotCount++;
+            allocation.slot_capacity_bytes.assign(slotCount, capacity);
+            for (std::size_t b = 1; b < count; ++b)
+              allocation.assignments.push_back({b, slots[(mask >> (b - 1)) & 1]});
+            bool valid = capacity >= bytes;
+            for (std::size_t a = 1; a < count; ++a)
+              for (std::size_t b = a + 1; b < count; ++b) {
+                if (allocation.assignments[a - 1].slot != allocation.assignments[b - 1].slot) continue;
+                auto end = delayedRead && a == 1 ? count - 1 : a;
+                if (end >= b - 1) valid = false;
+              }
+            expect(ask::pass::checkAllocationPlan(allocation), valid ? Verdict::Pass : Verdict::Fail,
+                   "generated allocation matrix");
+            if (valid) expect(ask::pass::checkAllocationPlan(allocation), Verdict::Pass, "cached plan");
+          }
+        }
+}
 } // namespace
 
 int main() {
   try {
+    allocationMatrix();
     auto plan = chain(4);
     AllocationPlan allocation{plan, {16, 16, 16, 16, 16},
                               {{1, 0}, {2, 1}, {3, 0}}, {16, 16}};
@@ -116,11 +150,6 @@ int main() {
     early.steps[0].inputs = {2};
     expect(ask::pass::checkPlan(early), Verdict::Fail, "read before write");
 
-    ask::pass::ReuseCandidate reusable{1, 2, 128, 64, true, false,
-                                       true, true, true, true};
-    expect(ask::pass::checkReuse(reusable), Verdict::Pass, "reusable candidate");
-    reusable.output_released = false;
-    expect(ask::pass::checkReuse(reusable), Verdict::Fail, "held output");
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

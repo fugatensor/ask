@@ -21,5 +21,7 @@ elseif(ASK_TEST_COMPONENT STREQUAL "Core")
 else()
   add_executable(ask-runtime-test runtime.cpp)
   target_link_libraries(ask-runtime-test PRIVATE ASK::Runtime)
+  target_compile_definitions(ask-runtime-test PRIVATE
+    ASK_RUNTIME_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/../fixtures/runtime/double_i32.ptx")
   add_test(NAME ask-runtime COMMAND ask-runtime-test)
 endif()

@@ -45,8 +45,7 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# The generic Suka proof engine is linked through ASK's own PASS library into
-# the Runtime shared library. Installed Runtime consumers need no Suka SDK.
+# The header-only Suka proof engine is private to ASK's PASS implementation.
 include(FetchContent)
 set(ASK_SUKA_SOURCE_DIR "" CACHE PATH "Use a local Suka checkout for development")
 file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/suka.lock.json" ASK_SUKA_LOCK)
@@ -114,10 +113,8 @@ target_link_libraries(ask_compiler PRIVATE ASK::Core ${CMAKE_DL_LIBS})
 set(ASK_PASS_RULE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rules/pass")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${ASK_PASS_RULE_DIR}/plan_availability.suka"
-  "${ASK_PASS_RULE_DIR}/buffer_reuse.suka"
   "${ASK_PASS_RULE_DIR}/allocation_plan.suka")
 file(READ "${ASK_PASS_RULE_DIR}/plan_availability.suka" ASK_PLAN_AVAILABILITY_RULES)
-file(READ "${ASK_PASS_RULE_DIR}/buffer_reuse.suka" ASK_BUFFER_REUSE_RULES)
 file(READ "${ASK_PASS_RULE_DIR}/allocation_plan.suka" ASK_ALLOCATION_PLAN_RULES)
 file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass")
 configure_file(lib/Pass/Rules.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass/Rules.h" @ONLY)
@@ -150,18 +147,24 @@ install(TARGETS ask_compiler EXPORT ASKCompilerTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Compiler)
 install(TARGETS ask_runtime EXPORT ASKRuntimeTargets
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Runtime)
+install(FILES include/ask/Frontend/CompilerAPI.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ask/Frontend COMPONENT Compiler)
+install(FILES include/ask/Runtime/CUDA.h
+  DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ask/Runtime COMPONENT Runtime)
 install(TARGETS ask-opt RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Core)
 install(DIRECTORY include/ask DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} COMPONENT Core)
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/BuildConfig.h" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/ask COMPONENT Core)
 install(EXPORT ASKCoreTargets NAMESPACE ASK:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Core)
 install(EXPORT ASKCompilerTargets NAMESPACE ASK:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Compiler)
-install(EXPORT ASKRuntimeTargets NAMESPACE ASK:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Core)
+install(EXPORT ASKRuntimeTargets NAMESPACE ASK:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Runtime)
 configure_package_config_file(cmake/ASKConfig.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake"
   INSTALL_DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK)
 write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
   VERSION ${PROJECT_VERSION} COMPATIBILITY ExactVersion)
-install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
-  DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Core)
+foreach(component Core Compiler Runtime)
+  install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
+    DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT ${component})
+endforeach()
 install(FILES cmake/llvm.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 install(FILES cmake/suka.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 
@@ -179,10 +182,16 @@ if(BUILD_TESTING)
   if(ASK_TEST_CUDA)
     add_executable(ask-runtime-test tests/cpp/runtime.cpp)
     target_link_libraries(ask-runtime-test PRIVATE ASK::Runtime)
+    target_compile_definitions(ask-runtime-test PRIVATE
+      ASK_RUNTIME_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/runtime/double_i32.ptx")
     add_test(NAME ask-runtime COMMAND ask-runtime-test)
   endif()
 endif()
 
 message(STATUS "ASK target backends: ${ASK_TARGET_BACKENDS}; LLVM/MLIR ${LLVM_PACKAGE_VERSION}")
-message(STATUS "ASK Suka proof engine: ${ASK_SUKA_COMMIT}")
+if(ASK_SUKA_SOURCE_DIR)
+  message(STATUS "ASK Suka proof engine: local headers at ${suka_SOURCE_DIR}")
+else()
+  message(STATUS "ASK Suka proof engine: ${ASK_SUKA_COMMIT}")
+endif()
 message(STATUS "ASK interfaces: native Compiler, Runtime and Core; no Python build dependency")
