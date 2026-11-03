@@ -1,0 +1,31 @@
+.version 7.0
+.target sm_80
+.address_size 64
+
+.visible .entry double_f32(
+    .param .u64 input,
+    .param .u64 output,
+    .param .u32 count
+) {
+    .reg .pred %p;
+    .reg .b32 %r<5>;
+    .reg .b64 %rd<6>;
+    .reg .f32 %f<3>;
+    ld.param.u64 %rd1, [input];
+    ld.param.u64 %rd2, [output];
+    ld.param.u32 %r1, [count];
+    mov.u32 %r2, %ctaid.x;
+    mov.u32 %r3, %ntid.x;
+    mov.u32 %r4, %tid.x;
+    mad.lo.s32 %r2, %r2, %r3, %r4;
+    setp.ge.u32 %p, %r2, %r1;
+    @%p bra done;
+    mul.wide.u32 %rd3, %r2, 4;
+    add.u64 %rd4, %rd1, %rd3;
+    add.u64 %rd5, %rd2, %rd3;
+    ld.global.f32 %f1, [%rd4];
+    add.f32 %f2, %f1, %f1;
+    st.global.f32 [%rd5], %f2;
+done:
+    ret;
+}

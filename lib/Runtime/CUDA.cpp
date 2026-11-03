@@ -1,5 +1,6 @@
 #include "ask/Runtime/CUDA.h"
 #include "Pass.h"
+#include "CUBLASLt.h"
 
 #include <algorithm>
 #include <cstring>
@@ -58,6 +59,7 @@ struct Driver {
   CUDA_FUNCTION(cuMemFreeHost, (void *));
   CUDA_FUNCTION(cuMemcpyHtoDAsync, (DevicePointer, const void *, std::size_t, Handle));
   CUDA_FUNCTION(cuMemcpyDtoHAsync, (void *, DevicePointer, std::size_t, Handle));
+  CUDA_FUNCTION(cuMemsetD8Async, (DevicePointer, unsigned char, std::size_t, Handle));
   CUDA_FUNCTION(cuPointerGetAttribute, (void *, int, DevicePointer));
   CUDA_FUNCTION(cuMemGetAddressRange, (DevicePointer *, std::size_t *, DevicePointer));
   CUDA_FUNCTION(cuEventCreate, (Handle *, unsigned));
@@ -71,6 +73,10 @@ struct Driver {
   CUDA_FUNCTION(cuGraphAddKernelNode, (Handle *, Handle, const Handle *, std::size_t, const KernelNodeParams *));
   CUDA_FUNCTION(cuGraphInstantiate, (Handle *, Handle, Handle *, char *, std::size_t));
   CUDA_FUNCTION(cuGraphExecKernelNodeSetParams, (Handle, Handle, const KernelNodeParams *));
+  CUDA_FUNCTION(cuGraphAddChildGraphNode, (Handle *, Handle, const Handle *, std::size_t, Handle));
+  CUDA_FUNCTION(cuGraphExecChildGraphNodeSetParams, (Handle, Handle, Handle));
+  CUDA_FUNCTION(cuStreamBeginCapture, (Handle, int));
+  CUDA_FUNCTION(cuStreamEndCapture, (Handle, Handle *));
   CUDA_FUNCTION(cuGraphLaunch, (Handle, Handle));
   CUDA_FUNCTION(cuGraphExecDestroy, (Handle));
   CUDA_FUNCTION(cuGraphDestroy, (Handle));
@@ -109,6 +115,7 @@ struct Driver {
       B(cuModuleLoadDataEx); B(cuModuleUnload); B(cuModuleGetFunction);
       B(cuFuncGetAttribute); B(cuFuncGetParamInfo); V(cuMemAlloc); V(cuMemFree);
       V(cuMemAllocHost); B(cuMemFreeHost); V(cuMemcpyHtoDAsync); V(cuMemcpyDtoHAsync);
+      B(cuMemsetD8Async);
       B(cuPointerGetAttribute); V(cuMemGetAddressRange);
       B(cuEventCreate); B(cuEventRecord); B(cuEventQuery); B(cuEventSynchronize); V(cuEventDestroy);
       B(cuLaunchKernel); B(cuGetErrorName); B(cuGetErrorString);
@@ -116,6 +123,8 @@ struct Driver {
 #define G(name) name = reinterpret_cast<name##Type>(symbol(#name))
       G(cuGraphCreate); G(cuGraphAddKernelNode); G(cuGraphExecKernelNodeSetParams);
       G(cuGraphLaunch); G(cuGraphExecDestroy); G(cuGraphDestroy);
+      G(cuGraphAddChildGraphNode); G(cuGraphExecChildGraphNodeSetParams); G(cuStreamEndCapture);
+      cuStreamBeginCapture = reinterpret_cast<cuStreamBeginCaptureType>(symbol("cuStreamBeginCapture_v2"));
       cuGraphInstantiate = reinterpret_cast<cuGraphInstantiateType>(symbol("cuGraphInstantiate_v2"));
 #undef G
 #undef B
@@ -125,6 +134,10 @@ struct Driver {
   bool graphs() const {
     return cuGraphCreate && cuGraphAddKernelNode && cuGraphInstantiate &&
            cuGraphExecKernelNodeSetParams && cuGraphLaunch && cuGraphExecDestroy && cuGraphDestroy;
+  }
+  bool libraryGraphs() const {
+    return graphs() && cuGraphAddChildGraphNode && cuGraphExecChildGraphNodeSetParams &&
+           cuStreamBeginCapture && cuStreamEndCapture;
   }
   void unload() noexcept {
     if (!library) return;
@@ -171,6 +184,7 @@ struct HostStorage {
 
 struct SessionState {
   std::shared_ptr<Driver> driver;
+  std::shared_ptr<detail::CUBLASLtContext> cublas;
   mutable std::recursive_mutex mutex;
   Handle context = nullptr, stream = nullptr;
   int device = 0, major = 0, minor = 0;
@@ -188,6 +202,7 @@ struct SessionState {
       {"synchronizations",0},{"event_waits",0},{"external_stream_waits",0},
       {"host_to_device_copies",0},{"device_to_host_copies",0},
       {"allocation_reuses",0},{"event_creations",0},{"event_reuses",0},
+      {"resident_device_bytes",0},{"peak_resident_device_bytes",0},{"matmul_preparations",0},
       {"program_submissions",0},{"workspace_reuses",0},
       {"graph_instantiations",0},{"graph_launches",0},{"graph_node_updates",0}};
   void checkOpen() const { require(!closed, "CUDA execution session is closed"); }
@@ -197,7 +212,8 @@ struct SessionState {
   }
   void clearPools() {
     for (auto &[bytes, pointers] : freeBuffers)
-      for (auto pointer : pointers) driver->cuMemFree(pointer);
+      for (auto pointer : pointers)
+        if (!driver->cuMemFree(pointer)) counters["resident_device_bytes"] -= std::max<std::size_t>(1,bytes);
     freeBuffers.clear();
     pooledBytes = 0;
     for (auto event : freeEvents) driver->cuEventDestroy(event);
@@ -208,6 +224,7 @@ struct SessionState {
     try {
       ContextScope current(*driver, context);
       clearPools();
+      cublas.reset();
       if (stream) driver->cuStreamDestroy(stream);
     } catch (...) {}
     driver->cuDevicePrimaryCtxRelease(device);
@@ -255,11 +272,18 @@ struct Session::Impl {
 
 struct PreparedProgram::Impl {
   struct Binding { std::size_t parameter, buffer; };
+  struct Workspace;
   struct Step {
     std::shared_ptr<Kernel> kernel;
+    std::shared_ptr<detail::CUBLASLtMatmul> matmul;
     KernelNodeParams launch;
+    std::size_t outputBytes = 0;
     std::vector<DevicePointer> constants;
     std::vector<Binding> publicBindings, internalBindings;
+    using Execute = void (*)(const Step &, Workspace &, std::size_t, SessionState &);
+    using AddGraph = Handle (*)(const Step &, Workspace &, std::size_t, SessionState &, const Handle *, std::size_t);
+    Execute execute = nullptr, updateGraph = nullptr;
+    AddGraph addGraph = nullptr;
   };
   struct Workspace {
     std::shared_ptr<SessionState> state;
@@ -280,15 +304,76 @@ struct PreparedProgram::Impl {
       } catch (...) {}
     }
   };
+  std::shared_ptr<SessionState> state;
   std::weak_ptr<Session> session;
   std::vector<std::size_t> sizes, inputs, outputs;
   // Public ports use caller-owned storage; only internal buffers have slots.
   std::vector<std::size_t> slotCapacities;
   std::vector<Step> steps;
   std::vector<std::size_t> publicSteps;
+  std::vector<std::pair<std::size_t,unsigned>> alignedPorts;
   std::vector<std::shared_ptr<Workspace>> workspaces;
   bool graph = false;
+  static void launchKernel(const Step &, Workspace &, std::size_t, SessionState &);
+  static void launchMatmul(const Step &, Workspace &, std::size_t, SessionState &);
+  static void zeroMatmul(const Step &, Workspace &, std::size_t, SessionState &);
+  static void emptyMatmul(const Step &, Workspace &, std::size_t, SessionState &) {}
+  static Handle addKernel(const Step &, Workspace &, std::size_t, SessionState &, const Handle *, std::size_t);
+  static void updateKernel(const Step &, Workspace &, std::size_t, SessionState &);
+  static Handle capture(const Step &, Workspace &, std::size_t, SessionState &);
+  static Handle addLibrary(const Step &, Workspace &, std::size_t, SessionState &, const Handle *, std::size_t);
+  static void updateLibrary(const Step &, Workspace &, std::size_t, SessionState &);
 };
+
+void PreparedProgram::Impl::launchKernel(const Step &, Workspace &w, std::size_t i, SessionState &s) {
+  const auto &n=w.launches[i];
+  s.driver->check(s.driver->cuLaunchKernel(n.function,n.gridX,n.gridY,n.gridZ,n.blockX,n.blockY,n.blockZ,
+                                         n.sharedBytes,s.stream,n.parameters,nullptr),"cuLaunchKernel");
+}
+void PreparedProgram::Impl::launchMatmul(const Step &step, Workspace &w, std::size_t i, SessionState &s) {
+  step.matmul->launch(w.values[i].data(),s.stream);
+}
+void PreparedProgram::Impl::zeroMatmul(const Step &step, Workspace &w, std::size_t i, SessionState &s) {
+  s.driver->check(s.driver->cuMemsetD8Async(w.values[i][2],0,step.outputBytes,s.stream),"cuMemsetD8Async(matmul)");
+}
+Handle PreparedProgram::Impl::addKernel(const Step &, Workspace &w, std::size_t i, SessionState &s,
+                                       const Handle *previous, std::size_t count) {
+  Handle node=nullptr;
+  s.driver->check(s.driver->cuGraphAddKernelNode(&node,w.graph,previous,count,&w.launches[i]),"cuGraphAddKernelNode");
+  return node;
+}
+void PreparedProgram::Impl::updateKernel(const Step &, Workspace &w, std::size_t i, SessionState &s) {
+  s.driver->check(s.driver->cuGraphExecKernelNodeSetParams(w.executable,w.nodes[i],&w.launches[i]),"cuGraphExecKernelNodeSetParams");
+}
+Handle PreparedProgram::Impl::capture(const Step &step, Workspace &w, std::size_t i, SessionState &s) {
+  auto &d=*s.driver;
+  d.check(d.cuStreamBeginCapture(s.stream,1),"cuStreamBeginCapture"); // Thread-local capture.
+  Handle child=nullptr;
+  try { step.execute(step,w,i,s); }
+  catch(...) {
+    d.cuStreamEndCapture(s.stream,&child);
+    if(child) d.cuGraphDestroy(child);
+    throw;
+  }
+  d.check(d.cuStreamEndCapture(s.stream,&child),"cuStreamEndCapture");
+  return child;
+}
+Handle PreparedProgram::Impl::addLibrary(const Step &step, Workspace &w, std::size_t i, SessionState &s,
+                                        const Handle *previous, std::size_t count) {
+  Handle child=capture(step,w,i,s),node=nullptr;
+  auto &d=*s.driver;
+  int status=d.cuGraphAddChildGraphNode(&node,w.graph,previous,count,child);
+  d.cuGraphDestroy(child);
+  d.check(status,"cuGraphAddChildGraphNode");
+  return node;
+}
+void PreparedProgram::Impl::updateLibrary(const Step &step, Workspace &w, std::size_t i, SessionState &s) {
+  Handle child=capture(step,w,i,s);
+  auto &d=*s.driver;
+  int status=d.cuGraphExecChildGraphNodeSetParams(w.executable,w.nodes[i],child);
+  d.cuGraphDestroy(child);
+  d.check(status,"cuGraphExecChildGraphNodeSetParams");
+}
 
 Session::Session(std::unique_ptr<Impl> impl) : impl(std::move(impl)) {}
 std::shared_ptr<Session> Session::create(int ordinal) {
@@ -342,6 +427,9 @@ std::shared_ptr<DeviceBuffer> Session::allocate(std::size_t bytes) {
     }
     s.driver->check(status,"cuMemAlloc");
     ++s.counters["allocations"];
+    auto &resident=s.counters["resident_device_bytes"];
+    resident+=std::max<std::size_t>(1,bytes);
+    s.counters["peak_resident_device_bytes"]=std::max(s.counters["peak_resident_device_bytes"],resident);
   }
   return std::shared_ptr<DeviceBuffer>(new DeviceBuffer(std::move(p)));
 }
@@ -484,7 +572,9 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
   auto &s=*impl->state;
   pass::AllocationPlan proof;
   const std::size_t noSlot=std::numeric_limits<std::size_t>::max();
-  std::vector<std::size_t> slotOfBuffer(sizes.size(),noSlot);
+  std::vector<std::size_t> slotOfBuffer, scratch(steps.size(),noSlot);
+  std::vector<std::shared_ptr<detail::CUBLASLtMatmul>> matmuls(steps.size());
+  std::vector<std::array<std::size_t,3>> matrixBytes(steps.size());
   {
     std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
     require(!graph || s.driver->graphs(),"CUDA driver does not support graph replay");
@@ -493,96 +583,131 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
     std::set<std::size_t> available;
     for(auto value:inputs) { index(value);require(available.insert(value).second,"program inputs must be unique"); }
     for(auto value:outputs) index(value);
-    for(const auto &step:steps) {
-      validateLaunch(step.kernel,step.grid,step.block,step.sharedBytes);
-      require(step.arguments.size()==step.kernel->impl->parameterWidths.size(),"program kernel argument count differs from its ABI");
+    proof.plan.public_inputs=inputs;proof.plan.public_outputs=outputs;
+    proof.buffer_sizes=sizes;
+    for(std::size_t stepIndex=0;stepIndex<steps.size();++stepIndex) {
+      const auto &step=steps[stepIndex];
+      require(bool(step.kernel)!=bool(step.matmul),"program step requires one kernel or matmul description");
       std::set<std::size_t> ports;
-      for(auto value:step.inputs) {
-        index(value);ports.insert(value);
-      }
+      for(auto value:step.inputs) { index(value);ports.insert(value); }
       for(auto value:step.outputs) {
         index(value);require(!available.count(value),"program step overwrites an existing logical buffer");
         require(ports.insert(value).second,"program step repeats or aliases an output");
       }
-      std::set<std::size_t> bound;
-      for(std::size_t i=0;i<step.arguments.size();++i) {
-        const auto &argument=step.arguments[i];auto width=step.kernel->impl->parameterWidths[i];
-        if(width) require(argument.buffer==-1 && argument.scalar.size()==width,"program scalar argument differs from its ABI");
-        else {
-          require(argument.scalar.empty() && argument.buffer>=-1,"program pointer argument differs from its ABI");
-          if(argument.buffer>=0) {
-            index(argument.buffer);require(ports.count(argument.buffer),"program argument is not a step port");
-            bound.insert(argument.buffer);
+      proof.plan.steps.push_back({step.inputs,step.outputs});
+      if(step.matmul) {
+        require(step.inputs.size()==2 && step.outputs.size()==1 && step.arguments.empty(),
+                "matmul step requires two inputs, one output and no kernel arguments");
+        require(!graph || s.driver->libraryGraphs(),"CUDA driver does not support library graph capture");
+        checkTypes({step.matmul->elementType});
+        auto bytes=detail::matmulBufferBytes(*step.matmul);matrixBytes[stepIndex]=bytes;
+        require(sizes[step.inputs[0]]==bytes[0] && sizes[step.inputs[1]]==bytes[1] &&
+                sizes[step.outputs[0]]==bytes[2],"matmul buffer byte counts differ from its dimensions");
+        if(bytes[2] && step.matmul->k) {
+          ContextScope current(*s.driver,s.context);
+          auto operation=detail::CUBLASLtMatmul::prepare(*step.matmul,s.cublas);
+          ++s.counters["matmul_preparations"];
+          if(auto workspace=operation->workspaceBytes()) {
+            // Scratch is a private logical buffer with this step's lifetime.
+            scratch[stepIndex]=proof.buffer_sizes.size();
+            proof.plan.steps.back().outputs.push_back(scratch[stepIndex]);
+            proof.buffer_sizes.push_back(workspace);
+          }
+          matmuls[stepIndex]=std::move(operation);
+        }
+      } else {
+        validateLaunch(step.kernel,step.grid,step.block,step.sharedBytes);
+        require(step.arguments.size()==step.kernel->impl->parameterWidths.size(),"program kernel argument count differs from its ABI");
+        std::set<std::size_t> bound;
+        for(std::size_t i=0;i<step.arguments.size();++i) {
+          const auto &argument=step.arguments[i];auto width=step.kernel->impl->parameterWidths[i];
+          if(width) require(argument.buffer==-1 && argument.scalar.size()==width,"program scalar argument differs from its ABI");
+          else {
+            require(argument.scalar.empty() && argument.buffer>=-1,"program pointer argument differs from its ABI");
+            if(argument.buffer>=0) {
+              index(argument.buffer);require(ports.count(argument.buffer),"program argument is not a step port");
+              bound.insert(argument.buffer);
+            }
           }
         }
+        require(bound==ports,"program step port is not bound to a kernel parameter");
       }
-      require(bound==ports,"program step port is not bound to a kernel parameter");
       available.insert(step.outputs.begin(),step.outputs.end());
     }
     require(available.size()==sizes.size(),"program contains an undefined buffer");
-    proof.plan.buffer_count=sizes.size();
-    proof.plan.public_inputs=inputs;proof.plan.public_outputs=outputs;
-    proof.plan.steps.reserve(steps.size());
-    for(const auto &step:steps) proof.plan.steps.push_back({step.inputs,step.outputs});
-    proof.buffer_sizes=sizes;
-
-    // A kernel may retain an input pointer for its entire launch, so a slot
-    // is reused only when the previous buffer's last use is in an earlier step.
-    std::vector<std::size_t> lastUse(sizes.size(),0);
-    for(std::size_t stepIndex=0;stepIndex<steps.size();++stepIndex) {
-      for(auto buffer:steps[stepIndex].inputs)
-        lastUse[buffer]=std::max(lastUse[buffer],stepIndex);
-      for(auto buffer:steps[stepIndex].outputs)
-        lastUse[buffer]=std::max(lastUse[buffer],stepIndex);
+    proof.plan.buffer_count=proof.buffer_sizes.size();
+    slotOfBuffer.assign(proof.plan.buffer_count,noSlot);
+    // Strictly separate same-stream lifetimes for tensors and library scratch.
+    std::vector<std::size_t> lastUse(proof.plan.buffer_count,0);
+    for(std::size_t i=0;i<steps.size();++i) {
+      for(auto buffer:proof.plan.steps[i].inputs) lastUse[buffer]=std::max(lastUse[buffer],i);
+      for(auto buffer:proof.plan.steps[i].outputs) lastUse[buffer]=std::max(lastUse[buffer],i);
     }
     std::set<std::size_t> publicPorts(inputs.begin(),inputs.end());
     publicPorts.insert(outputs.begin(),outputs.end());
     std::vector<std::size_t> slotLastUse;
-    for(std::size_t stepIndex=0;stepIndex<steps.size();++stepIndex)
-      for(auto buffer:steps[stepIndex].outputs) {
+    for(std::size_t i=0;i<steps.size();++i)
+      for(auto buffer:proof.plan.steps[i].outputs) {
         if(publicPorts.count(buffer)) continue;
         std::size_t slot=0;
-        while(slot<slotLastUse.size() && slotLastUse[slot]>=stepIndex) ++slot;
+        while(slot<slotLastUse.size() && slotLastUse[slot]>=i) ++slot;
         if(slot==slotLastUse.size()) {
           slotLastUse.push_back(lastUse[buffer]);
-          proof.slot_capacity_bytes.push_back(sizes[buffer]);
+          proof.slot_capacity_bytes.push_back(proof.buffer_sizes[buffer]);
         } else {
           slotLastUse[slot]=lastUse[buffer];
-          proof.slot_capacity_bytes[slot]=std::max(proof.slot_capacity_bytes[slot],sizes[buffer]);
+          proof.slot_capacity_bytes[slot]=std::max(proof.slot_capacity_bytes[slot],proof.buffer_sizes[buffer]);
         }
         slotOfBuffer[buffer]=slot;
         proof.assignments.push_back({buffer,slot});
       }
   }
-  // The complete slot map and step availability are proved without holding
-  // the CUDA session lock; recheck its lifetime before publishing the plan.
   auto decision=pass::checkAllocationPlan(proof);
-  require(decision.verdict==pass::Verdict::Pass,
-          "ASK execution plan proof failed: "+decision.explanation);
+  require(decision.verdict==pass::Verdict::Pass,"ASK execution plan proof failed: "+decision.explanation);
   std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
-  auto p=std::make_unique<PreparedProgram::Impl>();p->session=shared_from_this();
+  using Program=PreparedProgram::Impl;
+  auto p=std::make_unique<Program>();p->session=shared_from_this();p->state=impl->state;
   p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
   p->slotCapacities=std::move(proof.slot_capacity_bytes);
   p->steps.reserve(steps.size());p->graph=graph && !steps.empty();
-  for(auto &source:steps) {
-    PreparedProgram::Impl::Step step;
-    step.kernel=std::move(source.kernel);
-    step.launch={step.kernel->impl->function,source.grid[0],source.grid[1],source.grid[2],
-                 source.block[0],source.block[1],source.block[2],source.sharedBytes,nullptr,nullptr};
-    step.constants.resize(source.arguments.size());
-    for(std::size_t i=0;i<source.arguments.size();++i) {
-      const auto &argument=source.arguments[i];
-      if(!argument.scalar.empty())
-        std::memcpy(&step.constants[i],argument.scalar.data(),argument.scalar.size());
-      else if(argument.buffer>=0) {
-        auto slot=slotOfBuffer[argument.buffer];
-        if(slot==noSlot) step.publicBindings.push_back({i,static_cast<std::size_t>(argument.buffer)});
-        else step.internalBindings.push_back({i,slot});
+  std::map<std::size_t,unsigned> alignments;
+  for(std::size_t i=0;i<steps.size();++i) {
+    auto &source=steps[i];Program::Step step;
+    const auto bind=[&](std::size_t parameter,std::size_t buffer,unsigned alignment=1) {
+      auto slot=slotOfBuffer[buffer];
+      if(slot==noSlot) {
+        step.publicBindings.push_back({parameter,buffer});
+        if(alignment>1) alignments[buffer]=std::max(alignments[buffer],alignment);
+      } else step.internalBindings.push_back({parameter,slot});
+    };
+    if(source.matmul) {
+      step.constants.resize(4);step.matmul=std::move(matmuls[i]);step.outputBytes=matrixBytes[i][2];
+      step.execute=step.outputBytes ? (source.matmul->k ? &Program::launchMatmul : &Program::zeroMatmul) : &Program::emptyMatmul;
+      step.addGraph=&Program::addLibrary;step.updateGraph=&Program::updateLibrary;
+      if(step.outputBytes) {
+        const auto alignment=detail::matmulElementBytes(source.matmul->elementType);
+        bind(2,source.outputs[0],alignment);
+        if(source.matmul->k) {
+          bind(0,source.inputs[0],alignment);bind(1,source.inputs[1],alignment);
+          if(scratch[i]!=noSlot) bind(3,scratch[i]);
+        }
+      }
+    } else {
+      step.kernel=std::move(source.kernel);
+      step.execute=&Program::launchKernel;step.addGraph=&Program::addKernel;step.updateGraph=&Program::updateKernel;
+      step.launch={step.kernel->impl->function,source.grid[0],source.grid[1],source.grid[2],
+                   source.block[0],source.block[1],source.block[2],source.sharedBytes,nullptr,nullptr};
+      step.constants.resize(source.arguments.size());
+      for(std::size_t j=0;j<source.arguments.size();++j) {
+        const auto &argument=source.arguments[j];
+        if(!argument.scalar.empty()) std::memcpy(&step.constants[j],argument.scalar.data(),argument.scalar.size());
+        else if(argument.buffer>=0) bind(j,argument.buffer);
       }
     }
     if(!step.publicBindings.empty()) p->publicSteps.push_back(p->steps.size());
     p->steps.push_back(std::move(step));
   }
+  p->alignedPorts.assign(alignments.begin(),alignments.end());
   return std::shared_ptr<PreparedProgram>(new PreparedProgram(std::move(p)));
 }
 
@@ -615,6 +740,8 @@ std::shared_ptr<Event> PreparedProgram::submit(
               buffer->pointer()+buffer->size()<=output->pointer(),"distinct program output buffers must not overlap other ports");
     }
   }
+  for(const auto &[index,alignment]:impl->alignedPorts)
+    require(bound[index]->pointer()%alignment==0,"matmul buffer address is not aligned to its element type");
   session->reap();
   std::shared_ptr<Impl::Workspace> workspace;
   for(const auto &candidate:impl->workspaces) if(!candidate->busy) { workspace=candidate;break; }
@@ -652,17 +779,17 @@ std::shared_ptr<Event> PreparedProgram::submit(
       // Retain a partially constructed graph only within this attempt.
       if(workspace->graph) { d.cuGraphDestroy(workspace->graph);workspace->graph=nullptr;workspace->nodes.clear(); }
       d.check(d.cuGraphCreate(&workspace->graph,0),"cuGraphCreate");
-      for(const auto &node:nodes) {
-        Handle next=nullptr;
-        d.check(d.cuGraphAddKernelNode(&next,workspace->graph,
-            workspace->nodes.empty()?nullptr:&workspace->nodes.back(),workspace->nodes.empty()?0:1,&node),"cuGraphAddKernelNode");
-        workspace->nodes.push_back(next);
+      for(std::size_t i=0;i<impl->steps.size();++i) {
+        const auto &step=impl->steps[i];
+        auto node=step.addGraph(step,*workspace,i,s,
+            workspace->nodes.empty()?nullptr:&workspace->nodes.back(),workspace->nodes.empty()?0:1);
+        workspace->nodes.push_back(node);
       }
       d.check(d.cuGraphInstantiate(&workspace->executable,workspace->graph,nullptr,nullptr,0),"cuGraphInstantiate");
       workspace->graphValues=workspace->values;
       ++s.counters["graph_instantiations"];
     } else for(auto i:impl->publicSteps) if(workspace->graphValues[i]!=workspace->values[i]) {
-      d.check(d.cuGraphExecKernelNodeSetParams(workspace->executable,workspace->nodes[i],&nodes[i]),"cuGraphExecKernelNodeSetParams");
+      const auto &step=impl->steps[i];step.updateGraph(step,*workspace,i,s);
       workspace->graphValues[i]=workspace->values[i];++s.counters["graph_node_updates"];
     }
   }
@@ -672,9 +799,8 @@ std::shared_ptr<Event> PreparedProgram::submit(
     if(impl->graph) {
       d.check(d.cuGraphLaunch(workspace->executable,s.stream),"cuGraphLaunch");++s.counters["graph_launches"];
       s.counters["launches"]+=nodes.size();
-    } else for(const auto &node:nodes) {
-      d.check(d.cuLaunchKernel(node.function,node.gridX,node.gridY,node.gridZ,node.blockX,node.blockY,node.blockZ,
-                              node.sharedBytes,s.stream,node.parameters,nullptr),"cuLaunchKernel");
+    } else for(std::size_t i=0;i<impl->steps.size();++i) {
+      const auto &step=impl->steps[i];step.execute(step,*workspace,i,s);
       ++s.counters["launches"];
     }
     d.check(d.cuEventRecord(event->impl->event,s.stream),"cuEventRecord");
@@ -754,7 +880,7 @@ DeviceBuffer::~DeviceBuffer(){
     auto bytes=std::max<std::size_t>(1,impl->bytes);
     if(!s.closed && bytes<=SessionState::poolLimit-s.pooledBytes) {
       s.freeBuffers[impl->bytes].push_back(impl->pointer);s.pooledBytes+=bytes;
-    } else s.driver->cuMemFree(impl->pointer);
+    } else if(!s.driver->cuMemFree(impl->pointer)) s.counters["resident_device_bytes"]-=bytes;
   }catch(...){}
 }
 std::uint64_t DeviceBuffer::pointer()const{return impl->pointer;}

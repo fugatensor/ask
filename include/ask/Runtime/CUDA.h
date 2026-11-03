@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -33,12 +34,23 @@ struct PlanArgument {
   std::string scalar;
 };
 
+// Contiguous row-major matrices. Transpose flags apply to the last two axes;
+// batchCount is the product of matching leading dimensions. Accumulation is f32.
+struct MatmulDescription {
+  std::string elementType = "f32";
+  std::uint64_t m = 0, n = 0, k = 0, batchCount = 1;
+  bool transposeA = false, transposeB = false;
+  std::size_t workspaceLimit = 4 * 1024 * 1024;
+};
+
 struct PlanStep {
   std::shared_ptr<Kernel> kernel;
   std::vector<PlanArgument> arguments;
   std::array<unsigned, 3> grid{}, block{};
   unsigned sharedBytes = 0;
   std::vector<std::size_t> inputs, outputs;
+  // A library step binds inputs={A,B}, outputs={C}; kernel is empty.
+  std::optional<MatmulDescription> matmul;
 };
 
 // The primary context is retained, never reset. Each session owns one
