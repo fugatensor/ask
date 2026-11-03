@@ -15,6 +15,7 @@
 | [工程结构与测试体系](工程结构与测试体系.md) | C++ 工程、CTest 和上层集成测试边界 | `tests/cpp/`、`tests/ir/` |
 | [FugaTensor 协同与演进路线](FugaTensor协同与演进路线.md) | 两仓职责和当前限制 | ASK 与 FugaTensor |
 | [图切分与多 Kernel 执行计划](图切分与多Kernel执行计划.md) | owned/external 分区、JSON v1 与原生调度 | `lib/Frontend/Partition.cpp`、`lib/Runtime/` |
+| [SUKA 规则证明与计划校验](规则证明与计划校验.md) | 计划可用性证明、显存复用边界与构建依赖 | `lib/Runtime/`、`cmake/suka.lock.json` |
 | [外部编译器适配接入规范](外部编译器适配接入规范.md) | 通用 worker 请求/响应协议 v2 与缓存身份 | `schemas/` |
 
 ## 关联仓库文档

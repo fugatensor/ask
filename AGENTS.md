@@ -22,6 +22,7 @@
   - 第三方 worker、版本策略、编译编排、磁盘缓存和 Python 产物校验由调用方维护；FugaTensor 通过自己的原生绑定直接链接 ASK。ASK 维护协议 v2/schema、标准化请求、cubin/PTX 加载与原生调度，不硬编码 DSL 或扫描 Python entrypoints。
 - **图切分与执行计划**：
   - 高层 MLIR 分区函数与 JSON v1 记录缓冲区、步骤依赖和单 stream 调度；自有区域内部保留融合，每个外部节点始终独立执行。非法 IR、损坏产物和工具失败直接报错。
+  - `Session::prepareProgram` 使用 SUKA PASS 的有限步骤规则证明读端口与公开输出的可用性；ASK 继续校验索引、单一生产者、kernel ABI、完成事件和在途资源。未证成的计划直接拒绝。
   - 外部 kernel 通过显存缓冲区连接；支持静态连续多输出张量、指针/null 与按值标量参数，使用普通单 stream 启动，不实现第三方代码融合。编译期配置使用递归 JSON，编译器专属值由调用方编码解释。
   - `PreparedProgram` 在 C++ 中一次绑定并提交整段计划，完成事件保留在途资源。工作区、分配和事件按完成状态复用；CUDA Graph replay 允许公开端口地址变化，不修改在途 graph 实例，不覆盖仍被调用方持有的输出。
 - **数值语义**：

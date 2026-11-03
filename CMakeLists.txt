@@ -45,6 +45,24 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Suka's rule library is linked into the Runtime shared library, so installed
+# Compiler/Runtime consumers do not need Suka headers or a separate Suka SDK.
+include(FetchContent)
+set(ASK_SUKA_SOURCE_DIR "" CACHE PATH "Use a local Suka checkout for development")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/suka.lock.json" ASK_SUKA_LOCK)
+string(JSON ASK_SUKA_REPOSITORY GET "${ASK_SUKA_LOCK}" repository)
+string(JSON ASK_SUKA_COMMIT GET "${ASK_SUKA_LOCK}" commit)
+if(ASK_SUKA_SOURCE_DIR)
+  FetchContent_Declare(suka SOURCE_DIR "${ASK_SUKA_SOURCE_DIR}")
+else()
+  FetchContent_Declare(suka GIT_REPOSITORY "${ASK_SUKA_REPOSITORY}"
+    GIT_TAG "${ASK_SUKA_COMMIT}" GIT_SHALLOW FALSE)
+endif()
+FetchContent_MakeAvailable(suka)
+if(NOT TARGET Suka::Pass)
+  message(FATAL_ERROR "Suka dependency must provide Suka::Pass")
+endif()
+
 set(ASK_WITH_HOST 0)
 if(ASK_TARGET_BACKENDS STREQUAL "host")
   set(ASK_WITH_HOST 1)
@@ -102,7 +120,11 @@ target_compile_features(ask_runtime PUBLIC cxx_std_17)
 target_include_directories(ask_runtime PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
-target_link_libraries(ask_runtime PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(ask_runtime PRIVATE Suka::Pass ${CMAKE_DL_LIBS})
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
+  # The proof engine is an implementation detail of the Runtime shared ABI.
+  target_link_options(ask_runtime PRIVATE "LINKER:--exclude-libs,ALL")
+endif()
 
 install(TARGETS ask_core EXPORT ASKCoreTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} COMPONENT Core)
 install(TARGETS ask_compiler EXPORT ASKCompilerTargets
@@ -122,6 +144,7 @@ write_basic_package_version_file("${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.c
 install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
   DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT Core)
 install(FILES cmake/llvm.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
+install(FILES cmake/suka.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 
 option(ASK_TEST_CUDA "Run hardware CUDA runtime tests (requires an NVIDIA GPU)" OFF)
 if(BUILD_TESTING)
@@ -139,4 +162,5 @@ if(BUILD_TESTING)
 endif()
 
 message(STATUS "ASK target backends: ${ASK_TARGET_BACKENDS}; LLVM/MLIR ${LLVM_PACKAGE_VERSION}")
+message(STATUS "ASK Suka rules: ${ASK_SUKA_COMMIT}")
 message(STATUS "ASK interfaces: native Compiler, Runtime and Core; no Python build dependency")

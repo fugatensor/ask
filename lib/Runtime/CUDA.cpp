@@ -1,4 +1,5 @@
 #include "ask/Runtime/CUDA.h"
+#include "suka/pass.h"
 
 #include <algorithm>
 #include <cstring>
@@ -468,41 +469,53 @@ std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
 std::shared_ptr<PreparedProgram> Session::prepareProgram(
     std::vector<std::size_t> sizes,std::vector<std::size_t> inputs,
     std::vector<std::size_t> outputs,std::vector<PlanStep> steps,bool graph) {
-  auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
-  require(!graph || s.driver->graphs(),"CUDA driver does not support graph replay");
-  require(!outputs.empty(),"program must have at least one output");
-  auto index=[&](std::size_t value) { require(value<sizes.size(),"program buffer index is out of range"); };
-  std::set<std::size_t> available;
-  for(auto value:inputs) { index(value);require(available.insert(value).second,"program inputs must be unique"); }
-  for(auto value:outputs) index(value);
-  for(const auto &step:steps) {
-    validateLaunch(step.kernel,step.grid,step.block,step.sharedBytes);
-    require(step.arguments.size()==step.kernel->impl->parameterWidths.size(),"program kernel argument count differs from its ABI");
-    std::set<std::size_t> ports;
-    for(auto value:step.inputs) {
-      index(value);require(available.count(value),"program step reads a buffer before it is produced");ports.insert(value);
-    }
-    for(auto value:step.outputs) {
-      index(value);require(!available.count(value),"program step overwrites an existing logical buffer");
-      require(ports.insert(value).second,"program step repeats or aliases an output");
-    }
-    std::set<std::size_t> bound;
-    for(std::size_t i=0;i<step.arguments.size();++i) {
-      const auto &argument=step.arguments[i];auto width=step.kernel->impl->parameterWidths[i];
-      if(width) require(argument.buffer==-1 && argument.scalar.size()==width,"program scalar argument differs from its ABI");
-      else {
-        require(argument.scalar.empty() && argument.buffer>=-1,"program pointer argument differs from its ABI");
-        if(argument.buffer>=0) {
-          index(argument.buffer);require(ports.count(argument.buffer),"program argument is not a step port");
-          bound.insert(argument.buffer);
+  auto &s=*impl->state;
+  suka::pass::Plan proof;
+  {
+    std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
+    require(!graph || s.driver->graphs(),"CUDA driver does not support graph replay");
+    require(!outputs.empty(),"program must have at least one output");
+    auto index=[&](std::size_t value) { require(value<sizes.size(),"program buffer index is out of range"); };
+    std::set<std::size_t> available;
+    for(auto value:inputs) { index(value);require(available.insert(value).second,"program inputs must be unique"); }
+    for(auto value:outputs) index(value);
+    for(const auto &step:steps) {
+      validateLaunch(step.kernel,step.grid,step.block,step.sharedBytes);
+      require(step.arguments.size()==step.kernel->impl->parameterWidths.size(),"program kernel argument count differs from its ABI");
+      std::set<std::size_t> ports;
+      for(auto value:step.inputs) {
+        index(value);ports.insert(value);
+      }
+      for(auto value:step.outputs) {
+        index(value);require(!available.count(value),"program step overwrites an existing logical buffer");
+        require(ports.insert(value).second,"program step repeats or aliases an output");
+      }
+      std::set<std::size_t> bound;
+      for(std::size_t i=0;i<step.arguments.size();++i) {
+        const auto &argument=step.arguments[i];auto width=step.kernel->impl->parameterWidths[i];
+        if(width) require(argument.buffer==-1 && argument.scalar.size()==width,"program scalar argument differs from its ABI");
+        else {
+          require(argument.scalar.empty() && argument.buffer>=-1,"program pointer argument differs from its ABI");
+          if(argument.buffer>=0) {
+            index(argument.buffer);require(ports.count(argument.buffer),"program argument is not a step port");
+            bound.insert(argument.buffer);
+          }
         }
       }
+      require(bound==ports,"program step port is not bound to a kernel parameter");
+      available.insert(step.outputs.begin(),step.outputs.end());
     }
-    require(bound==ports,"program step port is not bound to a kernel parameter");
-    available.insert(step.outputs.begin(),step.outputs.end());
+    require(available.size()==sizes.size(),"program contains an undefined buffer");
+    proof.buffer_count=sizes.size();proof.public_inputs=inputs;proof.public_outputs=outputs;
+    proof.steps.reserve(steps.size());
+    for(const auto &step:steps) proof.steps.push_back({step.inputs,step.outputs});
   }
-  for(auto value:outputs) require(available.count(value),"program output is never produced");
-  require(available.size()==sizes.size(),"program contains an undefined buffer");
+  // Proving a large plan can be expensive; no CUDA session lock is held while
+  // SUKA derives step availability. Recheck session lifetime before publishing.
+  auto decision=suka::pass::checkPlan(proof);
+  require(decision.verdict==suka::pass::Verdict::Pass,
+          "Suka execution plan availability proof failed: "+decision.explanation);
+  std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   auto p=std::make_unique<PreparedProgram::Impl>();p->session=shared_from_this();
   p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
   p->steps=std::move(steps);p->graph=graph;

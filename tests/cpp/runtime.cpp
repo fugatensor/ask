@@ -41,6 +41,22 @@ done:
       step.inputs = {i}; step.outputs = {i + 1};
       steps.push_back(std::move(step));
     }
+    {
+      // Both logical buffers are eventually produced; the first step still
+      // reads buffer 1 before its producer, which the Suka proof must reject.
+      auto early = steps[0];
+      early.inputs = {1}; early.outputs = {2};
+      early.arguments = {{1, {}}, {2, {}}};
+      auto producer = steps[1];
+      producer.inputs = {0}; producer.outputs = {1};
+      producer.arguments = {{0, {}}, {1, {}}};
+      bool rejected = false;
+      try { session->prepareProgram({16, 16, 16}, {0}, {2}, {early, producer}, false); }
+      catch (const CUDAError &error) {
+        rejected = std::string(error.what()).find("Suka execution plan availability proof failed") != std::string::npos;
+      }
+      if (!rejected) return 1;
+    }
     auto program = session->prepareProgram({16, 16, 16}, {0}, {2}, std::move(steps), true);
     for (int iteration = 0; iteration < 2; ++iteration) {
       std::array<std::int32_t, 4> input = {iteration + 1, 2, -3, 4}, output{};
