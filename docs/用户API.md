@@ -1,6 +1,6 @@
-# ASK 用户 API
-
 返回核心思想：[构建与进程内接入](核心思想.md#ask-frontend-build) · 相关细节：[安装](安装.md) · [外部编译器接入](外部编译器适配接入规范.md) · [常驻运行时](常驻运行时与多级缓存.md)
+
+# ASK 用户 API
 
 ASK 的 C++ 接口分为编译器和运行时。接入示例见 [FugaTensor](../../fugatensor/README.md)，其原生扩展链接 Compiler 与 Runtime；Python 用法见 [FugaTensor API](../../fugatensor/docs/API/README.md)。
 
@@ -48,83 +48,69 @@ module attributes {ask.schema_version = 1 : i64} {
 
 ## 3. 编译接口
 
-编译入口位于 `namespace ask::compiler`，使用具名选项和按阶段区分的结果类型。所有公开类型仅依赖 C++17 标准库。
-
-| 调用 | 结果 |
-| --- | --- |
-| `prepare(source, options={})` | `PrepareResult`：校验后的 `ir`、`shapeSnapshotJSON`、`externalRequestsJSON` 与 `diagnosticsJSON` |
-| `partition(source, options={})` | `PartitionResult`：上述字段，以及 `executionPlanJSON` 和按步骤 ID 索引 MLIR 的 `stepSources` |
-| `codegen(source, options)` | `CodegenResult`：`target`、`outputPath`、`ir`、形状快照、外部请求、诊断，以及按目标提供的 `abiJSON` 或 `cudaArtifactJSON` |
-
-`PrepareOptions.optimize` 默认 `false`，`PartitionOptions.optimize` 和 `CodegenOptions.optimize` 默认 `true`。三个选项类型都通过 `optimization` 指定 `OptimizationOptions`，其中 `foldConstants`、`eliminateDeadCode`、`fuseElementwise` 默认 `true`。
-
-`CodegenOptions.target` 使用 `CodegenTarget` 枚举，默认 `HostLLVM`：
-
-- `HostLLVM`：`ir` 返回本机 LLVM 文本，`abiJSON` 有值。
-- `HostObject`：将本机 `.o` 写入必填 `outputPath`，`ir` 为空，`abiJSON` 有值。链接和加载由调用方负责。
-- `CUDALLVM`：必须指定 `architecture`，例如 `86`；`ir` 返回 CUDA LLVM 文本，`cudaArtifactJSON` 有值。`blockSize` 默认 `128`，`ptxVersion` 默认 `80`。调用方继续用 `llc` / `ptxas` 生成 PTX/cubin，自有计算保持 `-fp-contract=off`。
-
-`outputPath` 只用于 `HostObject`，LLVM 文本目标须保持为空。`abiJSON` 与 `cudaArtifactJSON` 为 `std::optional<std::string>`，仅对应目标的字段有值。其它 JSON 字段为 `std::string`，保留现有版本化契约；`stepSources` 为 `std::map<std::string, std::string>`。`shapeSnapshotJSON` 供形状校验与编译缓存使用，`externalRequestsJSON` 是外部请求数组。`diagnosticsJSON` 保存阶段、溯源和优化统计，编译编排通过上述具名字段获取产物。
+先把上面的图保存为 `std::string source`，生成一个 Host 对象文件：
 
 ```cpp
 #include <ask/Frontend/CompilerAPI.h>
 
-// source 为上面的 ASK MLIR 字符串。
-ask::compiler::PrepareOptions preparation;
-preparation.optimize = true;
-auto prepared = ask::compiler::prepare(source, preparation);
-auto partitioned = ask::compiler::partition(source);
-
-ask::compiler::CodegenOptions cudaOptions;
-cudaOptions.target = ask::compiler::CodegenTarget::CUDALLVM;
-cudaOptions.architecture = 86;
-auto cuda = ask::compiler::codegen(source, cudaOptions);
-
-ask::compiler::CodegenOptions hostOptions;
-hostOptions.target = ask::compiler::CodegenTarget::HostObject;
-hostOptions.outputPath = "increment.o";
-auto host = ask::compiler::codegen(source, hostOptions);
+ask::compiler::CodegenOptions options;
+options.target = ask::compiler::CodegenTarget::HostObject;
+options.outputPath = "increment.o";
+auto result = ask::compiler::codegen(source, options);
 ```
 
-`ask::compilerCapabilitiesJSON()` 返回构建版本、类型、目标后端与运行时能力；`ask::compilerLibraryPath()` 返回当前实际载入的 Compiler 共享库路径，可用于内容摘要与编译缓存身份。
+`result.outputPath` 是对象文件路径，`result.abiJSON` 描述入口和参数。调用方链接、加载该文件。编译失败抛出带诊断的 `std::runtime_error`。
 
-`namespace ask` 下的 `prepareJSON`、`partitionJSON`、`codegenJSON` 保留兼容接口，返回 `{ir, reportJSON}` 字符串对。`ask-opt --report-json` 同样输出含形状快照、外部请求、执行计划和目标产物的完整报告。具名结果与完整报告使用相同的序列化规则，保留浮点配置的词法类型、负零和 64 位整数精度。
+按需要选择编译阶段：
 
-| 兼容接口 | 默认参数 |
+| 目的 | 调用 | 读取的结果 |
+| --- | --- | --- |
+| 检查图和推导形状 | `prepare(source)` | `ir`、`shapeSnapshotJSON` |
+| 获取 CUDA 执行计划 | `partition(source)` | `executionPlanJSON`、按步骤 ID 索引的 `stepSources` |
+| 生成自有代码 | `codegen(source, options)` | `ir` 或 `outputPath`，以及目标 ABI |
+
+三个结果都提供 `externalRequestsJSON`，供调用方交给第三方 worker；`diagnosticsJSON` 保存溯源和优化统计。各请求使用独立 MLIR context，支持并发调用。
+
+<details>
+<summary>CUDA 代码生成与编译选项</summary>
+
+```cpp
+ask::compiler::CodegenOptions options;
+options.target = ask::compiler::CodegenTarget::CUDALLVM;
+options.architecture = 86;
+auto result = ask::compiler::codegen(source, options);
+```
+
+`result.ir` 是 CUDA LLVM 文本，`result.cudaArtifactJSON` 描述启动 ABI。调用方用 `llc -fp-contract=off` 和 `ptxas` 继续生成 PTX/cubin。
+
+| 选项 | 用法 |
 | --- | --- |
-| `prepareJSON(source, optimize, foldConstants, eliminateDeadCode, fuseElementwise)` | `false, true, true, true` |
-| `partitionJSON(source, optimize, foldConstants, eliminateDeadCode, fuseElementwise)` | `true, true, true, true` |
-| `codegenJSON(source, target, output, architecture, blockSize, ptxVersion, optimize)` | `output="", architecture=0, blockSize=128, ptxVersion=80, optimize=true`；`target` 为 `"host-llvm"`、`"host-object"` 或 `"cuda-llvm"` |
+| `target` | `HostLLVM`（默认）返回 Host LLVM；`HostObject` 写入对象文件；`CUDALLVM` 返回 CUDA LLVM |
+| `outputPath` | `HostObject` 的必填输出路径；LLVM 文本目标使用默认空值 |
+| `architecture` | CUDA 架构编号，如 `86` |
+| `blockSize` / `ptxVersion` | CUDA 默认值分别为 `128`、`80` |
+| `optimize` | `prepare` 默认 `false`；`partition` 和 `codegen` 默认 `true` |
+| `optimization` | `foldConstants`、`eliminateDeadCode`、`fuseElementwise` 默认均为 `true` |
 
-各请求使用独立 MLIR context，支持并发调用。失败抛出带原生诊断的 `std::runtime_error`。接口验证见[编译器测试](../tests/cpp/compiler.cpp)。
+`abiJSON` 和 `cudaArtifactJSON` 是可选字符串，按目标返回对应字段。完整类型定义见 [CompilerAPI.h](../include/ask/Frontend/CompilerAPI.h)。
+
+</details>
+
+构建信息、CLI 和 JSON 报告接口见[前端接入](前端接入与构建配置.md#native-compiler)。
 
 <a id="execution-api"></a>
 
 ## 4. 原生会话与计划执行
 
-以下对象位于 `namespace ask::runtime`，由 `std::shared_ptr` 管理。会话持有一条非阻塞 CUDA stream，所有步骤按计划顺序执行。
-
-| 接口 | 行为 |
-| --- | --- |
-| `Session::create(device=0)` | 创建目标设备的常驻会话，保留 primary context |
-| `session->allocate(bytes)` | 分配原生设备缓冲区，可复用同字节数的空闲分配 |
-| `session->importBuffer(pointer, bytes, readonly=false)` | 借用外部设备存储，不取得其实际分配的所有权 |
-| `session->load(binary, entry, requiredTypes, arch, parameterWidths)` | 加载 cubin 字节或 PTX 文本，校验设备与 kernel ABI，复用驻留模块 |
-| `session->prepareProgram(bufferSizes, inputs, outputs, steps, graph=false)` | 校验执行计划和内部缓冲区槽位映射，创建不可变 `PreparedProgram` |
-| `program->submit(inputs, outputs)` | 绑定公开缓冲区，一次提交完整计划，返回完成事件 |
-| `program->run(inputs)` | 自动分配公开输出，返回 `{outputs, event}`；计划中的输入别名与重复输出保持原存储 |
-| `event->query()` / `event->wait()` | 查询完成或等待完成 |
-| `session->reap()` / `synchronize()` / `close()` | 回收完成事件、同步 stream、同步关闭会话 |
-| `session->stats()` | 返回模块、分配、工作区、事件和 graph 等累计计数 |
-
-`parameterWidths` 按 kernel 的物理参数顺序填写：指针（含 null）用 `0`，按值标量用其 ABI 字节数 `1/2/4/8`。驱动报告的参数数量、宽度和偏移必须匹配。`requiredTypes` 声明产物实际使用的基础类型，`arch` 来自编译目标。
-
-每个 `PlanStep` 保存已加载的 `kernel`、`arguments`、三维 `grid/block`、`sharedBytes` 和逻辑输入输出索引。`PlanArgument.buffer` 指向整个计划的缓冲区表，负数表示 null；非空 `scalar` 保存冻结的标量 ABI 字节。启动标量不随 `submit` 改变，变更配置须准备新程序。
-
-下面将一个双指针 kernel 接入单步骤计划；`kernel` 已由 `load` 获取：
+运行时接入分为三步：加载 kernel、准备计划、绑定缓冲区执行。下面假设 `binary` 是一个面向 `sm_86` 的 cubin/PTX 字符串，入口 `increment` 读取四个 `i32` 并写入四个 `i32`：
 
 ```cpp
+#include <ask/Runtime/CUDA.h>
+
 using namespace ask::runtime;
+auto session = Session::create(0);
+auto kernel = session->load(binary, "increment", {"i32"}, 86, {0, 0});
+
 PlanStep step;
 step.kernel = kernel;
 step.arguments = {{0, {}}, {1, {}}};
@@ -132,9 +118,10 @@ step.grid = {1, 1, 1};
 step.block = {128, 1, 1};
 step.inputs = {0};
 step.outputs = {1};
-auto program = session->prepareProgram({16, 16}, {0}, {1}, {step}, true);
-auto x = session->allocate(16);
+auto program = session->prepareProgram({16, 16}, {0}, {1}, {step});
+
 std::int32_t values[4] = {1, 2, 3, 4};
+auto x = session->allocate(sizeof(values));
 x->copyFromHost(values, sizeof(values));
 auto [outputs, done] = program->run({x});
 done->wait();
@@ -142,9 +129,20 @@ std::int32_t result[4];
 outputs.front()->copyToHost(result, sizeof(result));
 ```
 
-缓冲区字节数按执行计划和 kernel ABI 中的形状、元素类型计算。输入允许共享存储；不同逻辑输出须与其它公开端口分离。计划中的输入别名和重复输出须绑定同一存储。ASK PASS 在准备时校验所有内部缓冲区的物理槽位容量与生存期；公开端口不参与槽位共享。全部端口通过检查后才启动 kernel。
+`prepareProgram(bufferSizes, inputs, outputs, steps, graph=false)` 接收逻辑缓冲区字节数、公开输入输出索引和步骤列表。它校验计划并生成内部槽位映射，返回可反复执行的 `PreparedProgram`。`run(inputs)` 自动分配公开输出；已有输出缓冲区时使用 `submit(inputs, outputs)`，得到完成事件。
 
-传 `graph=true` 使用 CUDA Graph replay：首次为工作区实例化 graph，后续更新 kernel 的输入输出地址后复用。拓扑、kernel、形状和启动配置固定，地址可变化。在途调用各用独立工作区和 graph 实例，完成后复用中间缓冲区和事件。顺序提交和 graph 共用参数绑定、校验及资源管理；驱动能力不足或调用失败会报错。验证见[运行时测试](../tests/cpp/runtime.cpp)。
+传 `graph=true` 使用 CUDA Graph replay。计划固定 kernel、形状和启动配置，每次可以传入新的公开缓冲区地址。工作区与事件的复用方式见[常驻运行时](常驻运行时与多级缓存.md#cuda-graph)。
+
+<details>
+<summary>kernel 参数和缓冲区契约</summary>
+
+`load(binary, entry, requiredTypes, arch, parameterWidths)` 按产物内容和入口复用模块。`requiredTypes` 声明使用的基础类型，`arch` 是编译目标。`parameterWidths` 按物理参数顺序填写：指针（含 null）为 `0`，按值标量为 ABI 字节数 `1/2/4/8`。加载时核对驱动报告的参数数量、宽度和偏移。
+
+`PlanStep` 保存 `kernel`、`arguments`、三维 `grid/block`、`sharedBytes` 和逻辑输入输出索引。`PlanArgument.buffer` 指向计划的缓冲区表，`-1` 表示 null；`scalar` 保存冻结的标量 ABI 字节。修改标量或启动配置时准备新程序。
+
+公开输入允许共享存储。不同逻辑输出须与其它公开端口分离；重复输出或输入别名须绑定同一存储。每次提交核对实际缓冲区的设备、字节数、可写性和别名。内部槽位的容量和生存期在准备阶段由 [ASK PASS](规则证明与计划校验.md) 验证。
+
+</details>
 
 <a id="external-api"></a>
 
@@ -160,7 +158,16 @@ worker 请求、产物格式和标量类型见[外部适配规范](外部编译�
 
 ## 6. 原始字节、资源寿命与缓存
 
-`DeviceBuffer` 提供 `pointer()`、`size()`、`readonly()`；`copyFromHost(pointer, bytes)` 与 `copyToHost(pointer, bytes)` 批量复制原始字节，大小须完全一致，主机导出地址须可写。无参 `copyToHost()` 返回 `std::string` 字节。复制返回前等待会话工作。
+会话与资源对象由 `std::shared_ptr` 管理。会话持有一条非阻塞 CUDA stream，步骤按计划顺序执行。
+
+| 接口 | 用途 |
+| --- | --- |
+| `DeviceBuffer::pointer()` / `size()` / `readonly()` | 读取设备地址、字节数和只读属性 |
+| `copyFromHost(pointer, bytes)` / `copyToHost(pointer, bytes)` | 复制完整缓冲区；返回前等待会话工作 |
+| `copyToHost()` | 将缓冲区复制为 `std::string` 字节 |
+| `Event::query()` / `wait()` | 查询完成状态或等待完成 |
+| `Session::reap()` / `synchronize()` / `close()` | 回收完成事件、同步 stream、同步关闭会话 |
+| `Session::stats()` | 查看模块、分配、工作区、事件和 graph 的累计计数 |
 
 会话保留待完成事件，事件保留程序、参数缓冲区和工作区，直到设备工作结束。完成后的工作区和事件句柄可复用，旧事件对象保持已完成状态，调用方持有的旧结果继续使用原存储。
 
@@ -168,8 +175,8 @@ worker 请求、产物格式和标量类型见[外部适配规范](外部编译�
 
 <a id="errors-and-limits"></a>
 
-## 7. 错误与边界
+## 7. 错误处理
 
 编译接口抛出 `std::runtime_error`，设备层抛出 `ask::runtime::CUDAError`。启动失败时，前序步骤可能已提交；运行时等待这些工作结束，再释放引用并传播错误，设备写入不回滚。
 
-当前计划支持静态连续缓冲区和单 stream 的普通 kernel 调度；动态形状、多 stream 和数据依赖控制流不在支持范围内。FugaTensor 负责 Python API 和框架级控制流，CUDA Graph 用于减少计划提交开销。
+计划使用静态连续缓冲区，在单 stream 上执行普通 kernel。FugaTensor 负责 Python API 和框架级控制流，CUDA Graph 用于减少计划提交开销。

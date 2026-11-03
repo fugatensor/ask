@@ -1,10 +1,10 @@
-# FugaTensor 协同与演进路线
+返回核心思想：[框架分工](核心思想.md#ask-positioning) · [测试验证](核心思想.md#ask-testing-roadmap) · 相关细节：[ASK IR](ASK-IR与数值语义.md) · [外部执行接口](外部产物与执行接口.md) · [FugaTensor 架构](../../fugatensor/docs/architecture/README.md)
 
-返回核心思想：[框架分工](核心思想.md#ask-positioning) · [验证与支持边界](核心思想.md#ask-testing-roadmap) · 相关细节：[ASK IR](ASK-IR与数值语义.md) · [外部执行接口](外部产物与执行接口.md) · [FugaTensor 架构](../../fugatensor/docs/architecture/README.md)
+# FugaTensor、ASK 与 SUKA 的职责
 
 <a id="division-of-labor"></a>
 
-## 1. 两个仓库的职责
+## 1. 框架与编译运行时
 
 推荐以 [FugaTensor](../../fugatensor/README.md) 作为 ASK 接入示例。它提供 [Python API](../../fugatensor/docs/API/README.md)，扩展链接 ASK C++ 库，wheel 携带编译器和运行时共享库。构建步骤见 [ASK 安装](安装.md#framework-install)和 [FugaTensor 安装](../../fugatensor/docs/安装.md)。
 
@@ -20,7 +20,7 @@
 
 <a id="implemented-scope"></a>
 
-## 2. 当前已实现范围
+## 2. 编译与执行能力
 
 - 六种显式类型、单步 RNE 常量和 6×6 转换；CPU/GPU 目标支持时使用原生 `bf16`。
 - C++ `ASK::Compiler`、`ASK::Runtime`、`ASK::Core` 与 `ask-opt`；形状推导、溯源提取、自有常量折叠、DCE 和逐元素融合。
@@ -32,13 +32,14 @@
 
 <a id="roadmap"></a>
 
-## 3. 当前限制
+## 3. 三个项目的依赖方向
 
-| 边界 | 当前行为 |
-| --- | --- |
-| 第三方融合 | 每个外部 kernel 独立执行，跨步骤通过显存连接。 |
-| 调度 | 静态计划、单 stream 顺序提交或 Graph replay；各未完成提交拥有独立 workspace，没有图内动态条件/循环或多 stream 并发计划。 |
-| 操作集 | 自有算子没有归约、轴广播或矩阵乘；`splat` 仅将标量填充到指定静态形状。 |
-| 外部 ABI | 静态连续张量、六种张量类型、指针与按值标量、固定普通 launch；没有非空 scratch 或描述符启动支持。 |
-| 副作用 | `ask.semantics` 只接受 `effects = "none"`，没有状态 token。 |
-| 互操作 | CAI 不承载 `bf16`，没有 DLPack 接口。 |
+| 项目 | 提供的接口 | 构建时消费 |
+| --- | --- | --- |
+| FugaTensor | Python Tensor API、Fuga IR、自动微分、第三方 worker | ASK 安装包中的 `Compiler`、`Runtime`，以及 nanobind |
+| ASK | C++ 编译器、设备运行时、执行计划规则 | LLVM/MLIR 和 SUKA；执行规则位于 `rules/pass/` |
+| SUKA | 通用规则语言和证明器 | C++ 标准库 |
+
+FugaTensor 先通过 Fuga IR 完成图变换，再向 ASK 提交静态图。ASK 构建计划并验证缓冲区与存储槽位，SUKA 根据 ASK 提供的事实和规则求证。各项目的领域知识随所属项目维护：Tensor 与微分规则在 FugaTensor，执行计划与槽位规则在 ASK，推理引擎在 SUKA。
+
+先安装 ASK SDK，再用 `CMAKE_PREFIX_PATH` 构建 FugaTensor。ASK 的 CMake 从锁文件获取 SUKA，也可通过 `ASK_SUKA_SOURCE_DIR` 选择本地源码。接口和依赖详情见[前端接入](前端接入与构建配置.md#native-compiler)与[证明器构建](规则证明与计划校验.md#build-dependency)。

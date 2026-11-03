@@ -1,6 +1,6 @@
-# 图切分与多 Kernel 执行计划
-
 返回核心思想：[图切分与执行计划](核心思想.md#execution-plan) · 相关细节：[自有代码生成](图优化与自有代码生成.md) · [外部产物与执行接口](外部产物与执行接口.md) · [常驻运行时](常驻运行时与多级缓存.md)
+
+# 图切分与多 Kernel 执行计划
 
 <a id="partition-ir"></a>
 
@@ -66,7 +66,7 @@ external 步骤交给调用方 worker 编译为 cubin/PTX，owned 步骤经 ASK 
 
 FugaTensor 将计划和各步骤产物保存为 `CUDAProgram`。包中使用相对路径：`execution_plan.json` 保存逻辑计划，`program.json` 记录步骤对应的子目录产物和摘要。保存和加载时检查路径范围、摘要、计划和 kernel ABI，自有与外部步骤分别使用对应的磁盘缓存。校验后，将内存中的计划描述交给 ASK Runtime。
 
-调用方加载各个 kernel，按逻辑缓冲区构造字节数表、公开端口索引与 `PlanStep`，交给 `Session::prepareProgram(..., graph)`。`PreparedProgram::submit(inputs, outputs)` 一次完成所有步骤；C++ 先校验公开端口的设备归属、字节数、可写性和别名，再绑定中间缓冲区并提交，只记录一个完成事件。`run(inputs)` 还负责分配本次输出，供 FugaTensor 的薄原生桥直接调用。
+调用方加载各个 kernel，按逻辑缓冲区构造字节数表、公开端口索引与 `PlanStep`，交给 `Session::prepareProgram(..., graph)`。`PreparedProgram::submit(inputs, outputs)` 一次完成所有步骤；C++ 先校验公开端口的设备归属、字节数、可写性和别名，再更新公开端口地址并提交，只记录一个完成事件。`run(inputs)` 还负责分配本次输出，供 FugaTensor 的薄原生桥直接调用。
 
 每个在途调用占用独立工作区，事件完成后才能复用。工作区内按已验证的步骤生存期共享物理槽位，公开端口单独绑定。事件保留程序和缓冲区，会话保留待完成事件，因此调用方释放对象后，在途资源仍然有效。启动失败时，运行时等待已排队的步骤结束再传播异常；设备写入不回滚。零步骤别名计划记录完成事件，覆盖此前的 stream 依赖，保持异步提交。
 

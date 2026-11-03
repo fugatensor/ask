@@ -12,7 +12,7 @@ ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态�
 
 - 类型与数值：支持 `bool`、`i32`、`i64`、`f32`、`f16`、`bf16`，常量按 RNE 舍入，加乘输入须同形状、同类型。
 - 编译与融合：常量折叠、DCE、多输出逐元素融合；Host 生成 `.o`，CUDA 生成 LLVM IR，再由 `llc` / `ptxas` 生成 cubin。
-- 执行计划：ASK PASS 校验整份缓冲区槽位映射，完成后复用工作区和事件，支持 CUDA Graph replay。
+- 执行计划：ASK PASS 在准备时证明缓冲区槽位映射并缓存成功结果；执行时复用参数模板、工作区和事件，支持 CUDA Graph replay。
 - 外部 kernel：通过设备缓冲区连接独立步骤，支持多输入、多输出、指针和按值标量。
 
 项目提供 C++ SDK 与 `ask-opt`。Compiler SDK 使用具名编译选项和按阶段区分的结果，将执行计划、ABI、产物与诊断分开返回。[FugaTensor](../fugatensor/README.md) 在此基础上实现 Python API、自动组图、求导和第三方编译器适配。
@@ -21,7 +21,7 @@ ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态�
 
 ## 构建、安装与验证
 
-构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)；CMake 按 [SUKA 提交记录](cmake/suka.lock.json)获取通用证明库。执行规则位于 ASK 的 [`rules/pass/`](rules/pass/)，用途见[计划校验](docs/规则证明与计划校验.md)。下载脚本使用 Python 3 标准库。
+构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)；CMake 按 [SUKA 提交记录](cmake/suka.lock.json)获取 C++ 头文件证明器。执行规则位于 ASK 的 [`rules/pass/`](rules/pass/)，用途见[计划校验](docs/规则证明与计划校验.md)。下载脚本使用 Python 3 标准库。
 
 ```bash
 python3 tools/fetch_deps.py
