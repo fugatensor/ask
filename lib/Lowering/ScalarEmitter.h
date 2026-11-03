@@ -20,6 +20,7 @@ class ScalarEmitter {
   bool cuda;
   std::function<llvm::Value *(mlir::Value, llvm::Value *)> load;
   llvm::DenseMap<std::pair<mlir::Value, llvm::Value *>, llvm::Value *> values;
+  llvm::DenseMap<mlir::Value, llvm::Value *> uniformValues, buffers;
 
   static llvm::ArrayRef<int64_t> shape(mlir::Type type) {
     if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) return tensor.getShape();
@@ -194,13 +195,25 @@ public:
                 std::function<llvm::Value *(mlir::Value, llvm::Value *)> loader)
       : b(builder), function(function), cuda(cuda), load(std::move(loader)) {}
 
+  void bindUniform(mlir::Value value, llvm::Value *computed) { uniformValues[value] = computed; }
+  void bindBuffer(mlir::Value value, llvm::Value *address) { buffers[value] = address; }
+
   llvm::Value *emit(mlir::Value value, llvm::Value *index) {
+    if (auto uniform = uniformValues.find(value); uniform != uniformValues.end()) return uniform->second;
     if (!mlir::isa<mlir::RankedTensorType>(value.getType())) index = b.getInt64(0);
     auto key = std::make_pair(value, index);
     auto cached = values.find(key);
     if (cached != values.end()) return cached->second;
     llvm::Value *computed;
-    if (mlir::isa<mlir::BlockArgument>(value)) computed = load(value, index);
+    if (auto stored = buffers.find(value); stored != buffers.end()) {
+      auto *type = llir::scalarLLVMType(value.getType(), b.getContext());
+      const bool boolean = type->isIntegerTy(1);
+      if (boolean) type = b.getInt8Ty();
+      auto *address = b.CreateGEP(type, stored->second, index, "cached.address");
+      computed = b.CreateAlignedLoad(type, address,
+          llvm::Align(elementByteWidth(value.getType())), "cached.value");
+      if (boolean) computed = b.CreateICmpNE(computed, b.getInt8(0));
+    } else if (mlir::isa<mlir::BlockArgument>(value)) computed = load(value, index);
     else {
       auto *op = value.getDefiningOp();
       if (auto constant = mlir::dyn_cast<ConstantOp>(op)) {

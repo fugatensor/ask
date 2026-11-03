@@ -7,6 +7,7 @@
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/IR/IRBuilder.h"
@@ -191,6 +192,68 @@ llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
   return llvm::Error::success();
 }
 
+struct WorkspacePlan {
+  llvm::DenseSet<mlir::Value> live, materialized;
+  llvm::DenseMap<mlir::Value, uint64_t> offsets;
+  uint64_t bytes = 0;
+};
+
+// Inputs and results have already passed the static byte-size checks.
+uint64_t concreteCount(mlir::Type type) {
+  if (auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(type)) {
+    if (llvm::is_contained(tensor.getShape(), int64_t(0))) return 0;
+    return uint64_t(tensor.getNumElements());
+  }
+  return 1;
+}
+
+llvm::Expected<WorkspacePlan> planWorkspace(mlir::func::FuncOp graph, uint64_t limit) {
+  WorkspacePlan plan;
+  std::function<void(mlir::Value)> visit = [&](mlir::Value value) {
+    if (!plan.live.insert(value).second) return;
+    if (concreteCount(value.getType()) == 0) return;
+    if (auto *owner = value.getDefiningOp())
+      for (auto operand : owner->getOperands()) visit(operand);
+  };
+  for (auto value : mlir::cast<mlir::func::ReturnOp>(graph.front().getTerminator()).getOperands()) visit(value);
+  llvm::DenseMap<mlir::Value, bool> expensive;
+  std::function<bool(mlir::Value)> hasReduction = [&](mlir::Value value) {
+    if (!mlir::isa<mlir::RankedTensorType>(value.getType()) ||
+        concreteCount(value.getType()) == 0 || plan.materialized.contains(value)) return false;
+    auto found = expensive.find(value);
+    if (found != expensive.end()) return found->second;
+    auto *owner = value.getDefiningOp();
+    bool result = owner && ((mlir::isa<ReduceSumOp, ReduceMaxOp>(owner) &&
+        concreteCount(owner->getOperand(0).getType()) > concreteCount(value.getType())) ||
+        llvm::any_of(owner->getOperands(), hasReduction));
+    expensive[value] = result;
+    return result;
+  };
+  for (auto &op : graph.front()) {
+    if (!op.getNumResults() || !plan.live.contains(op.getResult(0)) ||
+        concreteCount(op.getResult(0).getType()) == 0) continue;
+    for (auto operand : op.getOperands())
+      if ((mlir::isa<MatmulOp>(op) || concreteCount(op.getResult(0).getType()) > concreteCount(operand.getType())) &&
+          hasReduction(operand)) {
+        plan.materialized.insert(operand);
+        expensive.clear();
+      }
+  }
+  for (auto &op : graph.front()) {
+    if (!op.getNumResults()) continue;
+    auto value = op.getResult(0);
+    if (!plan.materialized.contains(value) || concreteCount(value.getType()) <= 1) continue;
+    const uint64_t bytes = concreteCount(value.getType()) * elementByteWidth(value.getType());
+    // One malloc block, with every static subrange aligned for all ASK dtypes.
+    if (plan.bytes > limit - 7) return error("host reduction workspace size overflows the address range");
+    uint64_t offset = (plan.bytes + 7) & ~uint64_t(7);
+    if (bytes > limit - offset) return error("host reduction workspace size overflows the address range");
+    plan.offsets[value] = offset;
+    plan.bytes = offset + bytes;
+  }
+  return plan;
+}
+
 llvm::Error validateFunction(mlir::func::FuncOp function, bool supportsBF16) {
   if (function.isExternal() || !llvm::hasSingleElement(function.getBody()))
     return error("host lowering requires a defined single-block graph function");
@@ -254,6 +317,12 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       return error("unsupported module-level operation in host lowering");
     if (llvm::Error failure = validateFunction(graph, supportsBF16))
       return std::move(failure);
+    const unsigned pointerBits = result->getDataLayout().getPointerSizeInBits();
+    const uint64_t workspaceLimit = pointerBits < 64 ? (uint64_t(1) << pointerBits) - 1
+        : uint64_t(std::numeric_limits<int64_t>::max());
+    auto planned = planWorkspace(graph, workspaceLimit);
+    if (!planned) return planned.takeError();
+    const auto &workspacePlan = *planned;
 
     llvm::SmallVector<llvm::Type *> parameters;
     for (mlir::Type type : graph.getArgumentTypes())
@@ -329,6 +398,75 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     }
 
     llvm::json::Array fusedGroups;
+    llvm::Value *workspace = nullptr;
+    if (workspacePlan.bytes) {
+      auto *sizeType = builder.getIntPtrTy(result->getDataLayout());
+      workspace = builder.CreateCall(result->getOrInsertFunction("malloc",
+          llvm::FunctionType::get(pointer, {sizeType}, false)),
+          {llvm::ConstantInt::get(sizeType, workspacePlan.bytes)}, "workspace");
+      auto *ready = llvm::BasicBlock::Create(context, "workspace.ready", function);
+      auto *failed = llvm::BasicBlock::Create(context, "workspace.failed", function);
+      builder.CreateCondBr(builder.CreateICmpNE(workspace, llvm::ConstantPointerNull::get(pointer)), ready, failed);
+      builder.SetInsertPoint(failed);
+      auto *abort = builder.CreateCall(result->getOrInsertFunction("abort",
+          llvm::FunctionType::get(builder.getVoidTy(), {}, false)));
+      abort->setDoesNotReturn();
+      builder.CreateUnreachable();
+      builder.SetInsertPoint(ready);
+    }
+    llvm::DenseMap<mlir::Value, llvm::Value *> uniformValues, cachedBuffers;
+    auto load = [&](mlir::Value value, llvm::Value *offset) -> llvm::Value * {
+      llvm::Value *computed = arguments.lookup(value);
+      if (mlir::isa<mlir::RankedTensorType>(value.getType())) {
+        auto *type = llvmStorageType(value.getType(), context);
+        auto *address = builder.CreateGEP(type, computed, offset, "input.address");
+        computed = builder.CreateAlignedLoad(type, address,
+            llvm::Align(elementByteWidth(value.getType())), "input");
+        ++inputLoads;
+      }
+      if (elementType(value.getType()).isInteger(1))
+        computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
+      return computed;
+    };
+    auto bind = [&](lowering::ScalarEmitter &emitter) {
+      for (const auto &entry : uniformValues) emitter.bindUniform(entry.first, entry.second);
+      for (const auto &entry : cachedBuffers) emitter.bindBuffer(entry.first, entry.second);
+    };
+    for (auto &op : graph.front()) {
+      if (!op.getNumResults()) continue;
+      auto value = op.getResult(0);
+      if (!workspacePlan.live.contains(value)) continue;
+      const bool scalar = !mlir::isa<mlir::RankedTensorType>(value.getType());
+      if (!scalar && !workspacePlan.materialized.contains(value)) continue;
+      if (scalar || concreteCount(value.getType()) == 1) {
+        lowering::ScalarEmitter emitter(builder, function, false, load);
+        bind(emitter);
+        uniformValues[value] = emitter.emit(value, builder.getInt64(0));
+        reductionLoops += emitter.reductionLoops;
+        continue;
+      }
+      auto *address = builder.CreateGEP(builder.getInt8Ty(), workspace,
+          builder.getInt64(workspacePlan.offsets.lookup(value)), "cached.buffer");
+      auto *before = builder.GetInsertBlock();
+      auto *body = llvm::BasicBlock::Create(context, "materialize.loop", function);
+      auto *after = llvm::BasicBlock::Create(context, "materialize.done", function);
+      builder.CreateBr(body);
+      builder.SetInsertPoint(body);
+      auto *index = builder.CreatePHI(builder.getInt64Ty(), 2, "materialize.index");
+      index->addIncoming(builder.getInt64(0), before);
+      lowering::ScalarEmitter emitter(builder, function, false, load);
+      bind(emitter);
+      auto *computed = emitter.emit(value, index);
+      if (computed->getType()->isIntegerTy(1)) computed = builder.CreateZExt(computed, builder.getInt8Ty());
+      builder.CreateAlignedStore(computed, builder.CreateGEP(computed->getType(), address, index),
+          llvm::Align(elementByteWidth(value.getType())));
+      reductionLoops += emitter.reductionLoops;
+      auto *next = builder.CreateAdd(index, builder.getInt64(1));
+      index->addIncoming(next, builder.GetInsertBlock());
+      builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(concreteCount(value.getType()))), body, after);
+      builder.SetInsertPoint(after);
+      cachedBuffers[value] = address;
+    }
     for (const OutputBatch &batch : batches) {
       if (batch.count == 0) {
         emptyOutputs += batch.outputs.size();
@@ -353,20 +491,8 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       builder.SetInsertPoint(body);
       auto *index = builder.CreatePHI(builder.getInt64Ty(), 2, "i");
       index->addIncoming(builder.getInt64(0), before);
-      lowering::ScalarEmitter emitter(builder, function, false,
-          [&](mlir::Value value, llvm::Value *offset) -> llvm::Value * {
-        llvm::Value *computed = arguments.lookup(value);
-        if (mlir::isa<mlir::RankedTensorType>(value.getType())) {
-          auto *type = llvmStorageType(value.getType(), context);
-          auto *address = builder.CreateGEP(type, computed, offset, "input.address");
-          computed = builder.CreateAlignedLoad(type, address,
-              llvm::Align(elementByteWidth(value.getType())), "input");
-          ++inputLoads;
-        }
-        if (elementType(value.getType()).isInteger(1))
-          computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
-        return computed;
-      });
+      lowering::ScalarEmitter emitter(builder, function, false, load);
+      bind(emitter);
       // The memo is shared only within this iteration of the same-shape batch.
       // Every public output still gets its own store under the existing noalias
       // contract, including repeated returns of the same logical value.
@@ -384,6 +510,9 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(batch.count)), body, after);
       builder.SetInsertPoint(after);
     }
+    if (workspace)
+      builder.CreateCall(result->getOrInsertFunction("free",
+          llvm::FunctionType::get(builder.getVoidTy(), {pointer}, false)), {workspace});
     builder.CreateRetVoid();
     unsigned bufferAlignment = 1;
     for (auto type : graph.getArgumentTypes())
@@ -402,6 +531,8 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
             {"fused_output_groups", int64_t(fusedOutputGroups)},
             {"input_load_count", int64_t(inputLoads)},
             {"reduction_loop_count", int64_t(reductionLoops)},
+            {"temporary_workspace_bytes", int64_t(workspacePlan.bytes)},
+            {"materialized_tensor_count", int64_t(cachedBuffers.size())},
             {"zero_element_outputs", int64_t(emptyOutputs)},
             {"groups", std::move(fusedGroups)}}}});
     totalLoops += loopCount;
