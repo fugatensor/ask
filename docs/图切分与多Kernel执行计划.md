@@ -43,6 +43,7 @@ CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。
 ```
 
 - `buffers` 中 ID 唯一，形状为具体的非负整数维度，类型取 ASK 六种基础类型。缓冲区连续、行优先，字节数由形状和类型推导。
+- 公开标量与跨步骤标量均以 `shape=[]` 的单元素设备缓冲区传递，保持自有 CUDA 的指针 ABI；返回的标量常量也由 owned 步骤写出。
 - 顶层 `inputs`、`outputs` 的顺序就是公开张量 ABI。输出可引用输入，也可重复引用同一缓冲区；这些别名端口须绑定同一存储。
 - `steps` 按执行顺序排列。每个结果只有一个生产者，输入来自图输入或更早步骤，`depends_on` 须恰好列出这些输入的生产者。内部常量保留在子图中。
 - `function` 指向切分 MLIR 中的函数，步骤输入输出的形状、类型必须逐项匹配实际编译 kernel 的端口。外部步骤的 `external_id` 指回原始算子，便于关联源码和报告失败原因。

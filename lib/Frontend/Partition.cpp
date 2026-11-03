@@ -85,9 +85,7 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
     return original.emitError("CUDA partitioning requires exactly one graph function");
   auto function = functions.front();
   auto returned = cast<func::ReturnOp>(function.front().getTerminator());
-  for (Type type : llvm::concat<const Type>(function.getArgumentTypes(), function.getResultTypes()))
-    if (!isa<RankedTensorType>(type))
-      return function.emitError("CUDA partition ports must be static ranked tensors; use tensor<...> for 0-D scalars");
+  llvm::DenseSet<Value> publicOutputs(returned.getOperands().begin(), returned.getOperands().end());
 
   std::vector<Partition> parts;
   // Scalar constants can be cloned into their consumer. Scalar values derived
@@ -101,6 +99,9 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
   };
   for (Operation &operation : function.front()) {
     if (isa<func::ReturnOp>(operation)) continue;
+    const bool runtimeComputed = llvm::any_of(operation.getResultTypes(), [](Type type) {
+          return isa<RankedTensorType>(type);
+        }) || llvm::any_of(operation.getOperands(), [&](Value value) { return runtimeValues.contains(value); });
     if (auto external = dyn_cast<ExternalOp>(operation)) {
       for (Type type : llvm::concat<const Type>(external->getOperandTypes(), external->getResultTypes()))
         if (!isa<RankedTensorType>(type))
@@ -110,8 +111,8 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
     } else if (auto matmul = dyn_cast<MatmulOp>(operation)) {
       parts.push_back({{&operation}, "library", {}, matmul});
       runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
-    } else if (llvm::any_of(operation.getResultTypes(), [](Type type) { return isa<RankedTensorType>(type); }) ||
-               llvm::any_of(operation.getOperands(), [&](Value value) { return runtimeValues.contains(value); })) {
+    } else if (runtimeComputed || llvm::any_of(operation.getResults(),
+                   [&](Value value) { return publicOutputs.contains(value); })) {
       if (parts.empty() || parts.back().kind != "owned") parts.emplace_back();
       // A reduction can fuse into same-sized consumers. Expanding its result
       // would repeat the reduction for each expanded element, so materialize
@@ -124,7 +125,8 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
           }))
         parts.emplace_back();
       parts.back().operations.push_back(&operation);
-      runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
+      if (runtimeComputed)
+        runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
       const auto current = parts.size() - 1;
       const bool reducesMultipleElements = isa<ReduceSumOp, ReduceMaxOp>(operation) &&
           elementCount(operation.getOperand(0).getType()) > elementCount(operation.getResult(0).getType());

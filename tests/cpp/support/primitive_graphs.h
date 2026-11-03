@@ -68,4 +68,23 @@ inline std::string reductionExpansion(int64_t extent, bool reduceAxis, const std
       "%y = \"ask.broadcast_in_dim\"(%r) {shape = " + dimensions(expandedShape) + ", dimensions = " + mapping + "} : (" + reduced + ") -> " + output + "\n"
       "return %y : " + output + " } }";
 }
+inline std::string scalarReductionExpansion(int64_t inputSize, int64_t outputSize, const std::string &operation) {
+  auto input = tensor({inputSize}, "f32"), output = tensor({outputSize}, "f32");
+  return "module { func.func @scalar_expansion(%x: " + input + ") -> " + output + " {\n"
+      "%r = \"ask." + operation + "\"(%x) {axes = array<i64: 0>} : (" + input + ") -> f32\n"
+      "%y = \"ask.splat\"(%r) {shape = " + dimensions({outputSize}) + "} : (f32) -> " + output + "\n"
+      "return %y : " + output + " } }";
+}
+inline std::string publicScalar(const std::string &dtype, bool constant) {
+  auto type = tensor({7}, dtype);
+  if (constant)
+    return "module { func.func @scalar_constant() -> " + dtype + " {\n"
+        "%c = \"ask.constant\"() {value = 2.0 : " + dtype + "} : () -> " + dtype + "\n"
+        "return %c : " + dtype + " } }";
+  return "module { func.func @scalar_ports(%x: " + type + ", %s: " + dtype + ") -> (" + type + ", " + dtype + ") {\n"
+      "%b = \"ask.splat\"(%s) {shape = array<i64: 7>} : (" + dtype + ") -> " + type + "\n"
+      "%y = \"ask.add\"(%x, %b) : (" + type + ", " + type + ") -> " + type + "\n"
+      "%z = \"ask.exp\"(%s) : (" + dtype + ") -> " + dtype + "\n"
+      "return %y, %z : " + type + ", " + dtype + " } }";
+}
 }
