@@ -89,7 +89,7 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 | `"i64"` | `i64` | 8 Bytes | `i64` | 64 位有符号二补数整数。 |
 | `"f32"` | `f32` | 4 Bytes | `float` | IEEE-754 binary32，自有代码生成默认关闭浮点乘加收缩（`fp-contract=off`）。 |
 | `"f16"` | `f16` | 2 Bytes | `half` | IEEE-754 binary16（5 位指数 + 10 位尾数）。 |
-| `"bf16"` | `bf16` | 2 Bytes | `bfloat` | bfloat16（8 位指数 + 7 位尾数）；要求执行硬件支持（CUDA `sm_80+` 或支持原生 `bf16` 的 CPU）。 |
+| `"bf16"` | `bf16` | 2 Bytes | `bfloat` | bfloat16（8 位指数 + 7 位尾数）；执行目标为 CUDA `sm_80+`。Host 代码生成拒绝含 `bf16` 的图。 |
 
 `ask.constant` 的 `f16`、`bf16`、`f32` 字面量采用单步最近偶数舍入（RNE），直接舍入到目标位宽，避免先转 `f32` 再截断到 `f16`/`bf16` 的双重舍入误差，并保留 `-0.0`、`±inf` 和 `NaN`。FugaTensor 的[数值编码](../../fugatensor/src/fugatensor/_ask/numerics.py)按同一规则将 Python 输入转换为目标格式，再由内部图桥接层输出 ASK IR。
 

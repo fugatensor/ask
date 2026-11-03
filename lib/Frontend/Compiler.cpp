@@ -13,6 +13,7 @@
 #include "llvm/Support/Format.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/IR/Metadata.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 
 namespace ask {
 namespace {
@@ -151,8 +152,7 @@ llvm::json::Object compilerCapabilities() {
       {"native_execution_plan", true}, {"cuda_graph_replay", true},
       {"supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
       {"explicit_cast", true}, {"mixed_precision", true},
-      {"host_bf16_hardware_supported", bool(ASK_WITH_HOST) && nativeHostSupportsBF16()},
-      {"host_supported_element_types", ASK_WITH_HOST ? json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"} : json::Array{}},
+      {"host_supported_element_types", ASK_WITH_HOST ? json::Array{"bool", "i32", "i64", "f32", "f16"} : json::Array{}},
       {"gpu_supported_element_types", json::Array{"bool", "i32", "i64", "f32", "f16", "bf16"}},
       {"compiler_interface", "c++"}, {"python_bindings_enabled", false},
       {"native_prepare", true}, {"native_codegen", true}, {"native_cuda_runtime", true}, {"device_tensors", true},
@@ -162,7 +162,8 @@ llvm::json::Object compilerCapabilities() {
 namespace {
 template <typename Emit>
 llvm::Expected<PreparedSource> processSource(llvm::StringRef source, bool optimize,
-                                           const OptimizationOptions &options, Emit emit) {
+                                           const OptimizationOptions &options, Emit emit,
+                                           llvm::function_ref<llvm::Error(mlir::ModuleOp)> validate = {}) {
   mlir::DialectRegistry registry;
   registry.insert<ASKDialect, mlir::func::FuncDialect>();
   mlir::MLIRContext context(registry);
@@ -174,9 +175,12 @@ llvm::Expected<PreparedSource> processSource(llvm::StringRef source, bool optimi
   auto module = mlir::parseSourceFile<mlir::ModuleOp>(sources, &context);
   PreparedSource result;
   result.report = llvm::json::Object{{"schema_version", 1}};
-  if (!module || mlir::failed(mlir::verify(*module)) ||
-      mlir::failed(optimize ? optimizeModule(*module, result.report, options)
-                            : prepareModule(*module, result.report)))
+  if (!module || mlir::failed(mlir::verify(*module)))
+    return llvm::createStringError(llvm::inconvertibleErrorCode(), diagnostics);
+  if (validate)
+    if (auto error = validate(*module)) return std::move(error);
+  if (mlir::failed(optimize ? optimizeModule(*module, result.report, options)
+                           : prepareModule(*module, result.report)))
     return llvm::createStringError(llvm::inconvertibleErrorCode(), diagnostics);
   result.report["phase"] = optimize ? "optimized" : "prepared";
   result.report["external_requests"] = externalRequests(*module, &result.floatPaths);
@@ -232,6 +236,9 @@ llvm::Expected<PreparedSource> codegenSource(llvm::StringRef source,
       result.report["phase"] = options.target == CodegenTarget::HostObject ? "host_object" : "host_llvm";
     }
     return Error::success();
+  }, [&](mlir::ModuleOp module) {
+    return options.target == CodegenTarget::CUDALLVM ? Error::success()
+                                                   : validateHostElementTypes(module);
   });
 }
 } // namespace ask

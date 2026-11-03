@@ -22,7 +22,7 @@
 
 ## 2. 编译与执行能力
 
-- 六种显式类型、单步 RNE 常量和 6×6 转换；CPU/GPU 目标支持时使用原生 `bf16`。
+- 六种显式类型、单步 RNE 常量和 6×6 转换；Host 执行使用 `bool/i32/i64/f32/f16`，`bf16` 执行使用 CUDA `sm_80+`。
 - C++ `ASK::Compiler`、`ASK::Runtime`、`ASK::Core` 与 `ask-opt`；形状推导、溯源提取、自有常量折叠、DCE 和逐元素融合。
 - 自有 Host 共享循环 `.o` 与 CUDA cubin 代码生成；多端口、0-D 张量和空张量。
 - 广播、转置、归约、条件选择及浮点函数；CUDA 矩阵乘法使用 cuBLASLt，CPU 使用 Host 降级。

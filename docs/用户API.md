@@ -40,7 +40,7 @@ module attributes {ask.schema_version = 1 : i64} {
 }
 ```
 
-类型包括 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 写作 `i1`。类型转换用 `ask.cast`，标量填充用 `ask.splat`，执行前所有形状须确定。`tensor<f32>` 是通过指针传递的单元素 0-D 张量；Host 标量 `f32` 输入按值传递。舍入和溯源规则见 [ASK IR](ASK-IR与数值语义.md)。
+IR 类型包括 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 写作 `i1`。Host 使用前五种类型；`bf16` 的执行目标为 CUDA `sm_80+`。类型转换用 `ask.cast`，标量填充用 `ask.splat`，执行前所有形状须确定。`tensor<f32>` 是通过指针传递的单元素 0-D 张量；Host 标量 `f32` 输入按值传递。舍入和溯源规则见 [ASK IR](ASK-IR与数值语义.md)。
 
 形状变化使用 `ask.reshape`，例如 `"ask.reshape"(%x) {shape = array<i64: 2, 2>} : (tensor<4xi32>) -> tensor<2x2xi32>`。输入输出保持相同元素类型、总数和连续次序；目标形状中的 `-1` 须先由调用方解析。外部 kernel 会接收变换后的 `2×2` 端口。
 

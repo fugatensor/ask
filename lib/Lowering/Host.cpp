@@ -27,23 +27,6 @@
 #include <mutex>
 
 namespace ask {
-bool hostSupportsBF16(llvm::StringRef architecture, const llvm::StringMap<bool> &features) {
-  auto enabled = [&](llvm::StringRef feature) {
-    auto it = features.find(feature);
-    return it != features.end() && it->second;
-  };
-  // AMX-BF16 alone supplies matrix dot products, not the scalar/vector format
-  // conversions used by this backend. Do not infer support from its name.
-  if (architecture == "x86_64" || architecture == "i386")
-    return enabled("avx512bf16") || enabled("avxneconvert");
-  if (architecture == "aarch64" || architecture == "aarch64_be")
-    return enabled("bf16");
-  return false;
-}
-bool nativeHostSupportsBF16() {
-  llvm::Triple triple(llvm::sys::getProcessTriple());
-  return hostSupportsBF16(triple.getArchName(), llvm::sys::getHostCPUFeatures());
-}
 namespace {
 llvm::Error error(llvm::Twine message) {
   return llvm::createStringError(llvm::inconvertibleErrorCode(), message.str());
@@ -254,12 +237,10 @@ llvm::Expected<WorkspacePlan> planWorkspace(mlir::func::FuncOp graph, uint64_t l
   return plan;
 }
 
-llvm::Error validateFunction(mlir::func::FuncOp function, bool supportsBF16) {
+llvm::Error validateFunction(mlir::func::FuncOp function) {
   if (function.isExternal() || !llvm::hasSingleElement(function.getBody()))
     return error("host lowering requires a defined single-block graph function");
   for (mlir::Type type : function.getArgumentTypes()) {
-    if (elementType(type).isBF16() && !supportsBF16)
-      return error("bf16 requires hardware support; this native CPU does not report a supported BF16 instruction feature");
     auto count = elementCount(type);
     if (!count)
       return count.takeError();
@@ -270,8 +251,6 @@ llvm::Error validateFunction(mlir::func::FuncOp function, bool supportsBF16) {
     if (!isPureComputeOperation(&op) && !mlir::isa<mlir::func::ReturnOp>(op))
       return error("unsupported host graph operation " + op.getName().getStringRef());
     for (mlir::Type type : op.getResultTypes()) {
-      if (elementType(type).isBF16() && !supportsBF16)
-        return error("bf16 requires hardware support; this native CPU does not report a supported BF16 instruction feature");
       auto count = elementCount(type);
       if (!count)
         return count.takeError();
@@ -290,6 +269,20 @@ llvm::Error validateFunction(mlir::func::FuncOp function, bool supportsBF16) {
 }
 } // namespace
 
+llvm::Error validateHostElementTypes(mlir::ModuleOp module) {
+  auto bf16 = [](mlir::Type type) { return elementType(type).isBF16(); };
+  auto result = module.walk([&](mlir::Operation *op) {
+    if (auto function = mlir::dyn_cast<mlir::func::FuncOp>(op))
+      if (llvm::any_of(function.getArgumentTypes(), bf16) ||
+          llvm::any_of(function.getResultTypes(), bf16))
+        return mlir::WalkResult::interrupt();
+    return llvm::any_of(op->getResultTypes(), bf16)
+        ? mlir::WalkResult::interrupt() : mlir::WalkResult::advance();
+  });
+  return result.wasInterrupted() ? error("bf16 is not supported by the Host backend")
+                                 : llvm::Error::success();
+}
+
 llvm::Expected<std::unique_ptr<llvm::Module>>
 lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
                 llvm::json::Object &abiReport) {
@@ -297,10 +290,10 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     return error("host code generation was disabled at build time");
   if (mlir::failed(mlir::verify(source)))
     return error("cannot lower invalid ASK IR");
+  if (auto failure = validateHostElementTypes(source)) return std::move(failure);
   auto target = makeHostMachine();
   if (!target)
     return target.takeError();
-  const bool supportsBF16 = nativeHostSupportsBF16();
   auto result = std::make_unique<llvm::Module>("ask.host", context);
   result->setTargetTriple((*target)->getTargetTriple());
   result->setDataLayout((*target)->createDataLayout());
@@ -315,7 +308,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     auto graph = mlir::dyn_cast<mlir::func::FuncOp>(op);
     if (!graph)
       return error("unsupported module-level operation in host lowering");
-    if (llvm::Error failure = validateFunction(graph, supportsBF16))
+    if (llvm::Error failure = validateFunction(graph))
       return std::move(failure);
     const unsigned pointerBits = result->getDataLayout().getPointerSizeInBits();
     const uint64_t workspaceLimit = pointerBits < 64 ? (uint64_t(1) << pointerBits) - 1
@@ -552,7 +545,6 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
                                 {"data_layout", result->getDataLayoutStr()},
                                 {"target_cpu", (*target)->getTargetCPU().str()},
                                 {"target_features", (*target)->getTargetFeatureString().str()},
-                                {"bf16_hardware_supported", supportsBF16},
                                 {"bool_storage", "one-byte-zero-or-one"},
                                 {"cast_semantics", "rne-saturating-fptosi-nan-zero-v1"},
                                 {"functions", std::move(functions)},

@@ -179,6 +179,47 @@ void checkReshape(bool host) {
   checkDiagnostics(typedPlan.diagnosticsJSON);
   checkDiagnostics(typedPreparation.diagnosticsJSON);
 }
+
+void checkHostTypes(const std::string &capabilities, const std::string &objectPath) {
+  using namespace ask::compiler;
+  require(capabilities.find("\"host_supported_element_types\":[\"bool\",\"i32\",\"i64\",\"f32\",\"f16\"]") != std::string::npos,
+          "Host type capabilities disagree with its dtype boundary");
+  for (const std::string type : {"bf16", "tensor<bf16>", "tensor<0xbf16>", "tensor<2xbf16>"}) {
+    const std::string graph = "module { func.func @identity(%x: " + type + ") -> " + type +
+        " { return %x : " + type + " } }";
+    for (const auto target : {CodegenTarget::HostLLVM, CodegenTarget::HostObject})
+      for (bool optimize : {false, true}) {
+        CodegenOptions options;
+        options.target = target;
+        options.optimize = optimize;
+        if (target == CodegenTarget::HostObject) options.outputPath = objectPath;
+        bool rejected = false;
+        try { codegen(graph, options); }
+        catch (const std::runtime_error &error) {
+          rejected = std::string(error.what()).find("bf16 is not supported by the Host backend") != std::string::npos;
+        }
+        require(rejected, "Host codegen accepted a bf16 graph");
+      }
+    CodegenOptions cuda;
+    cuda.target = CodegenTarget::CUDALLVM;
+    cuda.architecture = 86;
+    require(!codegen(graph, cuda).ir.empty(), "CUDA bf16 support changed with the Host boundary");
+  }
+  // A constant fold or DCE must not erase an unsupported input graph's dtype.
+  for (bool returned : {false, true}) {
+    const std::string graph = "module { func.func @constant(%x: f32) -> f32 { "
+        "%b = \"ask.constant\"() {value = 1.0 : bf16} : () -> bf16 "
+        "%f = \"ask.cast\"(%b) : (bf16) -> f32 return " +
+        std::string(returned ? "%f" : "%x") + " : f32 } }";
+    bool rejected = false;
+    try { codegen(graph, {}); }
+    catch (const std::runtime_error &error) {
+      rejected = std::string(error.what()).find("bf16 is not supported by the Host backend") != std::string::npos;
+    }
+    require(rejected, "Host optimization bypassed its bf16 dtype boundary");
+    require(!prepare(graph).ir.empty(), "target-independent preparation rejected bf16");
+  }
+}
 } // namespace
 
 // Compiler-only consumer: the public facade exposes no LLVM/MLIR or Python type.
@@ -202,6 +243,7 @@ int main(int argc, char **argv) {
     checkReshape(capabilities.find("\"host_codegen\":true") != std::string::npos);
     require(std::ifstream(ask::compilerLibraryPath()).good(), "loaded compiler library is not identifiable");
     if (capabilities.find("\"host_codegen\":true") != std::string::npos) {
+      checkHostTypes(capabilities, argv[1]);
       auto host = ask::codegenJSON(source, "host-llvm");
       require(host.second.find("\"abi\"") != std::string::npos, "missing Host ABI");
       auto object = ask::codegenJSON(source, "host-object", argv[1]);
