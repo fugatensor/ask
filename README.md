@@ -21,7 +21,7 @@ ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态�
 
 ## 构建、安装与验证
 
-构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)；CMake 按 [Rin 提交记录](cmake/rin.lock.json)获取 C++ 头文件证明器。执行规则位于 ASK 的 [`rules/pass/`](rules/pass/)，用途见[计划校验](docs/规则证明与计划校验.md)。下载脚本使用 Python 3 标准库。
+构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)。执行计划由 ASK 自有 C++ 静态校验器检查，用途见[计划校验](docs/规则证明与计划校验.md)。下载脚本使用 Python 3 标准库。
 
 ```bash
 python3 tools/fetch_deps.py

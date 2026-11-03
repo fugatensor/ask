@@ -27,7 +27,7 @@ int main() {
     }
     {
       // Both logical buffers are eventually produced; the first step still
-      // reads buffer 1 before its producer, which the Rin proof must reject.
+      // reads buffer 1 before its producer, which plan validation must reject.
       auto early = steps[0];
       early.inputs = {1}; early.outputs = {2};
       early.arguments = {{1, {}}, {2, {}}};
@@ -37,7 +37,7 @@ int main() {
       bool rejected = false;
       try { session->prepareProgram({16, 16, 16}, {0}, {2}, {early, producer}, false); }
       catch (const CUDAError &error) {
-        rejected = std::string(error.what()).find("ASK execution plan proof failed") != std::string::npos;
+        rejected = std::string(error.what()).find("ASK execution plan validation failed") != std::string::npos;
       }
       if (!rejected) return 1;
     }

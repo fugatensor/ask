@@ -571,7 +571,7 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
     std::vector<std::size_t> sizes,std::vector<std::size_t> inputs,
     std::vector<std::size_t> outputs,std::vector<PlanStep> steps,bool graph) {
   auto &s=*impl->state;
-  pass::AllocationPlan proof;
+  pass::AllocationPlan allocation;
   const std::size_t noSlot=std::numeric_limits<std::size_t>::max();
   std::vector<std::size_t> slotOfBuffer, scratch(steps.size(),noSlot);
   std::vector<std::shared_ptr<detail::CUBLASLtMatmul>> matmuls(steps.size());
@@ -584,8 +584,8 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
     std::set<std::size_t> available;
     for(auto value:inputs) { index(value);require(available.insert(value).second,"program inputs must be unique"); }
     for(auto value:outputs) index(value);
-    proof.plan.public_inputs=inputs;proof.plan.public_outputs=outputs;
-    proof.buffer_sizes=sizes;
+    allocation.plan.public_inputs=inputs;allocation.plan.public_outputs=outputs;
+    allocation.buffer_sizes=sizes;
     for(std::size_t stepIndex=0;stepIndex<steps.size();++stepIndex) {
       const auto &step=steps[stepIndex];
       require(bool(step.kernel)!=bool(step.matmul),"program step requires one kernel or matmul description");
@@ -595,7 +595,7 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
         index(value);require(!available.count(value),"program step overwrites an existing logical buffer");
         require(ports.insert(value).second,"program step repeats or aliases an output");
       }
-      proof.plan.steps.push_back({step.inputs,step.outputs});
+      allocation.plan.steps.push_back({step.inputs,step.outputs});
       if(step.matmul) {
         require(step.inputs.size()==2 && step.outputs.size()==1 && step.arguments.empty(),
                 "matmul step requires two inputs, one output and no kernel arguments");
@@ -610,9 +610,9 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
           ++s.counters["matmul_preparations"];
           if(auto workspace=operation->workspaceBytes()) {
             // Scratch is a private logical buffer with this step's lifetime.
-            scratch[stepIndex]=proof.buffer_sizes.size();
-            proof.plan.steps.back().outputs.push_back(scratch[stepIndex]);
-            proof.buffer_sizes.push_back(workspace);
+            scratch[stepIndex]=allocation.buffer_sizes.size();
+            allocation.plan.steps.back().outputs.push_back(scratch[stepIndex]);
+            allocation.buffer_sizes.push_back(workspace);
           }
           matmuls[stepIndex]=std::move(operation);
         }
@@ -636,40 +636,40 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
       available.insert(step.outputs.begin(),step.outputs.end());
     }
     require(available.size()==sizes.size(),"program contains an undefined buffer");
-    proof.plan.buffer_count=proof.buffer_sizes.size();
-    slotOfBuffer.assign(proof.plan.buffer_count,noSlot);
+    allocation.plan.buffer_count=allocation.buffer_sizes.size();
+    slotOfBuffer.assign(allocation.plan.buffer_count,noSlot);
     // Strictly separate same-stream lifetimes for tensors and library scratch.
-    std::vector<std::size_t> lastUse(proof.plan.buffer_count,0);
+    std::vector<std::size_t> lastUse(allocation.plan.buffer_count,0);
     for(std::size_t i=0;i<steps.size();++i) {
-      for(auto buffer:proof.plan.steps[i].inputs) lastUse[buffer]=std::max(lastUse[buffer],i);
-      for(auto buffer:proof.plan.steps[i].outputs) lastUse[buffer]=std::max(lastUse[buffer],i);
+      for(auto buffer:allocation.plan.steps[i].inputs) lastUse[buffer]=std::max(lastUse[buffer],i);
+      for(auto buffer:allocation.plan.steps[i].outputs) lastUse[buffer]=std::max(lastUse[buffer],i);
     }
     std::set<std::size_t> publicPorts(inputs.begin(),inputs.end());
     publicPorts.insert(outputs.begin(),outputs.end());
     std::vector<std::size_t> slotLastUse;
     for(std::size_t i=0;i<steps.size();++i)
-      for(auto buffer:proof.plan.steps[i].outputs) {
+      for(auto buffer:allocation.plan.steps[i].outputs) {
         if(publicPorts.count(buffer)) continue;
         std::size_t slot=0;
         while(slot<slotLastUse.size() && slotLastUse[slot]>=i) ++slot;
         if(slot==slotLastUse.size()) {
           slotLastUse.push_back(lastUse[buffer]);
-          proof.slot_capacity_bytes.push_back(proof.buffer_sizes[buffer]);
+          allocation.slot_capacity_bytes.push_back(allocation.buffer_sizes[buffer]);
         } else {
           slotLastUse[slot]=lastUse[buffer];
-          proof.slot_capacity_bytes[slot]=std::max(proof.slot_capacity_bytes[slot],proof.buffer_sizes[buffer]);
+          allocation.slot_capacity_bytes[slot]=std::max(allocation.slot_capacity_bytes[slot],allocation.buffer_sizes[buffer]);
         }
         slotOfBuffer[buffer]=slot;
-        proof.assignments.push_back({buffer,slot});
+        allocation.assignments.push_back({buffer,slot});
       }
   }
-  auto decision=pass::checkAllocationPlan(proof);
-  require(decision.verdict==pass::Verdict::Pass,"ASK execution plan proof failed: "+decision.explanation);
+  auto decision=pass::checkAllocationPlan(allocation);
+  require(decision.verdict==pass::Verdict::Pass,"ASK execution plan validation failed: "+decision.explanation);
   std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   using Program=PreparedProgram::Impl;
   auto p=std::make_unique<Program>();p->session=shared_from_this();p->state=impl->state;
   p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
-  p->slotCapacities=std::move(proof.slot_capacity_bytes);
+  p->slotCapacities=std::move(allocation.slot_capacity_bytes);
   p->steps.reserve(steps.size());p->graph=graph && !steps.empty();
   std::map<std::size_t,unsigned> alignments;
   for(std::size_t i=0;i<steps.size();++i) {

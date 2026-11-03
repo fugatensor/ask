@@ -1,6 +1,6 @@
 返回核心思想：[框架分工](核心思想.md#ask-positioning) · [测试验证](核心思想.md#ask-testing-roadmap) · 相关细节：[ASK IR](ASK-IR与数值语义.md) · [外部执行接口](外部产物与执行接口.md) · [FugaTensor 架构](../../fugatensor/docs/architecture/README.md)
 
-# FugaTensor、ASK 与 Rin 的职责
+# FugaTensor 与 ASK 的职责
 
 <a id="division-of-labor"></a>
 
@@ -33,14 +33,13 @@
 
 <a id="roadmap"></a>
 
-## 3. 三个项目的依赖方向
+## 3. 构建依赖方向
 
 | 项目 | 提供的接口 | 构建时消费 |
 | --- | --- | --- |
 | FugaTensor | Python Tensor API、Fuga IR、自动微分、第三方 worker | ASK 安装包中的 `Compiler`、`Runtime`，以及 nanobind |
-| ASK | C++ 编译器、设备运行时、执行计划规则 | LLVM/MLIR 和 Rin；CUDA matmul 可选 cuBLASLt 头文件，执行规则位于 `rules/pass/` |
-| Rin | 通用规则语言和证明器 | C++ 标准库 |
+| ASK | C++ 编译器、设备运行时、执行计划校验 | LLVM/MLIR；CUDA matmul 可选 cuBLASLt 头文件 |
 
-FugaTensor 先通过 Fuga IR 完成图变换，再向 ASK 提交静态图。ASK 构建计划并验证缓冲区与存储槽位，Rin 根据 ASK 提供的事实和规则求证。各项目的领域知识随所属项目维护：Tensor 与微分规则在 FugaTensor，执行计划与槽位规则在 ASK，推理引擎在 Rin。
+FugaTensor 先通过 Fuga IR 完成图变换，再向 ASK 提交静态图。ASK 构建计划，通过自有 C++ 校验器检查缓冲区与存储槽位。Tensor 与微分规则由 FugaTensor 维护，执行计划与槽位约束由 ASK 维护。
 
-先安装 ASK SDK，再用 `CMAKE_PREFIX_PATH` 构建 FugaTensor。ASK 的 CMake 从锁文件获取 Rin，也可通过 `ASK_RIN_SOURCE_DIR` 选择本地源码。接口和依赖详情见[前端接入](前端接入与构建配置.md#native-compiler)与[证明器构建](规则证明与计划校验.md#build-dependency)。
+先安装 ASK SDK，再用 `CMAKE_PREFIX_PATH` 构建 FugaTensor。接口和依赖详情见[前端接入](前端接入与构建配置.md#native-compiler)与[计划校验构建](规则证明与计划校验.md#build-dependency)。

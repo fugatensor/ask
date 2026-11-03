@@ -45,23 +45,6 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# The header-only Rin proof engine is private to ASK's PASS implementation.
-include(FetchContent)
-set(ASK_RIN_SOURCE_DIR "" CACHE PATH "Use a local Rin checkout for development")
-file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/rin.lock.json" ASK_RIN_LOCK)
-string(JSON ASK_RIN_REPOSITORY GET "${ASK_RIN_LOCK}" repository)
-string(JSON ASK_RIN_COMMIT GET "${ASK_RIN_LOCK}" commit)
-if(ASK_RIN_SOURCE_DIR)
-  FetchContent_Declare(rin SOURCE_DIR "${ASK_RIN_SOURCE_DIR}")
-else()
-  FetchContent_Declare(rin GIT_REPOSITORY "${ASK_RIN_REPOSITORY}"
-    GIT_TAG "${ASK_RIN_COMMIT}" GIT_SHALLOW FALSE)
-endif()
-FetchContent_MakeAvailable(rin)
-if(NOT TARGET Rin::Pass)
-  message(FATAL_ERROR "Rin dependency must provide Rin::Pass")
-endif()
-
 set(ASK_WITH_HOST 0)
 if(ASK_TARGET_BACKENDS STREQUAL "host")
   set(ASK_WITH_HOST 1)
@@ -110,22 +93,11 @@ target_include_directories(ask_compiler PUBLIC
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_link_libraries(ask_compiler PRIVATE ASK::Core ${CMAKE_DL_LIBS})
 
-set(ASK_PASS_RULE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rules/pass")
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-  "${ASK_PASS_RULE_DIR}/plan_availability.rin"
-  "${ASK_PASS_RULE_DIR}/allocation_plan.rin")
-file(READ "${ASK_PASS_RULE_DIR}/plan_availability.rin" ASK_PLAN_AVAILABILITY_RULES)
-file(READ "${ASK_PASS_RULE_DIR}/allocation_plan.rin" ASK_ALLOCATION_PLAN_RULES)
-file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass")
-configure_file(lib/Pass/Rules.h.in "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass/Rules.h" @ONLY)
-
 add_library(ask_pass STATIC lib/Pass/Pass.cpp)
 add_library(ASK::Pass ALIAS ask_pass)
 set_target_properties(ask_pass PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_compile_features(ask_pass PUBLIC cxx_std_17)
 target_include_directories(ask_pass PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/lib/Pass>)
-target_include_directories(ask_pass PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated/ask/Pass")
-target_link_libraries(ask_pass PRIVATE Rin::Pass)
 
 add_library(ask_runtime SHARED lib/Runtime/CUDA.cpp lib/Runtime/CUBLASLt.cpp)
 add_library(ASK::Runtime ALIAS ask_runtime)
@@ -150,7 +122,7 @@ else()
   target_compile_definitions(ask_runtime PRIVATE ASK_WITH_CUBLASLT=0)
 endif()
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_CXX_COMPILER_ID MATCHES "^(GNU|Clang)$")
-  # The proof engine is an implementation detail of the Runtime shared ABI.
+  # Plan validation is an implementation detail of the Runtime shared ABI.
   target_link_options(ask_runtime PRIVATE "LINKER:--exclude-libs,ALL")
 endif()
 
@@ -178,7 +150,6 @@ foreach(component Core Compiler Runtime)
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT ${component})
 endforeach()
 install(FILES cmake/llvm.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
-install(FILES cmake/rin.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 
 option(ASK_TEST_CUDA "Run hardware CUDA runtime tests (requires an NVIDIA GPU)" OFF)
 if(BUILD_TESTING)
@@ -211,9 +182,4 @@ if(BUILD_TESTING)
 endif()
 
 message(STATUS "ASK target backends: ${ASK_TARGET_BACKENDS}; LLVM/MLIR ${LLVM_PACKAGE_VERSION}")
-if(ASK_RIN_SOURCE_DIR)
-  message(STATUS "ASK Rin proof engine: local headers at ${rin_SOURCE_DIR}")
-else()
-  message(STATUS "ASK Rin proof engine: ${ASK_RIN_COMMIT}")
-endif()
 message(STATUS "ASK interfaces: native Compiler, Runtime and Core; no Python build dependency")

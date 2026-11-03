@@ -6,10 +6,10 @@
 
 namespace ask::pass {
 
-enum class Verdict { Pass, Fail, Unknown, Error };
+enum class Verdict { Pass, Fail };
 
 struct Decision {
-  Verdict verdict = Verdict::Error;
+  Verdict verdict = Verdict::Fail;
   std::string explanation;
 };
 
@@ -40,13 +40,12 @@ struct AllocationPlan {
 };
 
 // Rejects a plan unless every read and public output is available in the
-// declared single-stream order. FAIL means an obligation was not proved.
+// declared single-stream order. Fail reports the violated plan constraints.
 Decision checkPlan(const Plan &plan);
 
-// Includes all checkPlan obligations, mapping completeness and capacity.
-// It proves consecutive lifetimes in producer order for each complete slot;
+// Includes all checkPlan constraints, mapping completeness and capacity.
+// Checks consecutive lifetimes in producer order for each complete slot;
 // strict separation of adjacent lifetimes implies every pair is disjoint.
-// UNKNOWN and ERROR also reject the candidate.
 Decision checkAllocationPlan(const AllocationPlan &allocation);
 
 } // namespace ask::pass

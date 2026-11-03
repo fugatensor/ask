@@ -1,6 +1,0 @@
-# Numeric facts are observations; Rin compares the values in each obligation.
-all b: internal, s: slot, required: byte_count, allocated: byte_count =>
-    assigned(b, s) & size(b, required) & capacity(s, allocated) & less_equal(required, allocated) -> fits(b, s)
-
-all a: internal, b: internal, s: slot, start: time, end: time, next: time, finish: time =>
-    adjacent(a, b) & assigned(a, s) & assigned(b, s) & lifetime(a, start, end) & lifetime(b, next, finish) & less(end, next) -> compatible(a, b)

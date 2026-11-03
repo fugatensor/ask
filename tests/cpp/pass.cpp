@@ -1,6 +1,8 @@
 #include "Pass.h"
+#include "support/plan_matrix.h"
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -11,6 +13,7 @@ using ask::pass::Decision;
 using ask::pass::Plan;
 using ask::pass::PlanStep;
 using ask::pass::Verdict;
+namespace matrix = ask::test::plan_matrix;
 
 void expect(const Decision &decision, Verdict verdict, const char *caseName) {
   if (decision.verdict != verdict)
@@ -18,52 +21,74 @@ void expect(const Decision &decision, Verdict verdict, const char *caseName) {
 }
 
 Plan chain(std::size_t steps) {
-  Plan plan;
-  plan.buffer_count = steps + 1;
-  plan.public_inputs = {0};
-  plan.public_outputs = {steps};
-  for (std::size_t index = 0; index < steps; ++index)
-    plan.steps.push_back(PlanStep{{index}, {index + 1}});
-  return plan;
+  return matrix::plan(matrix::Topology::Chain, steps);
 }
 
-void allocationMatrix() {
-  // Enumerate assignments independently of the runtime allocator. The oracle
-  // checks every interval pair, while production proves adjacent intervals.
-  for (std::size_t count : {2, 4, 6})
-    for (std::size_t bytes : {0, 1, 16})
-      for (bool delayedRead : {false, true})
-        for (bool shortCapacity : {false, true}) {
-          auto plan = chain(count);
-          if (delayedRead) plan.steps.back().inputs.push_back(1);
-          for (std::size_t mask = 0; mask < (std::size_t{1} << (count - 1)); ++mask) {
-            AllocationPlan allocation{plan, std::vector<std::size_t>(count + 1, bytes), {}, {}};
+std::size_t allocationMatrix() {
+  std::size_t cases = 0;
+  const std::size_t sizes[] = {0, 1, 16, std::numeric_limits<std::size_t>::max()};
+  for (auto topology : matrix::topologies)
+    for (std::size_t count : {2, 4, 6})
+      for (auto bytes : sizes)
+        for (bool delayedRead : {false, true})
+          for (bool shortCapacity : {false, true}) {
+            auto plan = matrix::plan(topology, count);
+            if (delayedRead) plan.steps.back().inputs.push_back(1);
             const auto capacity = shortCapacity && bytes ? bytes - 1 : bytes;
-            bool used[2] = {};
-            for (std::size_t b = 1; b < count; ++b) used[(mask >> (b - 1)) & 1] = true;
-            std::size_t slots[2] = {}, slotCount = 0;
-            for (int i = 0; i < 2; ++i) if (used[i]) slots[i] = slotCount++;
-            allocation.slot_capacity_bytes.assign(slotCount, capacity);
-            for (std::size_t b = 1; b < count; ++b)
-              allocation.assignments.push_back({b, slots[(mask >> (b - 1)) & 1]});
-            bool valid = capacity >= bytes;
-            for (std::size_t a = 1; a < count; ++a)
-              for (std::size_t b = a + 1; b < count; ++b) {
-                if (allocation.assignments[a - 1].slot != allocation.assignments[b - 1].slot) continue;
-                auto end = delayedRead && a == 1 ? count - 1 : a;
-                if (end >= b - 1) valid = false;
-              }
-            expect(ask::pass::checkAllocationPlan(allocation), valid ? Verdict::Pass : Verdict::Fail,
-                   "generated allocation matrix");
-            if (valid) expect(ask::pass::checkAllocationPlan(allocation), Verdict::Pass, "cached plan");
+            for (std::size_t mask = 0; mask < (std::size_t{1} << (count - 1)); ++mask) {
+              const auto allocation = matrix::mapping(plan, bytes, capacity, mask);
+              const auto valid = matrix::valid(allocation);
+              expect(ask::pass::checkAllocationPlan(allocation), valid ? Verdict::Pass : Verdict::Fail,
+                     "generated allocation matrix");
+              if (valid) expect(ask::pass::checkAllocationPlan(allocation), Verdict::Pass, "cached plan");
+              ++cases;
+            }
           }
+  return cases;
+}
+
+std::size_t cacheMutationMatrix() {
+  std::size_t cases = 0;
+  const std::size_t sizes[] = {1, 16, std::numeric_limits<std::size_t>::max() - 1};
+  for (auto topology : matrix::topologies)
+    for (std::size_t count : {4, 8})
+      for (auto bytes : sizes) {
+        const auto original = matrix::cyclic(topology, count, bytes);
+        if (!matrix::valid(original)) throw std::runtime_error("invalid cache matrix source");
+        expect(ask::pass::checkAllocationPlan(original), Verdict::Pass, "cache matrix source");
+        for (auto mutation : matrix::mutations) {
+          auto candidate = original;
+          matrix::mutate(candidate, mutation);
+          expect(ask::pass::checkAllocationPlan(candidate),
+                 matrix::valid(candidate) ? Verdict::Pass : Verdict::Fail, "cached-plan mutation");
+          expect(ask::pass::checkAllocationPlan(original), Verdict::Pass, "source survives mutation");
+          ++cases;
         }
+      }
+  return cases;
+}
+
+std::size_t largePlanMatrix() {
+  std::size_t cases = 0;
+  const std::size_t sizes[] = {0, 16, std::numeric_limits<std::size_t>::max()};
+  for (auto topology : matrix::topologies)
+    for (std::size_t count : {128, 1024, 4096})
+      for (auto bytes : sizes) {
+        const auto allocation = matrix::cyclic(topology, count, bytes);
+        if (!matrix::valid(allocation)) throw std::runtime_error("invalid large matrix source");
+        expect(ask::pass::checkAllocationPlan(allocation), Verdict::Pass, "large allocation plan");
+        expect(ask::pass::checkAllocationPlan(allocation), Verdict::Pass, "repeated large allocation plan");
+        ++cases;
+      }
+  return cases;
 }
 } // namespace
 
 int main() {
   try {
-    allocationMatrix();
+    const auto smallCases = allocationMatrix();
+    const auto cacheCases = cacheMutationMatrix();
+    const auto largeCases = largePlanMatrix();
     auto plan = chain(4);
     AllocationPlan allocation{plan, {16, 16, 16, 16, 16},
                               {{1, 0}, {2, 1}, {3, 0}}, {16, 16}};
@@ -99,14 +124,28 @@ int main() {
     auto overlapDecision = ask::pass::checkAllocationPlan(sameSlot);
     expect(overlapDecision, Verdict::Fail, "overlapping adjacent lifetimes");
     if (overlapDecision.explanation.find("ADJACENT_1_2 FAIL") == std::string::npos)
-      throw std::runtime_error("missing adjacent-lifetime proof obligation");
+      throw std::runtime_error("missing adjacent-lifetime diagnostic");
 
     auto smallSlot = allocation;
     smallSlot.slot_capacity_bytes[0] = 15;
     auto capacityDecision = ask::pass::checkAllocationPlan(smallSlot);
     expect(capacityDecision, Verdict::Fail, "insufficient capacity");
     if (capacityDecision.explanation.find("CAPACITY_1 FAIL") == std::string::npos)
-      throw std::runtime_error("missing capacity proof obligation");
+      throw std::runtime_error("missing capacity diagnostic");
+
+    auto multipleFailures = sameSlot;
+    multipleFailures.plan.steps[0].inputs = {1};
+    multipleFailures.slot_capacity_bytes[0] = 15;
+    const auto multipleDecision = ask::pass::checkAllocationPlan(multipleFailures);
+    expect(multipleDecision, Verdict::Fail, "all violated constraints are reported");
+    if (multipleDecision.explanation !=
+        "verify READ_0_0 FAIL\n"
+        "verify CAPACITY_1 FAIL\n"
+        "verify CAPACITY_2 FAIL\n"
+        "verify CAPACITY_3 FAIL\n"
+        "verify ADJACENT_1_2 FAIL\n"
+        "verify ADJACENT_2_3 FAIL\n")
+      throw std::runtime_error("combined validation diagnostics differ");
 
     auto incomplete = allocation;
     incomplete.assignments.pop_back();
@@ -150,6 +189,8 @@ int main() {
     early.steps[0].inputs = {2};
     expect(ask::pass::checkPlan(early), Verdict::Fail, "read before write");
 
+    std::cout << "allocation matrix: " << smallCases << ", cache mutations: " << cacheCases
+              << ", large plans: " << largeCases << '\n';
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
