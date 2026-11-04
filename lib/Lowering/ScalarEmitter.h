@@ -6,6 +6,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/IntrinsicsNVPTX.h"
 
 #include <functional>
 
@@ -18,6 +19,7 @@ class ScalarEmitter {
   llvm::IRBuilder<> &b;
   llvm::Function *function;
   bool cuda;
+  llvm::Value *warpLane = nullptr;
   std::function<llvm::Value *(mlir::Value, llvm::Value *)> load;
   llvm::DenseMap<std::pair<mlir::Value, llvm::Value *>, llvm::Value *> values;
   llvm::DenseMap<mlir::Value, llvm::Value *> uniformValues, buffers;
@@ -125,6 +127,49 @@ class ScalarEmitter {
     b.SetInsertPoint(after);
     return result;
   }
+  llvm::Value *shuffleXor(llvm::Value *value, unsigned offset) {
+    auto shuffle = [&](llvm::Value *part) {
+      auto intrinsic = part->getType()->isFloatTy() ? llvm::Intrinsic::nvvm_shfl_sync_bfly_f32
+                                                   : llvm::Intrinsic::nvvm_shfl_sync_bfly_i32;
+      return b.CreateIntrinsic(intrinsic, {},
+          {b.getInt32(-1), part, b.getInt32(offset), b.getInt32(31)});
+    };
+    if (!value->getType()->isIntegerTy(64)) return shuffle(value);
+    auto *low = shuffle(b.CreateTrunc(value, b.getInt32Ty()));
+    auto *high = shuffle(b.CreateTrunc(b.CreateLShr(value, b.getInt64(32)), b.getInt32Ty()));
+    return b.CreateOr(b.CreateZExt(low, b.getInt64Ty()),
+        b.CreateShl(b.CreateZExt(high, b.getInt64Ty()), b.getInt64(32)));
+  }
+  template<class Read>
+  llvm::Value *warpMaximum(uint64_t count, llvm::Value *initial, Read read) {
+    auto *outputType = initial->getType();
+    if (outputType->isFloatingPointTy()) initial = llir::createNumericCast(b, initial, b.getFloatTy());
+    auto update = [&](llvm::Value *index, llvm::Value *previous) {
+      auto *value = read(index);
+      if (outputType->isFloatingPointTy()) value = llir::createNumericCast(b, value, b.getFloatTy());
+      return maximum(previous, value);
+    };
+    auto *value = accumulate(count / 32, initial, [&](llvm::Value *block, llvm::Value *previous) {
+      return update(b.CreateAdd(b.CreateMul(block, b.getInt64(32)), warpLane), previous);
+    });
+    if (const uint64_t tail = count % 32) {
+      auto *before = b.GetInsertBlock();
+      auto *body = llvm::BasicBlock::Create(b.getContext(), "reduce.tail", function);
+      auto *after = llvm::BasicBlock::Create(b.getContext(), "reduce.tail.done", function);
+      b.CreateCondBr(b.CreateICmpULT(warpLane, b.getInt64(tail)), body, after);
+      b.SetInsertPoint(body);
+      auto *partial = update(b.CreateAdd(b.getInt64(count - tail), warpLane), value);
+      auto *tailEnd = b.GetInsertBlock();
+      b.CreateBr(after);
+      b.SetInsertPoint(after);
+      auto *merged = b.CreatePHI(value->getType(), 2, "reduce.partial");
+      merged->addIncoming(value, before);
+      merged->addIncoming(partial, tailEnd);
+      value = merged;
+    }
+    for (unsigned offset : {16, 8, 4, 2, 1}) value = maximum(value, shuffleXor(value, offset));
+    return outputType->isFloatingPointTy() ? llir::createNumericCast(b, value, outputType) : value;
+  }
   llvm::Value *reduce(mlir::Operation *op, llvm::Value *index) {
     auto input = op->getOperand(0);
     auto inputShape = shape(input.getType());
@@ -150,12 +195,16 @@ class ScalarEmitter {
     for (unsigned axis = 0; axis < inputShape.size(); ++axis)
       if (!reduced.test(axis))
         base = b.CreateAdd(base, atStride(coordinate(index, outputShape, outputAxis++), inputShape, axis));
-    return accumulate(count, initial, [&](llvm::Value *reductionIndex, llvm::Value *accumulator) {
+    auto read = [&](llvm::Value *reductionIndex) {
       llvm::Value *inputIndex = base;
       for (auto [reducedAxis, axis] : llvm::enumerate(axes))
         inputIndex = b.CreateAdd(inputIndex,
             atStride(coordinate(reductionIndex, reducedShape, reducedAxis), inputShape, axis));
-      auto *value = emit(input, inputIndex);
+      return emit(input, inputIndex);
+    };
+    if (warpLane && mlir::isa<ReduceMaxOp>(op)) return warpMaximum(count, initial, read);
+    return accumulate(count, initial, [&](llvm::Value *reductionIndex, llvm::Value *accumulator) {
+      auto *value = read(reductionIndex);
       return mlir::isa<ReduceSumOp>(op) ? binary(op, accumulator, value) : maximum(accumulator, value);
     });
   }
@@ -220,6 +269,7 @@ public:
 
   void bindUniform(mlir::Value value, llvm::Value *computed) { uniformValues[value] = computed; }
   void bindBuffer(mlir::Value value, llvm::Value *address) { buffers[value] = address; }
+  void bindWarpLane(llvm::Value *lane) { warpLane = lane; }
 
   // The host schedules each tile inside one batch, including its static tails.
   llvm::Value *emitMatmulTile(mlir::Value value, llvm::Value *index,

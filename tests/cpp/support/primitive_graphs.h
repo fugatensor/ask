@@ -42,6 +42,29 @@ inline std::string reductionBroadcast(bool full, const std::string &operation) {
       "%r = \"ask.div\"(%x, %b) : (tensor<2x3xf32>, tensor<2x3xf32>) -> tensor<2x3xf32>\n"
       "return %r : tensor<2x3xf32> } }";
 }
+inline std::string cudaReduction(const std::string &dtype, int64_t rows,
+    int64_t width, bool transposed, bool epilogue, bool retainInput,
+    const std::string &operation = "reduce_max") {
+  auto input = tensor(transposed ? std::vector<int64_t>{width, rows}
+                                 : std::vector<int64_t>{rows, width}, dtype);
+  auto output = tensor({rows}, dtype);
+  auto body = "%r = \"ask." + operation + "\"(%x) {axes = " +
+      dimensions({transposed ? 0 : 1}) + "} : (" + input + ") -> " + output + "\n";
+  if (epilogue) body += "%s = \"ask.add\"(%r, %r) : (" + output + ", " + output + ") -> " + output + "\n";
+  std::string outputs = epilogue ? "%s" : "%r", types = output;
+  if (retainInput) { outputs += ", %x";types += ", " + input; }
+  return "module { func.func @reduce(%x: " + input + ") -> (" + types + ") {\n" + body +
+      "return " + outputs + " : " + types + " } }";
+}
+inline std::string nestedCudaMaximum(const std::string &dtype, int64_t rows, int64_t width) {
+  auto input = tensor({rows, width}, dtype), output = tensor({rows}, dtype);
+  return "module { func.func @nested_max(%x: " + input + ") -> " + output + " {\n"
+      "%a = \"ask.reduce_max\"(%x) {axes = array<i64: 1>} : (" + input + ") -> " + output + "\n"
+      "%b = \"ask.broadcast_in_dim\"(%a) {shape = " + dimensions({rows, width}) +
+      ", dimensions = array<i64: 0>} : (" + output + ") -> " + input + "\n"
+      "%c = \"ask.reduce_max\"(%b) {axes = array<i64: 1>} : (" + input + ") -> " + output + "\n"
+      "return %c : " + output + " } }";
+}
 inline std::string matmul(const std::string &dtype, int64_t batch, bool transposeA, bool transposeB) {
   std::vector<int64_t> a, b, c;
   if (batch > 0) { a.push_back(batch);b.push_back(batch);c.push_back(batch); }

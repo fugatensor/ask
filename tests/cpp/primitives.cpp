@@ -119,11 +119,66 @@ void hostMatmulMatrix() {
             }
   std::cout << "Host matmul layout matrix: " << cases << " cases\n";
 }
+void cudaReductionMatrix() {
+  ask::compiler::CodegenOptions options;
+  options.target = ask::compiler::CodegenTarget::CUDALLVM;
+  options.architecture = 86;
+  std::size_t cases = 0;
+  for (const std::string dtype : {"i32", "i64", "f32", "f16", "bf16"})
+    for (int64_t rows : {0, 1, 9})
+      for (int64_t width : {1, 31, 32, 33, 64, 65})
+        for (bool transposed : {false, true})
+          for (bool epilogue : {false, true})
+            for (bool retainInput : {false, true}) {
+              auto result = ask::compiler::codegen(ask::test::cudaReduction(
+                  dtype, rows, width, transposed, epilogue, retainInput), options);
+              const bool cooperative = rows && width >= 32;
+              const auto call = "call " + std::string(dtype == "i32" || dtype == "i64" ? "i32" : "float") +
+                  " @llvm.nvvm.shfl.sync.bfly.";
+              require(occurrences(result.ir, call) == (cooperative ? (dtype == "i64" ? 10 : 5) : 0),
+                      "CUDA max selected an invalid warp reduction");
+              require((result.ir.find("reduce.tail:") != std::string::npos) == (cooperative && width % 32),
+                      "CUDA max must emit a tail load only for a partial warp");
+              const int64_t workers = cooperative ? 4 : 128;
+              auto blocks = rows / workers + (rows % workers != 0);
+              if (retainInput) blocks = std::max(blocks, rows * width / 128 + (rows * width % 128 != 0));
+              blocks = std::max<int64_t>(blocks, 1);
+              require(result.cudaArtifactJSON->find("\"grid\":[" + std::to_string(blocks) + ",1,1]") != std::string::npos,
+                      "CUDA mixed output groups have an incorrect launch grid");
+              require(integerField(*result.cudaArtifactJSON, "shared_bytes", 0),
+                      "warp max must preserve the zero shared-memory launch contract");
+              ++cases;
+            }
+  for (unsigned block : {31, 32, 33, 128})
+    for (unsigned architecture : {60, 70, 86})
+      for (const std::string operation : {"reduce_max", "reduce_sum"}) {
+        options.blockSize = block;
+        options.architecture = architecture;
+        auto result = ask::compiler::codegen(
+            ask::test::cudaReduction("f32", 9, 65, false, true, false, operation), options);
+        const bool cooperative = operation == "reduce_max" && architecture >= 70 && block % 32 == 0;
+        require((result.ir.find("@llvm.nvvm.shfl.sync") != std::string::npos) == cooperative,
+                "CUDA warp choice changed the architecture/block/sum contract");
+        ++cases;
+      }
+  options.blockSize = 128;
+  options.architecture = 86;
+  for (const std::string dtype : {"i32", "i64", "f32", "f16", "bf16"})
+    for (int64_t rows : {1, 9})
+      for (int64_t width : {32, 65}) {
+        auto result = ask::compiler::codegen(ask::test::nestedCudaMaximum(dtype, rows, width), options);
+        require(result.ir.find("@llvm.nvvm.shfl.sync") == std::string::npos,
+                "nested reductions must retain the indexed scalar schedule");
+        ++cases;
+      }
+  std::cout << "CUDA reduction schedule matrix: " << cases << " cases\n";
+}
 }
 int main() {
   try {
     const bool host = ask::compilerCapabilitiesJSON().find("\"host_codegen\":true") != std::string::npos;
     if (host) { workspaceMatrix();hostMatmulMatrix(); }
+    cudaReductionMatrix();
     for (const std::string dtype : {"f32", "f16", "bf16"})
       for (bool constant : {false, true}) {
         auto plan = ask::compiler::partition(ask::test::publicScalar(dtype, constant));

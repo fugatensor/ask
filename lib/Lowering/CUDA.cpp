@@ -48,6 +48,42 @@ llvm::SmallVector<int64_t> shapeOf(mlir::Type type) {
   return {};
 }
 
+bool supportsWarpMaximum(llvm::ArrayRef<mlir::Value> roots, uint64_t outputCount) {
+  struct Summary { bool supported, reduction; };
+  llvm::DenseMap<mlir::Value, Summary> summaries;
+  std::function<Summary(mlir::Value)> inspect = [&](mlir::Value value) -> Summary {
+    if (auto found = summaries.find(value); found != summaries.end()) return found->second;
+    Summary result{true, false};
+    if (auto *op = value.getDefiningOp()) {
+      for (auto operand : op->getOperands()) {
+        auto input = inspect(operand);
+        result.supported &= input.supported;
+        result.reduction |= input.reduction;
+      }
+      if (mlir::isa<ReduceSumOp, ReduceMaxOp>(op)) {
+        uint64_t domain = 1;
+        auto shape = shapeOf(op->getOperand(0).getType());
+        for (int64_t axis : op->getAttrOfType<mlir::DenseI64ArrayAttr>("axes").asArrayRef())
+          domain *= uint64_t(shape[axis]);
+        auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
+        const uint64_t count = tensor ? uint64_t(tensor.getNumElements()) : 1;
+        result.supported &= mlir::isa<ReduceMaxOp>(op) && !result.reduction &&
+                            domain >= 32 && count == outputCount;
+        result.reduction = true;
+      }
+    }
+    summaries[value] = result;
+    return result;
+  };
+  bool reduction = false;
+  for (auto value : roots) {
+    auto result = inspect(value);
+    if (!result.supported) return false;
+    reduction |= result.reduction;
+  }
+  return reduction;
+}
+
 llvm::json::Object describePort(mlir::Type type, unsigned argument, llvm::StringRef binding) {
   llvm::json::Array shape;
   for (int64_t dimension : shapeOf(type)) shape.push_back(dimension);
@@ -165,24 +201,34 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     llvm::SmallVector<int64_t> shape;
     uint64_t count;
     llvm::SmallVector<unsigned> outputs;
+    bool cooperative = false;
   };
   llvm::SmallVector<Batch> batches;
-  uint64_t maximumCount = 0, emptyOutputs = 0;
+  uint64_t emptyOutputs = 0;
   auto returned = mlir::cast<mlir::func::ReturnOp>(graph.front().getTerminator());
   for (auto [index, value] : llvm::enumerate(returned.getOperands())) {
     auto count = elementCount(value.getType());
     if (!count) return count.takeError();
-    maximumCount = std::max(maximumCount, *count);
     if (*count == 0) { ++emptyOutputs; continue; }
     auto shape = shapeOf(value.getType());
     auto batch = llvm::find_if(batches, [&](const Batch &item) { return item.shape == shape; });
     if (batch == batches.end()) batches.push_back({std::move(shape), *count, {unsigned(index)}});
     else batch->outputs.push_back(index);
   }
+  uint64_t maximumBlocks = 0, warpGroups = 0;
+  for (auto &batch : batches) {
+    llvm::SmallVector<mlir::Value> roots;
+    for (unsigned index : batch.outputs) roots.push_back(returned.getOperand(index));
+    batch.cooperative = options.architecture >= 70 && options.blockSize % 32 == 0 &&
+                        supportsWarpMaximum(roots, batch.count);
+    warpGroups += batch.cooperative;
+    const uint64_t outputsPerBlock = options.blockSize / (batch.cooperative ? 32 : 1);
+    maximumBlocks = std::max(maximumBlocks,
+        batch.count / outputsPerBlock + (batch.count % outputsPerBlock != 0));
+  }
   // A grid-stride loop bounds the launch size without bounding tensor lengths.
   // For empty outputs the entry returns without touching any pointer.
-  uint64_t grid = std::max<uint64_t>(1, std::min<uint64_t>(65535,
-      maximumCount / options.blockSize + (maximumCount % options.blockSize != 0)));
+  uint64_t grid = std::max<uint64_t>(1, std::min<uint64_t>(65535, maximumBlocks));
   uint64_t stride = grid * options.blockSize;
   llvm::IRBuilder<> builder(llvm::BasicBlock::Create(context, "entry", function));
   auto registerValue = [&](llvm::StringRef name) -> llvm::Value * {
@@ -199,13 +245,15 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   uint64_t inputLoads = 0, reductionLoops = 0;
   llvm::json::Array groups;
   for (const Batch &batch : batches) {
+    auto *first = batch.cooperative ? builder.CreateUDiv(start, builder.getInt64(32)) : start;
+    auto *lane = batch.cooperative ? builder.CreateAnd(start, builder.getInt64(31)) : nullptr;
     auto *before = builder.GetInsertBlock();
     auto *body = llvm::BasicBlock::Create(context, "element.loop", function);
     auto *after = llvm::BasicBlock::Create(context, "output.done", function);
-    builder.CreateCondBr(builder.CreateICmpULT(start, builder.getInt64(batch.count)), body, after);
+    builder.CreateCondBr(builder.CreateICmpULT(first, builder.getInt64(batch.count)), body, after);
     builder.SetInsertPoint(body);
     auto *index = builder.CreatePHI(builder.getInt64Ty(), 2, "index");
-    index->addIncoming(start, before);
+    index->addIncoming(first, before);
     lowering::ScalarEmitter emitter(builder, function, true,
         [&](mlir::Value value, llvm::Value *offset) -> llvm::Value * {
       auto argument = mlir::cast<mlir::BlockArgument>(value);
@@ -218,22 +266,37 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
       return computed;
     });
+    if (batch.cooperative) emitter.bindWarpLane(lane);
     llvm::json::Array outputIndices;
+    llvm::SmallVector<llvm::Value *> computedOutputs;
     for (unsigned outputIndex : batch.outputs) {
       auto *computed = emitter.emit(returned.getOperand(outputIndex), index);
       if (computed->getType()->isIntegerTy(1)) computed = builder.CreateZExt(computed, builder.getInt8Ty(), "output.bool");
+      computedOutputs.push_back(computed);
+    }
+    llvm::BasicBlock *stored = nullptr;
+    if (batch.cooperative) {
+      auto *write = llvm::BasicBlock::Create(context, "warp.write", function);
+      stored = llvm::BasicBlock::Create(context, "warp.stored", function);
+      builder.CreateCondBr(builder.CreateICmpEQ(lane, builder.getInt64(0)), write, stored);
+      builder.SetInsertPoint(write);
+    }
+    for (auto [position, outputIndex] : llvm::enumerate(batch.outputs)) {
+      auto *computed = computedOutputs[position];
       auto *pointer = function->getArg(graph.getNumArguments() + outputIndex);
       auto *address = builder.CreateGEP(computed->getType(), pointer, index, "output.address");
       builder.CreateAlignedStore(computed, address,
           llvm::Align(elementByteWidth(returned.getOperand(outputIndex).getType())));
       outputIndices.push_back(int64_t(outputIndex));
     }
+    if (stored) { builder.CreateBr(stored);builder.SetInsertPoint(stored); }
     reductionLoops += emitter.reductionLoops;
-    auto *next = builder.CreateAdd(index, builder.getInt64(stride), "next");
+    auto *next = builder.CreateAdd(index, builder.getInt64(stride / (batch.cooperative ? 32 : 1)), "next");
     index->addIncoming(next, builder.GetInsertBlock());
     builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(batch.count)), body, after);
     builder.SetInsertPoint(after);
-    groups.push_back(llvm::json::Object{{"outputs", std::move(outputIndices)}, {"element_count", int64_t(batch.count)}});
+    groups.push_back(llvm::json::Object{{"outputs", std::move(outputIndices)},
+        {"element_count", int64_t(batch.count)}, {"threads_per_output", batch.cooperative ? 32 : 1}});
   }
   builder.CreateRetVoid();
   std::string diagnostics;
@@ -258,7 +321,8 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       {"requires_disjoint_outputs", true}, {"outputs_must_not_alias_inputs", true},
       {"validation", llvm::json::Object{{"llvm_module_verified", true}, {"device_execution_performed", false}, {"stage", "ask_cuda_llvm"}}}};
   report = llvm::json::Object{{"statistics_stage", "cuda_lowering"}, {"kernel_count", 1},
-      {"indexing", "linear_grid_stride"}, {"output_loop_count", int64_t(batches.size())},
+      {"indexing", warpGroups ? "cooperative_grid_stride" : "linear_grid_stride"},
+      {"warp_reduction_groups", int64_t(warpGroups)}, {"output_loop_count", int64_t(batches.size())},
       {"input_load_count", int64_t(inputLoads)}, {"reduction_loop_count", int64_t(reductionLoops)},
       {"zero_element_outputs", int64_t(emptyOutputs)},
       {"temporary_buffer_count", 0}, {"groups", std::move(groups)},
