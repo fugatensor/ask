@@ -155,6 +155,7 @@ foreach(component Core Compiler Runtime)
   install(FILES "${CMAKE_CURRENT_BINARY_DIR}/ASKConfig.cmake" "${CMAKE_CURRENT_BINARY_DIR}/ASKConfigVersion.cmake"
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT ${component})
 endforeach()
+install(FILES LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/ask COMPONENT Core)
 install(FILES cmake/llvm.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
 if(ASK_WITH_HOST)
   foreach(component Core Compiler)

@@ -55,4 +55,8 @@ ctest --preset core --output-on-failure
 
 FugaTensor 的[端到端测试](../fugatensor/docs/测试.md)覆盖图降级、数值、求导和外部 kernel 调度。
 
+## 许可证
+
+本项目采用 [Apache-2.0](LICENSE) 许可证开源。
+
 [文档目录](docs/README.md) · [外部 Worker 协议](docs/外部编译器适配接入规范.md) · [执行计划](docs/图切分与多Kernel执行计划.md)
