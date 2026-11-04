@@ -311,7 +311,7 @@ struct PreparedProgram::Impl {
   std::shared_ptr<SessionState> state;
   std::weak_ptr<Session> session;
   std::vector<std::size_t> sizes, inputs, outputs;
-  std::vector<std::size_t> allocatedOutputs;
+  std::vector<std::size_t> allocatedOutputs, writableOutputs;
   std::vector<std::pair<std::size_t, std::size_t>> disjointPorts;
   // Public ports use caller-owned storage; only internal buffers have slots.
   std::vector<std::size_t> slotCapacities;
@@ -754,6 +754,9 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
     p->allocatedOutputs.push_back(index);
     for(auto other:publicPorts) if(other!=index) p->disjointPorts.emplace_back(index,other);
   }
+  for(std::size_t port=0;port<p->outputs.size();++port)
+    if(std::find(p->allocatedOutputs.begin(),p->allocatedOutputs.end(),p->outputs[port])!=p->allocatedOutputs.end())
+      p->writableOutputs.push_back(port);
   p->slotCapacities=std::move(allocation.slot_capacity_bytes);
   s.counters["prepared_internal_slots"]+=p->slotCapacities.size();
   for(auto capacity:p->slotCapacities) s.counters["prepared_internal_bytes"]+=capacity;
@@ -821,8 +824,8 @@ std::shared_ptr<Event> PreparedProgram::submit(
   std::vector<std::shared_ptr<DeviceBuffer>> bound(impl->sizes.size());
   for(std::size_t i=0;i<inputs.size();++i) bindPort(bound,impl->inputs[i],inputs[i]);
   for(std::size_t i=0;i<outputs.size();++i) bindPort(bound,impl->outputs[i],outputs[i]);
-  for(auto index:impl->allocatedOutputs)
-    require(!bound[index]->readonly(),"program output tensor is read-only");
+  for(auto port:impl->writableOutputs)
+    require(!outputs[port]->readonly(),"program output tensor is read-only");
   for(const auto &[index,other]:impl->disjointPorts) {
     const auto &output=bound[index];const auto &buffer=bound[other];
     require(!output->size() || !buffer->size() || output->pointer()+output->size()<=buffer->pointer() ||

@@ -49,6 +49,11 @@ void portBindings(const std::string &ptx) {
       if (actual[i] != values[i] * 2) throw std::runtime_error("allocated run result mismatch");
     auto readonlyOutput = session->importBuffer(outputs[0]->pointer(), 16, true);
     rejects([&] { program->submit({input}, {readonlyOutput, readonlyOutput}); });
+    for(bool readonlyFirst:{false,true}) {
+      const auto &first=readonlyFirst?readonlyOutput:outputs[0];
+      const auto &second=readonlyFirst?outputs[0]:readonlyOutput;
+      rejects([&] { program->submit({input}, {first, second}); });
+    }
     rejects([&] { program->submit({input}, {input, input}); });
     rejects([&] { program->submit({input}, {outputs[0], input}); });
     program->submit({input}, outputs)->wait();
