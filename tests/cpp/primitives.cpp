@@ -173,7 +173,7 @@ void cudaReductionMatrix() {
         options.architecture = architecture;
         auto result = ask::compiler::codegen(
             ask::test::cudaReduction("f32", 9, 65, false, true, false, operation), options);
-        const bool cooperative = operation == "reduce_max" && architecture >= 70 && block % 32 == 0;
+        const bool cooperative = (operation == "reduce_max" || operation == "reduce_sum") && architecture >= 70 && block % 32 == 0;
         require((result.ir.find("@llvm.nvvm.shfl.sync") != std::string::npos) == cooperative,
                 "CUDA warp choice changed the architecture/block/sum contract");
         ++cases;

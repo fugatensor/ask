@@ -195,7 +195,7 @@ struct SessionState {
   unsigned maxThreads = 0;
   std::map<std::size_t, std::vector<DevicePointer>> freeBuffers;
   std::size_t pooledBytes = 0;
-  static constexpr std::size_t poolLimit = 64 * 1024 * 1024;
+  static constexpr std::size_t poolLimit = 1024ULL * 1024 * 1024;
   std::vector<Handle> freeEvents;
   std::map<std::string,std::uint64_t> counters = {
       {"context_creations",0},{"primary_context_retains",0},{"stream_creations",0},

@@ -141,13 +141,21 @@ class ScalarEmitter {
         b.CreateShl(b.CreateZExt(high, b.getInt64Ty()), b.getInt64(32)));
   }
   template<class Read>
-  llvm::Value *warpMaximum(uint64_t count, llvm::Value *initial, Read read) {
+  llvm::Value *warpReduction(mlir::Operation *op, uint64_t count, llvm::Value *initial, Read read) {
+    const bool isSum = mlir::isa<ReduceSumOp>(op);
     auto *outputType = initial->getType();
     if (outputType->isFloatingPointTy()) initial = llir::createNumericCast(b, initial, b.getFloatTy());
+    auto combine = [&](llvm::Value *left, llvm::Value *right) -> llvm::Value * {
+      if (isSum) {
+        if (left->getType()->isIntegerTy()) return b.CreateAdd(left, right, "add.wrap");
+        return b.CreateFAdd(left, right, "add");
+      }
+      return maximum(left, right);
+    };
     auto update = [&](llvm::Value *index, llvm::Value *previous) {
       auto *value = read(index);
       if (outputType->isFloatingPointTy()) value = llir::createNumericCast(b, value, b.getFloatTy());
-      return maximum(previous, value);
+      return combine(previous, value);
     };
     auto *value = accumulate(count / 32, initial, [&](llvm::Value *block, llvm::Value *previous) {
       return update(b.CreateAdd(b.CreateMul(block, b.getInt64(32)), warpLane), previous);
@@ -167,8 +175,12 @@ class ScalarEmitter {
       merged->addIncoming(partial, tailEnd);
       value = merged;
     }
-    for (unsigned offset : {16, 8, 4, 2, 1}) value = maximum(value, shuffleXor(value, offset));
+    for (unsigned offset : {16, 8, 4, 2, 1}) value = combine(value, shuffleXor(value, offset));
     return outputType->isFloatingPointTy() ? llir::createNumericCast(b, value, outputType) : value;
+  }
+  template<class Read>
+  llvm::Value *warpMaximum(uint64_t count, llvm::Value *initial, Read read) {
+    return warpReduction(nullptr, count, initial, read);
   }
   llvm::Value *reduce(mlir::Operation *op, llvm::Value *index) {
     auto input = op->getOperand(0);
@@ -202,7 +214,7 @@ class ScalarEmitter {
             atStride(coordinate(reductionIndex, reducedShape, reducedAxis), inputShape, axis));
       return emit(input, inputIndex);
     };
-    if (warpLane && mlir::isa<ReduceMaxOp>(op)) return warpMaximum(count, initial, read);
+    if (warpLane && mlir::isa<ReduceMaxOp, ReduceSumOp>(op)) return warpReduction(op, count, initial, read);
     return accumulate(count, initial, [&](llvm::Value *reductionIndex, llvm::Value *accumulator) {
       auto *value = read(reductionIndex);
       return mlir::isa<ReduceSumOp>(op) ? binary(op, accumulator, value) : maximum(accumulator, value);

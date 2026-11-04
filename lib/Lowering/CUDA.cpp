@@ -48,7 +48,7 @@ llvm::SmallVector<int64_t> shapeOf(mlir::Type type) {
   return {};
 }
 
-bool supportsWarpMaximum(llvm::ArrayRef<mlir::Value> roots, uint64_t outputCount) {
+bool supportsWarpReduction(llvm::ArrayRef<mlir::Value> roots, uint64_t outputCount) {
   struct Summary { bool supported, reduction; };
   llvm::DenseMap<mlir::Value, Summary> summaries;
   std::function<Summary(mlir::Value)> inspect = [&](mlir::Value value) -> Summary {
@@ -67,7 +67,7 @@ bool supportsWarpMaximum(llvm::ArrayRef<mlir::Value> roots, uint64_t outputCount
           domain *= uint64_t(shape[axis]);
         auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
         const uint64_t count = tensor ? uint64_t(tensor.getNumElements()) : 1;
-        result.supported &= mlir::isa<ReduceMaxOp>(op) && !result.reduction &&
+        result.supported &= (mlir::isa<ReduceMaxOp, ReduceSumOp>(op)) && !result.reduction &&
                             domain >= 32 && count == outputCount;
         result.reduction = true;
       }
@@ -220,7 +220,7 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     llvm::SmallVector<mlir::Value> roots;
     for (unsigned index : batch.outputs) roots.push_back(returned.getOperand(index));
     batch.cooperative = options.architecture >= 70 && options.blockSize % 32 == 0 &&
-                        supportsWarpMaximum(roots, batch.count);
+                        supportsWarpReduction(roots, batch.count);
     warpGroups += batch.cooperative;
     const uint64_t outputsPerBlock = options.blockSize / (batch.cooperative ? 32 : 1);
     maximumBlocks = std::max(maximumBlocks,
