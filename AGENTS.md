@@ -28,6 +28,7 @@
   - `MatmulDescription` 在计划准备时选定 cuBLASLt 描述、算法和实际 scratch；scratch 纳入同一槽位校验。执行函数在准备时固定，库调用捕获为 Graph 子图，变址时更新子图。
 - **数值语义**：
   - 6 种基础类型（`bool`、`i32`、`i64`、`f32`、`f16`、`bf16`）不做隐式类型提升或隐式广播。
+  - Host f32 matmul 使用 OpenBLAS SGEMM，由库决定 f32 累加顺序；f16 matmul 保留 f32 逐步乘加并最终舍入为 f16。
   - Host 使用 `bool/i32/i64/f32/f16` 五种类型；`bf16` 的执行目标为 CUDA `sm_80+`。
   - `ask.constant` 按单步最近偶数舍入（RNE）编码浮点字面量，64 位整数保持完整精度。
   - `ask.cast` 浮点转整数采用确定性饱和截断（`NaN` 置 0，溢出钳制到目标整数极值）。
@@ -39,10 +40,10 @@
 ## 构建与测试
 
 - **依赖与构建指令**：
-  - 拉取依赖使用 `python3 tools/fetch_deps.py`（支持 `--only llvm`）。`CMakeLists.txt` 根据 `cmake/llvm.lock.json` 自动识别 `.deps/` 下的 LLVM/MLIR：
+  - 拉取依赖使用 `python3 tools/fetch_deps.py`（支持 `--only llvm` / `--only openblas`）。`CMakeLists.txt` 根据 `cmake/llvm.lock.json` 自动识别 `.deps/` 下的 LLVM/MLIR；Host f32 matmul 使用 `cmake/openblas.lock.json` 锁定的原生单线程 OpenBLAS SDK：
     - 核心构建与测试：`cmake --preset core && cmake --build --preset core && ctest --preset core --output-on-failure`
 - **测试组织**：
-  - 原生测试源码位于 `tests/cpp/`，默认 CTest 为 `ask-core`、`ask-compiler`、`ask-pass`、`ask-primitives`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。
+  - 原生测试源码位于 `tests/cpp/`，默认 CTest 为 `ask-core`、`ask-compiler`、`ask-pass`、`ask-primitives`、`ask-host-blas`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。
   - 推荐以 FugaTensor 的生产接口和实现作为完整接入示例，文档不使用测试目录充当示例，也不叙述测试迁移历史。端到端数值、图组合和第三方编译器验证由 FugaTensor 维护；新增覆盖优先复用独立参考与 `plan_matrix`，避免重复实现。
   - SDK 使用 `cmake --install build/core --prefix /path/to/ask-sdk` 安装；验证独立消费 Compiler/Runtime 时不依赖 LLVM 开发 SDK，消费 Core 时匹配 ASK 实际构建的 LLVM/MLIR 版本。默认依赖记录用于复现稳定发行版；自有 LLVM/MLIR 与第三方编译器内部 LLVM 独立选择。
   - 因缺少 `ASK_OPT`、GPU 驱动或编译工具而 `skipped` 的测试不能视作功能验证通过。

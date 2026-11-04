@@ -14,6 +14,13 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#if ASK_WITH_HOST
+#include <cblas.h>
+#include <dlfcn.h>
+#include <filesystem>
+#include <stdexcept>
+static_assert(sizeof(blasint) == sizeof(int32_t), "ASK Host SGEMM uses the OpenBLAS LP64 ABI");
+#endif
 
 namespace ask {
 namespace {
@@ -140,7 +147,7 @@ llvm::json::Array externalRequests(mlir::ModuleOp module, JSONFloatPaths *floatP
 
 llvm::json::Object compilerCapabilities() {
   using namespace llvm;
-  return json::Object{
+  json::Object capabilities{
       {"schema_version", 1}, {"build_id", ASK_BUILD_ID}, {"ask_version", ASK_VERSION}, {"llvm_version", ASK_LLVM_VERSION},
       {"llvm_revision", ASK_LLVM_REVISION},
       {"prepare", true}, {"partition", true}, {"cuda_execution_plan", true},
@@ -157,6 +164,18 @@ llvm::json::Object compilerCapabilities() {
       {"compiler_interface", "c++"}, {"python_bindings_enabled", false},
       {"native_prepare", true}, {"native_codegen", true}, {"native_cuda_runtime", true}, {"device_tensors", true},
       {"async_execution", true}, {"executable_cache", true}};
+#if ASK_WITH_HOST
+  Dl_info library{};
+  if (!dladdr(reinterpret_cast<void *>(&ask_cblas_sgemm), &library) || !library.dli_fname)
+    throw std::runtime_error("cannot identify the loaded ASK OpenBLAS library");
+  capabilities["host_link_libraries"] = json::Object{
+      {"openblas", std::filesystem::canonical(library.dli_fname).string()}};
+  capabilities["host_matmul"] = json::Object{
+      {"f32_provider", "openblas_sgemm"}, {"f16_provider", "native"},
+      {"openblas_version", ASK_OPENBLAS_VERSION}, {"integer_abi", "lp64"},
+      {"threads", ask_openblas_get_num_threads()}, {"configuration", ask_openblas_get_config()}};
+#endif
+  return capabilities;
 }
 
 namespace {

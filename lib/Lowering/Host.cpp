@@ -178,8 +178,38 @@ llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
 }
 
 struct WorkspacePlan {
-  llvm::DenseSet<mlir::Value> live, materialized;
+  llvm::DenseSet<mlir::Value> live, materialized, addressed;
 };
+
+bool blasMatmul(mlir::Value value) {
+  return value.getDefiningOp<MatmulOp>() && elementType(value.getType()).isF32();
+}
+
+struct BlasOperand {
+  mlir::Value value;
+  bool transposed;
+};
+
+BlasOperand blasOperand(mlir::Operation *matmul, unsigned index) {
+  auto flag = matmul->getAttrOfType<mlir::BoolAttr>(index ? "transpose_b" : "transpose_a");
+  BlasOperand result{matmul->getOperand(index), flag && flag.getValue()};
+  while (auto transpose = result.value.getDefiningOp<TransposeOp>()) {
+    auto permutation = transpose->getAttrOfType<mlir::DenseI64ArrayAttr>("permutation").asArrayRef();
+    const auto rank = permutation.size();
+    bool tailSwap = permutation[rank - 2] == int64_t(rank - 1) && permutation[rank - 1] == int64_t(rank - 2);
+    for (std::size_t axis = 0; axis + 2 < rank; ++axis) tailSwap &= permutation[axis] == int64_t(axis);
+    if (!tailSwap) break;
+    result.value = transpose->getOperand(0);
+    result.transposed = !result.transposed;
+  }
+  return result;
+}
+
+uint64_t blasContractingSize(mlir::Value value) {
+  auto operand = blasOperand(value.getDefiningOp(), 0);
+  auto type = mlir::cast<mlir::RankedTensorType>(operand.value.getType());
+  return type.getDimSize(type.getRank() - (operand.transposed ? 2 : 1));
+}
 
 // Inputs and results have already passed the static byte-size checks.
 uint64_t concreteCount(mlir::Type type) {
@@ -220,6 +250,17 @@ WorkspacePlan planWorkspace(mlir::func::FuncOp graph) {
           return user->getNumResults() && plan.live.contains(user->getResult(0));
         })) {
       plan.materialized.insert(op.getResult(0));
+      if (blasMatmul(op.getResult(0))) plan.addressed.insert(op.getResult(0));
+      expensive.clear();
+    }
+    if (blasMatmul(op.getResult(0)) && blasContractingSize(op.getResult(0))) {
+      for (unsigned index = 0; index < 2; ++index) {
+        auto input = blasOperand(&op, index).value;
+        if (!mlir::isa<mlir::BlockArgument>(input)) {
+          plan.materialized.insert(input);
+          plan.addressed.insert(input);
+        }
+      }
       expensive.clear();
     }
     for (auto operand : op.getOperands())
@@ -412,6 +453,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   llvm::json::Array functions;
   uint64_t totalLoops = 0, totalUnfusedLoops = 0, totalFusedOutputGroups = 0;
   uint64_t totalInputLoads = 0, totalReductionLoops = 0;
+  uint64_t totalBlasCalls = 0;
 
   for (mlir::Operation &op : source.getBody()->getOperations()) {
     if (mlir::isa<SemanticsOp, ImplementationOp>(op))
@@ -425,6 +467,17 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     const uint64_t workspaceLimit = pointerBits < 64 ? (uint64_t(1) << pointerBits) - 1
         : uint64_t(std::numeric_limits<int64_t>::max());
     const auto workspacePlan = planWorkspace(graph);
+    for (auto &operation : graph.front()) {
+      if (!operation.getNumResults() || !blasMatmul(operation.getResult(0)) ||
+          !workspacePlan.live.contains(operation.getResult(0)) ||
+          !concreteCount(operation.getResult(0).getType()) || !blasContractingSize(operation.getResult(0))) continue;
+      for (unsigned index = 0; index < 2; ++index) {
+        auto type = mlir::cast<mlir::RankedTensorType>(blasOperand(&operation, index).value.getType());
+        if (type.getDimSize(type.getRank() - 2) > std::numeric_limits<int32_t>::max() ||
+            type.getDimSize(type.getRank() - 1) > std::numeric_limits<int32_t>::max())
+          return error("Host f32 matmul matrix dimensions exceed the OpenBLAS LP64 range");
+      }
+    }
 
     llvm::SmallVector<llvm::Type *> parameters;
     for (mlir::Type type : graph.getArgumentTypes())
@@ -474,7 +527,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     llvm::SmallVector<OutputBatch> batches;
     llvm::StringMap<unsigned> batchForGroup;
     uint64_t loopCount = 0, unfusedLoops = 0, fusedOutputGroups = 0;
-    uint64_t inputLoads = 0, emptyOutputs = 0, reductionLoops = 0;
+    uint64_t inputLoads = 0, emptyOutputs = 0, reductionLoops = 0, blasCalls = 0;
     for (auto [outputIndex, value] : llvm::enumerate(returned.getOperands())) {
       auto count = elementCount(value.getType());
       if (!count)
@@ -503,8 +556,8 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     llvm::CallInst *workspace = nullptr;
     llvm::SmallVector<WorkspaceBuffer> workspaceBuffers;
     llvm::SmallVector<llvm::SmallVector<mlir::Value>> workspacePhases;
-    if (llvm::any_of(workspacePlan.materialized, [](mlir::Value value) {
-          return concreteCount(value.getType()) > 1;
+    if (llvm::any_of(workspacePlan.materialized, [&](mlir::Value value) {
+          return concreteCount(value.getType()) > 1 || workspacePlan.addressed.contains(value);
         })) {
       auto *sizeType = builder.getIntPtrTy(result->getDataLayout());
       // Layout constants are filled after collecting the emitted phase reads.
@@ -543,10 +596,44 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
       const uint64_t columns = type.getShape().back();
       const uint64_t rows = type.getShape()[type.getRank() - 2];
+      llvm::SmallVector<mlir::Value> reads;
+      if (blasMatmul(value)) {
+        const auto contracting = blasContractingSize(value);
+        if (!contracting) {
+          builder.CreateMemSet(address, builder.getInt8(0), concreteCount(type) * sizeof(float), llvm::Align(4));
+          return reads;
+        }
+        auto a = blasOperand(value.getDefiningOp(), 0), b = blasOperand(value.getDefiningOp(), 1);
+        auto at = mlir::cast<mlir::RankedTensorType>(a.value.getType());
+        auto bt = mlir::cast<mlir::RankedTensorType>(b.value.getType());
+        auto input = [&](mlir::Value operand) {
+          if (auto *cached = cachedBuffers.lookup(operand)) { reads.push_back(operand);return cached; }
+          return arguments.lookup(operand);
+        };
+        auto *left = input(a.value), *right = input(b.value);
+        auto *i32 = builder.getInt32Ty();
+        auto *f32 = builder.getFloatTy();
+        auto sgemm = result->getOrInsertFunction(ASK_OPENBLAS_SYMBOL,
+            llvm::FunctionType::get(builder.getVoidTy(),
+                {i32, i32, i32, i32, i32, i32, f32, pointer, i32, pointer, i32, f32, pointer, i32}, false));
+        emitHostLoop(builder, function, concreteCount(type) / (rows * columns), 1, [&](llvm::Value *batch) {
+          auto offset = [&](llvm::Value *base, uint64_t stride) {
+            return builder.CreateGEP(f32, base, builder.CreateMul(batch, builder.getInt64(stride)));
+          };
+          // CBLAS row-major, alpha=1 and beta=0; all sizes and layouts are static.
+          builder.CreateCall(sgemm, {builder.getInt32(101), builder.getInt32(a.transposed ? 112 : 111),
+              builder.getInt32(b.transposed ? 112 : 111), builder.getInt32(rows), builder.getInt32(columns),
+              builder.getInt32(contracting), llvm::ConstantFP::get(f32, 1), offset(left, rows * contracting),
+              builder.getInt32(at.getShape().back()), offset(right, contracting * columns),
+              builder.getInt32(bt.getShape().back()), llvm::ConstantFP::get(f32, 0),
+              offset(address, rows * columns), builder.getInt32(columns)});
+        });
+        ++blasCalls;
+        return reads;
+      }
       constexpr unsigned width = 16, height = 4;
       const uint64_t fullColumns = columns / width * width;
       const uint64_t fullRows = rows / height * height;
-      llvm::SmallVector<mlir::Value> reads;
       emitHostLoop(builder, function, concreteCount(type) / (rows * columns), 1, [&](llvm::Value *batch) {
         auto *batchBase = builder.CreateMul(batch, builder.getInt64(rows * columns));
         auto rowTile = [&](llvm::Value *row, unsigned tileRows) {
@@ -589,7 +676,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       if (!workspacePlan.live.contains(value)) continue;
       const bool scalar = !mlir::isa<mlir::RankedTensorType>(value.getType());
       if (!scalar && !workspacePlan.materialized.contains(value)) continue;
-      if (scalar || concreteCount(value.getType()) == 1) {
+      if (scalar || (concreteCount(value.getType()) == 1 && !workspacePlan.addressed.contains(value))) {
         lowering::ScalarEmitter emitter(builder, function, false, load);
         bind(emitter);
         uniformValues[value] = emitter.emit(value, builder.getInt64(0));
@@ -710,6 +797,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
             {"fused_output_groups", int64_t(fusedOutputGroups)},
             {"input_load_count", int64_t(inputLoads)},
             {"reduction_loop_count", int64_t(reductionLoops)},
+            {"blas_matmul_count", int64_t(blasCalls)},
             {"temporary_workspace_bytes", int64_t(*workspaceBytes)},
             {"materialized_tensor_count", int64_t(cachedBuffers.size())},
             {"zero_element_outputs", int64_t(emptyOutputs)},
@@ -719,6 +807,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     totalFusedOutputGroups += fusedOutputGroups;
     totalInputLoads += inputLoads;
     totalReductionLoops += reductionLoops;
+    totalBlasCalls += blasCalls;
   }
   if (functions.empty())
     return error("host lowering requires at least one graph function");
@@ -727,6 +816,8 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   if (llvm::verifyModule(*result, &stream))
     return error("host lowering produced invalid LLVM IR: " + stream.str());
   abiReport = llvm::json::Object{{"schema_version", 1},
+                                {"link_libraries", totalBlasCalls ? llvm::json::Array{"openblas"} : llvm::json::Array{}},
+                                {"matmul_f32_semantics", "openblas-sgemm-f32"},
                                 {"target_triple", result->getTargetTriple().str()},
                                 {"data_layout", result->getDataLayoutStr()},
                                 {"target_cpu", (*target)->getTargetCPU().str()},
@@ -740,7 +831,8 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
                                     {"unfused_output_loop_count", int64_t(totalUnfusedLoops)},
                                     {"fused_output_groups", int64_t(totalFusedOutputGroups)},
                                     {"input_load_count", int64_t(totalInputLoads)},
-                                    {"reduction_loop_count", int64_t(totalReductionLoops)}}}};
+                                    {"reduction_loop_count", int64_t(totalReductionLoops)},
+                                    {"blas_matmul_count", int64_t(totalBlasCalls)}}}};
   std::string abiText;
   llvm::raw_string_ostream abiStream(abiText);
   abiStream << llvm::json::Value(llvm::json::Object(abiReport));

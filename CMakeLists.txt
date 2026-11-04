@@ -49,7 +49,8 @@ set(ASK_WITH_HOST 0)
 if(ASK_TARGET_BACKENDS STREQUAL "host")
   set(ASK_WITH_HOST 1)
 endif()
-string(SHA256 ASK_BUILD_ID "${CMAKE_CURRENT_BINARY_DIR};${PROJECT_VERSION};${LLVM_PACKAGE_VERSION};${ASK_LLVM_REVISION};${ASK_WITH_HOST}")
+include(cmake/AskOpenBLAS.cmake)
+string(SHA256 ASK_BUILD_ID "${CMAKE_CURRENT_BINARY_DIR};${PROJECT_VERSION};${LLVM_PACKAGE_VERSION};${ASK_LLVM_REVISION};${ASK_WITH_HOST};${ASK_OPENBLAS_LOCK}")
 configure_file(cmake/BuildConfig.h.in generated/ask/BuildConfig.h @ONLY)
 
 separate_arguments(ASK_LLVM_DEFINITIONS NATIVE_COMMAND "${LLVM_DEFINITIONS}")
@@ -77,16 +78,21 @@ if(NOT LLVM_ENABLE_RTTI)
   target_compile_options(ask_core PUBLIC $<$<CXX_COMPILER_ID:GNU,Clang>:-fno-rtti>)
 endif()
 target_link_libraries(ask_core PUBLIC MLIRIR MLIRParser MLIRFuncDialect MLIRSideEffectInterfaces MLIRSupport ${ASK_LLVM_LIBS})
+if(ASK_WITH_HOST)
+  target_include_directories(ask_core SYSTEM PRIVATE "${ASK_OPENBLAS_ROOT}/include")
+  target_link_libraries(ask_core PUBLIC ASK::HostBLAS ${CMAKE_DL_LIBS})
+endif()
 
 add_executable(ask-opt tools/ask-opt.cpp)
 target_link_libraries(ask-opt PRIVATE ASK::Core)
-set_target_properties(ask-opt PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin")
+set_target_properties(ask-opt PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin"
+  INSTALL_RPATH "$ORIGIN/../${CMAKE_INSTALL_LIBDIR}")
 
 add_library(ask_compiler SHARED lib/Frontend/CompilerAPI.cpp)
 add_library(ASK::Compiler ALIAS ask_compiler)
 set_target_properties(ask_compiler PROPERTIES EXPORT_NAME Compiler
   VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR}
-  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/lib")
+  LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/lib" INSTALL_RPATH "$ORIGIN")
 target_compile_features(ask_compiler PUBLIC cxx_std_17)
 target_include_directories(ask_compiler PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -150,6 +156,15 @@ foreach(component Core Compiler Runtime)
     DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/ASK COMPONENT ${component})
 endforeach()
 install(FILES cmake/llvm.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT Core)
+if(ASK_WITH_HOST)
+  foreach(component Core Compiler)
+    install(FILES "$<TARGET_FILE:ASK::HostBLAS>" DESTINATION ${CMAKE_INSTALL_LIBDIR}
+      RENAME "${ASK_OPENBLAS_SONAME}" COMPONENT ${component})
+    install(FILES "${ASK_OPENBLAS_ROOT}/share/licenses/OpenBLAS/LICENSE"
+      DESTINATION ${CMAKE_INSTALL_DATADIR}/licenses/ask/OpenBLAS COMPONENT ${component})
+    install(FILES cmake/openblas.lock.json DESTINATION ${CMAKE_INSTALL_DATADIR}/ask COMPONENT ${component})
+  endforeach()
+endif()
 
 option(ASK_TEST_CUDA "Run hardware CUDA runtime tests (requires an NVIDIA GPU)" OFF)
 if(BUILD_TESTING)
@@ -162,6 +177,12 @@ if(BUILD_TESTING)
   add_executable(ask-primitives-test tests/cpp/primitives.cpp)
   target_link_libraries(ask-primitives-test PRIVATE ASK::Compiler)
   add_test(NAME ask-primitives COMMAND ask-primitives-test)
+  if(ASK_WITH_HOST)
+    add_executable(ask-host-blas-test tests/cpp/host_blas.cpp)
+    target_link_libraries(ask-host-blas-test PRIVATE ASK::Compiler ${CMAKE_DL_LIBS})
+    add_test(NAME ask-host-blas COMMAND ask-host-blas-test "${CMAKE_C_COMPILER}"
+      "$<TARGET_FILE:ASK::HostBLAS>" "${CMAKE_CURRENT_BINARY_DIR}/host-blas-test")
+  endif()
   add_executable(ask-core-test tests/cpp/frontend.cpp)
   target_link_libraries(ask-core-test PRIVATE ASK::Core)
   add_test(NAME ask-core COMMAND ask-core-test --optimize)

@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "version": "0.3.33",
+  "platform": "linux-x86_64",
+  "directory": "OpenBLAS-0.3.33",
+  "sdk_directory": "openblas-0.3.33",
+  "url": "https://codeload.github.com/OpenMathLib/OpenBLAS/tar.gz/refs/tags/v0.3.33",
+  "sha256": "6761af1d9f5d353ab4f0b7497be2643313b36c8f31caec0144bfef198e71e6ab",
+  "size_bytes": 25256012,
+  "unpacked_size_limit_bytes": 536870912,
+  "library": "lib/libask_openblas.so.0",
+  "symbol": "ask_cblas_sgemm",
+  "build_options": {
+    "DYNAMIC_ARCH": "1",
+    "USE_THREAD": "0",
+    "USE_LOCKING": "1",
+    "NUM_THREADS": "1",
+    "NO_AFFINITY": "1",
+    "NOFORTRAN": "1",
+    "NO_LAPACK": "1",
+    "ONLY_CBLAS": "1",
+    "BUILD_SINGLE": "1",
+    "SYMBOLPREFIX": "ask_",
+    "LIBNAMEPREFIX": "ask_"
+  }
+}

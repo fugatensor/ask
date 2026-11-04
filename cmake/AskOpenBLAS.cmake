@@ -1,0 +1,25 @@
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/cmake/openblas.lock.json" ASK_OPENBLAS_LOCK)
+string(JSON ASK_OPENBLAS_VERSION GET "${ASK_OPENBLAS_LOCK}" version)
+string(JSON ASK_OPENBLAS_DIRECTORY GET "${ASK_OPENBLAS_LOCK}" sdk_directory)
+string(JSON ASK_OPENBLAS_LIBRARY GET "${ASK_OPENBLAS_LOCK}" library)
+string(JSON ASK_OPENBLAS_SYMBOL GET "${ASK_OPENBLAS_LOCK}" symbol)
+get_filename_component(ASK_OPENBLAS_SONAME "${ASK_OPENBLAS_LIBRARY}" NAME)
+set(ASK_OPENBLAS_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/.deps/${ASK_OPENBLAS_DIRECTORY}"
+  CACHE PATH "Native OpenBLAS SDK produced by tools/fetch_deps.py --only openblas")
+if(ASK_WITH_HOST)
+  if(NOT EXISTS "${ASK_OPENBLAS_ROOT}/${ASK_OPENBLAS_LIBRARY}" OR
+     NOT EXISTS "${ASK_OPENBLAS_ROOT}/.ask-openblas.json")
+    message(FATAL_ERROR "Prepare the pinned OpenBLAS SDK with python3 tools/fetch_deps.py --only openblas")
+  endif()
+  file(READ "${ASK_OPENBLAS_ROOT}/.ask-openblas.json" ASK_OPENBLAS_RECEIPT)
+  string(JSON ASK_OPENBLAS_RECEIPT GET "${ASK_OPENBLAS_RECEIPT}")
+  string(JSON ASK_OPENBLAS_EXPECTED GET "${ASK_OPENBLAS_LOCK}")
+  if(NOT ASK_OPENBLAS_RECEIPT STREQUAL ASK_OPENBLAS_EXPECTED)
+    message(FATAL_ERROR "OpenBLAS SDK does not match cmake/openblas.lock.json")
+  endif()
+  add_library(ASK::HostBLAS SHARED IMPORTED GLOBAL)
+  get_filename_component(ASK_OPENBLAS_REAL_LIBRARY "${ASK_OPENBLAS_ROOT}/${ASK_OPENBLAS_LIBRARY}" REALPATH)
+  set_target_properties(ASK::HostBLAS PROPERTIES
+    IMPORTED_LOCATION "${ASK_OPENBLAS_REAL_LIBRARY}"
+    IMPORTED_SONAME "${ASK_OPENBLAS_SONAME}")
+endif()

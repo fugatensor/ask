@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the pinned ASK LLVM/MLIR SDK into .deps.
+"""Fetch the pinned LLVM/MLIR and build the native OpenBLAS SDK into .deps.
 
 Uses only the Python standard library. Fetches the SDK into <repository>/.deps.
 Existing directories must carry a matching receipt and required files and are
@@ -16,6 +16,8 @@ from pathlib import Path, PurePosixPath
 import platform
 import posixpath
 import re
+import shutil
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -220,12 +222,47 @@ def fetch_llvm(lock: dict, destination: Path | str) -> Path:
     return target
 
 
+def fetch_openblas(lock: dict, destination: Path, jobs: int) -> Path:
+    _validate_common_lock(lock, {
+        "schema_version", "version", "platform", "directory", "sdk_directory", "url",
+        "sha256", "size_bytes", "unpacked_size_limit_bytes", "library", "symbol", "build_options",
+    }, "OpenBLAS")
+    destination = destination.expanduser().resolve()
+    destination.mkdir(parents=True, exist_ok=True)
+    target = destination / lock["sdk_directory"]
+    receipt = target / ".ask-openblas.json"
+    if target.exists():
+        if (not receipt.is_file() or json.loads(receipt.read_text()) != lock or
+                not all((target / path).is_file() for path in (
+                    lock["library"], "include/cblas.h", "share/licenses/OpenBLAS/LICENSE"))):
+            raise ValueError(f"OpenBLAS SDK is incomplete or differs from its lock: {target}")
+        return target
+    archive = destination / f"OpenBLAS-v{lock['version']}.tar.gz"
+    _download_archive(archive, lock)
+    with tempfile.TemporaryDirectory(dir=destination, prefix=".ask-openblas-build-") as temporary:
+        staging = Path(temporary)
+        _extract_archive(archive, staging, archive_filter(lock))
+        source, installed = staging / lock["directory"], staging / "sdk"
+        options = [f"{key}={value}" for key, value in lock["build_options"].items()]
+        options.append(f"MAKE_NB_JOBS={jobs}")
+        subprocess.run(["make", f"-j{jobs}", *options], cwd=source, check=True)
+        subprocess.run(["make", "install", f"PREFIX={installed}", *options], cwd=source, check=True)
+        license_dir = installed / "share/licenses/OpenBLAS"
+        license_dir.mkdir(parents=True)
+        shutil.copyfile(source / "LICENSE", license_dir / "LICENSE")
+        (installed / ".ask-openblas.json").write_text(json.dumps(lock, indent=2) + "\n")
+        installed.rename(target)
+    return target
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--destination", type=Path, default=ROOT / ".deps")
-    parser.add_argument("--only", choices=("llvm",), default="llvm",
-                        help="fetch the pinned LLVM/MLIR SDK")
+    parser.add_argument("--only", choices=("llvm", "openblas"),
+                        help="prepare one SDK; the default prepares both")
     parser.add_argument("--llvm-lock", type=Path, default=ROOT / "cmake" / "llvm.lock.json")
+    parser.add_argument("--openblas-lock", type=Path, default=ROOT / "cmake" / "openblas.lock.json")
+    parser.add_argument("--jobs", type=int, default=4, help="parallel OpenBLAS build jobs")
     args = parser.parse_args(argv)
     try:
         if args.only in (None, "llvm"):
@@ -237,8 +274,14 @@ def main(argv: list[str] | None = None) -> int:
             ):
                 raise ValueError("this LLVM SDK lock supports only Linux x86-64")
             print(fetch_llvm(llvm_lock, args.destination))
+        if args.only in (None, "openblas"):
+            if sys.platform != "linux" or platform.machine() not in ("x86_64", "AMD64"):
+                raise ValueError("the OpenBLAS SDK lock supports Linux x86-64")
+            if args.jobs <= 0:
+                raise ValueError("--jobs must be positive")
+            print(fetch_openblas(json.loads(args.openblas_lock.read_text()), args.destination, args.jobs))
         return 0
-    except (OSError, ValueError, tarfile.TarError) as exc:
+    except (OSError, ValueError, tarfile.TarError, subprocess.CalledProcessError) as exc:
         print(f"ASK dependency fetch failed: {exc}", file=sys.stderr)
         return 1
 

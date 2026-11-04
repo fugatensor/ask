@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> int:
     build_dir = args.build_dir.resolve()
     report = build_dir / "ci-tests.xml"
     expected = {"ask-core", "ask-compiler", "ask-pass", "ask-primitives"}
+    if "ASK_TARGET_BACKENDS:STRING=host" in (build_dir / "CMakeCache.txt").read_text():
+        expected.add("ask-host-blas")
     if args.cuda or args.cublaslt:
         expected.add("ask-runtime")
     if args.cublaslt:

@@ -107,17 +107,34 @@ void hostMatmulMatrix() {
               auto result = hostWorkspace(ask::test::hostMatmul(
                   dtype, batch, rows, columns, transposeA, transposeB, epilogue),
                   epilogue ? bytes : 0, epilogue ? 1 : 0);
-              require(result.ir.find("fmul <") != std::string::npos,
-                      "Host matmul must accumulate independent columns in f32");
-              require(result.ir.find("fast ") == std::string::npos &&
-                      result.ir.find("contract ") == std::string::npos &&
-                      result.ir.find("@llvm.fma") == std::string::npos,
-                      "Host matmul changed separate multiply/add rounding");
+              if (dtype == "f32") {
+                require(result.ir.find("call void @ask_cblas_sgemm") != std::string::npos &&
+                        result.abiJSON->find("\"link_libraries\":[\"openblas\"]") != std::string::npos,
+                        "Host f32 matmul must declare and invoke its OpenBLAS dependency");
+              } else {
+                require(result.ir.find("fmul <") != std::string::npos,
+                        "Host f16 matmul must accumulate independent columns in f32");
+                require(result.ir.find("fast ") == std::string::npos &&
+                        result.ir.find("contract ") == std::string::npos &&
+                        result.ir.find("@llvm.fma") == std::string::npos &&
+                        result.ir.find("ask_cblas_sgemm") == std::string::npos,
+                        "Host f16 matmul changed separate multiply/add rounding");
+              }
               require(result.ir.find("@llvm.masked") == std::string::npos,
                       "static matmul tails must not require runtime lane masks");
               ++cases;
             }
   std::cout << "Host matmul layout matrix: " << cases << " cases\n";
+  for (unsigned axis = 0; axis < 3; ++axis) for (int64_t dimension : {int64_t(2147483647), int64_t(2147483648)}) {
+    int64_t m = axis == 0 ? dimension : 1, n = axis == 1 ? dimension : 1, k = axis == 2 ? dimension : 1;
+    auto a = ask::test::tensor({m, k}, "f32"), b = ask::test::tensor({k, n}, "f32"), c = ask::test::tensor({m, n}, "f32");
+    const std::string source = "module { func.func @boundary(%a: " + a + ", %b: " + b + ") -> " + c +
+        " { %y = \"ask.matmul\"(%a, %b) : (" + a + ", " + b + ") -> " + c + " return %y : " + c + " } }";
+    bool rejected = false;
+    try { ask::compiler::codegen(source, {}); }
+    catch (const std::runtime_error &error) { rejected = std::string(error.what()).find("OpenBLAS LP64 range") != std::string::npos; }
+    require(rejected == (dimension > 2147483647), "OpenBLAS matrix dimensions were not checked before code generation");
+  }
 }
 void cudaReductionMatrix() {
   ask::compiler::CodegenOptions options;

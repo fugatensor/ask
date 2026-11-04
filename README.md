@@ -21,7 +21,7 @@ ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态�
 
 ## 构建、安装与验证
 
-构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)。执行计划由 ASK 自有 C++ 静态校验器检查，用途见[计划校验](docs/规则证明与计划校验.md)。下载脚本使用 Python 3 标准库。
+构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)。执行计划由 ASK 自有 C++ 静态校验器检查，用途见[计划校验](docs/规则证明与计划校验.md)。下载脚本使用 Python 3 标准库，并通过 C 编译器与 Make 构建锁定的原生 OpenBLAS SDK，供 Host f32 矩阵乘法使用。
 
 ```bash
 python3 tools/fetch_deps.py
@@ -51,7 +51,7 @@ cmake --build --preset core
 ctest --preset core --output-on-failure
 ```
 
-默认 CTest 运行 `ask-core`、`ask-compiler`、`ask-pass` 和 `ask-primitives`，启用 GPU 后增加 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。源码与 SDK 消费测试位于 `tests/`，覆盖范围见[测试体系](docs/工程结构与测试体系.md)。
+默认 CTest 运行 `ask-core`、`ask-compiler`、`ask-pass`、`ask-primitives` 和 `ask-host-blas`，启用 GPU 后增加 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。源码与 SDK 消费测试位于 `tests/`，覆盖范围见[测试体系](docs/工程结构与测试体系.md)。
 
 FugaTensor 的[端到端测试](../fugatensor/docs/测试.md)覆盖图降级、数值、求导和外部 kernel 调度。
 
