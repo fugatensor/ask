@@ -25,7 +25,7 @@
 - 六种显式类型、单步 RNE 常量和 6×6 转换；Host 执行使用 `bool/i32/i64/f32/f16`，`bf16` 执行使用 CUDA `sm_80+`。
 - C++ `ASK::Compiler`、`ASK::Runtime`、`ASK::Core` 与 `ask-opt`；形状推导、溯源提取、自有常量折叠、DCE 和逐元素融合。
 - 自有 Host 共享循环 `.o` 与 CUDA cubin 代码生成；多端口、0-D 张量和空张量。
-- 广播、转置、归约、条件选择及浮点函数；CUDA 矩阵乘法使用 cuBLASLt，CPU 使用 Host 降级。
+- 广播、转置、归约、条件选择及浮点函数；CUDA 矩阵乘法使用 cuBLASLt，CPU f32 使用 OpenBLAS，f16 使用自有代码生成。
 - 外部 cubin/PTX 接入与协议 v2；调用方运行 worker，每个外部节点是独立计划步骤。
 - 原生常驻会话、设备缓冲区、整计划提交、异步事件与资源复用、CUDA Graph replay；FugaTensor 在此基础上提供 CAI 借用、磁盘缓存和可迁移多 kernel 编译包。
 
@@ -38,7 +38,7 @@
 | 项目 | 提供的接口 | 构建时消费 |
 | --- | --- | --- |
 | FugaTensor | Python Tensor API、Fuga IR、自动微分、第三方 worker | ASK 安装包中的 `Compiler`、`Runtime`，以及 nanobind |
-| ASK | C++ 编译器、设备运行时、执行计划校验 | LLVM/MLIR；CUDA matmul 可选 cuBLASLt 头文件 |
+| ASK | C++ 编译器、设备运行时、执行计划校验 | LLVM/MLIR、Host OpenBLAS SDK；CUDA matmul 可选 cuBLASLt 头文件 |
 
 FugaTensor 先通过 Fuga IR 完成图变换，再向 ASK 提交静态图。ASK 构建计划，通过自有 C++ 校验器检查缓冲区与存储槽位。Tensor 与微分规则由 FugaTensor 维护，执行计划与槽位约束由 ASK 维护。
 
