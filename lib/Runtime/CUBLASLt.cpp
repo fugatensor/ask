@@ -139,7 +139,7 @@ std::shared_ptr<CUBLASLtMatmul> CUBLASLtMatmul::prepare(
   auto p = std::make_unique<Impl>(); p->context = context;
   auto &library = *context->library;
   // FP32 inputs retain IEEE precision. Low precision inputs accumulate in FP32.
-  const auto compute = d.elementType == "f32" ? CUBLAS_COMPUTE_32F_PEDANTIC : CUBLAS_COMPUTE_32F;
+  const auto compute = d.elementType == "f32" ? CUBLAS_COMPUTE_32F_FAST_TF32 : CUBLAS_COMPUTE_32F;
   const auto type = d.elementType == "f32" ? CUDA_R_32F : d.elementType == "f16" ? CUDA_R_16F : CUDA_R_16BF;
   check(library.cublasLtMatmulDescCreate(&p->operation, compute, CUDA_R_32F), "cublasLtMatmulDescCreate");
   const auto transposeA = d.transposeA ? CUBLAS_OP_T : CUBLAS_OP_N;

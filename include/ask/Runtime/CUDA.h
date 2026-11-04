@@ -35,7 +35,8 @@ struct PlanArgument {
 };
 
 // Contiguous row-major matrices. Transpose flags apply to the last two axes;
-// batchCount is the product of matching leading dimensions. Accumulation is f32.
+// batchCount is the product of matching leading dimensions. Accumulation is f32;
+// f32 inputs allow TF32 multiplication while retaining f32 storage.
 struct MatmulDescription {
   std::string elementType = "f32";
   std::uint64_t m = 0, n = 0, k = 0, batchCount = 1;
@@ -114,6 +115,10 @@ public:
       const std::vector<std::shared_ptr<DeviceBuffer>> &inputs);
 private:
   friend class Session;
+  void bindPort(std::vector<std::shared_ptr<DeviceBuffer>> &bound, std::size_t index,
+                const std::shared_ptr<DeviceBuffer> &buffer) const;
+  std::shared_ptr<Event> enqueue(const std::shared_ptr<Session> &session,
+                                std::vector<std::shared_ptr<DeviceBuffer>> bound);
   struct Impl;
   explicit PreparedProgram(std::unique_ptr<Impl> impl);
   std::unique_ptr<Impl> impl;

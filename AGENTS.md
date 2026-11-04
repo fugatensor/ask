@@ -32,7 +32,7 @@
   - Host 使用 `bool/i32/i64/f32/f16` 五种类型；`bf16` 的执行目标为 CUDA `sm_80+`。
   - `ask.constant` 按单步最近偶数舍入（RNE）编码浮点字面量，64 位整数保持完整精度。
   - `ask.cast` 浮点转整数采用确定性饱和截断（`NaN` 置 0，溢出钳制到目标整数极值）。
-  - CUDA matmul 支持 f32/f16/bf16，累加及分段中间值为 f32；f32 使用 PEDANTIC。归约 sum 按输入 dtype 逐步舍入，需要 f32 时显式 cast。
+  - CUDA matmul 支持 f32/f16/bf16，累加及分段中间值为 f32；f32 允许 TF32 乘法输入精度。归约 sum 按输入 dtype 逐步舍入，需要 f32 时显式 cast。
   - 自有 CUDA 计算通过 `llc -fp-contract=off` 保持乘加分别舍入；外部 cubin/PTX 保留生产者数值策略，ASK 不改写第三方代码。
 
 ---

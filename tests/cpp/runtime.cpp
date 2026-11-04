@@ -12,6 +12,49 @@ namespace {
 using namespace ask::runtime;
 namespace matrix = ask::test::graph_matrix;
 
+void portBindings(const std::string &ptx) {
+  auto session = Session::create(), other = Session::create();
+  auto kernel = session->load(ptx, "double_i32", {"i32"}, 80, {0, 0});
+  auto input = session->allocate(16), wrongSize = session->allocate(8), foreign = other->allocate(16);
+  const std::array<std::int32_t, 4> values{1, -2, 3, 4};
+  input->copyFromHost(values.data(), sizeof(values));
+  auto readonly = session->importBuffer(input->pointer(), 16, true);
+  const auto rejects = [](auto operation) {
+    try { operation(); }
+    catch (const CUDAError &) { return; }
+    throw std::runtime_error("invalid public port was accepted");
+  };
+  for (bool graph : {false, true}) {
+    auto identity = session->prepareProgram({16}, {0}, {0, 0}, {}, graph);
+    const auto beforeIdentity = session->stats().at("allocations");
+    auto [aliases, aliasEvent] = identity->run({readonly}); aliasEvent->wait();
+    if (aliases.size() != 2 || aliases[0] != readonly || aliases[1] != readonly ||
+        session->stats().at("allocations") != beforeIdentity)
+      throw std::runtime_error("input outputs were allocated or lost identity");
+    PlanStep step;
+    step.kernel = kernel; step.arguments = {{0, {}}, {1, {}}};
+    step.inputs = {0}; step.outputs = {1}; step.grid = {1, 1, 1}; step.block = {32, 1, 1};
+    auto program = session->prepareProgram({16, 16}, {0}, {1, 1}, {step}, graph);
+    const auto beforeInvalid = session->stats().at("allocations");
+    for (const auto &invalid : {std::shared_ptr<DeviceBuffer>{}, wrongSize, foreign})
+      rejects([&] { program->run({invalid}); });
+    if (session->stats().at("allocations") != beforeInvalid)
+      throw std::runtime_error("invalid run allocated outputs before input validation");
+    auto [outputs, event] = program->run({readonly}); event->wait();
+    if (outputs.size() != 2 || outputs[0] != outputs[1])
+      throw std::runtime_error("repeated output did not share its allocated buffer");
+    std::array<std::int32_t, 4> actual{};
+    outputs[0]->copyToHost(actual.data(), sizeof(actual));
+    for (std::size_t i = 0; i < values.size(); ++i)
+      if (actual[i] != values[i] * 2) throw std::runtime_error("allocated run result mismatch");
+    auto readonlyOutput = session->importBuffer(outputs[0]->pointer(), 16, true);
+    rejects([&] { program->submit({input}, {readonlyOutput, readonlyOutput}); });
+    rejects([&] { program->submit({input}, {input, input}); });
+    rejects([&] { program->submit({input}, {outputs[0], input}); });
+    program->submit({input}, outputs)->wait();
+  }
+}
+
 std::size_t deepForkMatrix(const std::shared_ptr<Session> &session, const std::string &ptx) {
   auto kernel = session->load(ptx, "map_i32", {"i32"}, 80, {0, 0, 4});
   auto input = session->allocate(0);
@@ -143,6 +186,7 @@ int main() {
     std::ifstream source(ASK_RUNTIME_FIXTURE);
     if (!source) throw std::runtime_error("cannot open runtime PTX fixture");
     const std::string ptx((std::istreambuf_iterator<char>(source)), {});
+    portBindings(ptx);
     auto session = Session::create();
     auto kernel = session->load(ptx, "double_i32", {"i32"}, 80, {0, 0});
     std::vector<PlanStep> steps;

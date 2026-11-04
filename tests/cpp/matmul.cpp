@@ -1,6 +1,7 @@
 #include <ask/Runtime/CUDA.h>
 
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -184,9 +185,40 @@ void precisionAndResidency() {
   auto a = upload(session, {precise}, "f32"), b = upload(session, {1}, "f32");
   auto [outputs, event] = program->run({a, b});
   event->wait();
-  check(outputs[0], "f32", {precise}, "f32 precision");
+  const auto actual = decode(outputs[0]->copyToHost(), "f32");
+  require(actual.size() == 1 && std::abs(actual[0] - precise) <= std::ldexp(precise, -11),
+          "f32 multiplication exceeded TF32 rounding error");
   require(session->stats().at("peak_resident_device_bytes") >=
           session->stats().at("resident_device_bytes"), "resident peak mismatch");
+}
+
+void float32Accuracy() {
+  auto session = Session::create();
+  for (const auto shape : {std::array<std::uint64_t, 3>{17, 9, 65}, {64, 32, 128}})
+    for (bool graph : {false, true}) {
+      const auto [m, n, k] = shape;
+      MatmulDescription description{"f32", m, n, k};
+      std::vector<float> a(m * k), b(k * n);
+      for (std::size_t i = 0; i < a.size(); ++i) a[i] = float(int(i * 7 % 31) - 15) / 37;
+      for (std::size_t i = 0; i < b.size(); ++i) b[i] = float(int(i * 11 % 29) - 14) / 41;
+      auto program = prepare(session, description, graph);
+      auto [outputs, event] = program->run({upload(session, a, "f32"), upload(session, b, "f32")});
+      event->wait();
+      const auto actual = decode(outputs[0]->copyToHost(), "f32");
+      // Bound input rounding and f32 accumulation against a double reference.
+      const double u = std::ldexp(1.0, -11), accumulation = k * std::ldexp(1.0, -24);
+      const double relative = 2 * u + u * u + accumulation / (1 - accumulation) * (1 + u) * (1 + u);
+      for (std::size_t row = 0; row < m; ++row)
+        for (std::size_t column = 0; column < n; ++column) {
+          double expected = 0, magnitude = 0;
+          for (std::size_t inner = 0; inner < k; ++inner) {
+            const double term = double(a[row * k + inner]) * b[inner * n + column];
+            expected += term; magnitude += std::abs(term);
+          }
+          require(std::abs(actual[row * n + column] - expected) <= relative * magnitude + 1e-7,
+                  "f32 matmul exceeded TF32 input and f32 accumulation error");
+        }
+    }
 }
 
 void importedAddresses() {
@@ -319,6 +351,7 @@ int main() {
     matrix();
     for (bool graph : {false, true}) mixedPlan(graph, ptx);
     precisionAndResidency();
+    float32Accuracy();
     importedAddresses();
     branchMatrix();
     for (bool graph : {false, true})

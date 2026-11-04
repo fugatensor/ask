@@ -311,6 +311,8 @@ struct PreparedProgram::Impl {
   std::shared_ptr<SessionState> state;
   std::weak_ptr<Session> session;
   std::vector<std::size_t> sizes, inputs, outputs;
+  std::vector<std::size_t> allocatedOutputs;
+  std::vector<std::pair<std::size_t, std::size_t>> disjointPorts;
   // Public ports use caller-owned storage; only internal buffers have slots.
   std::vector<std::size_t> slotCapacities;
   std::vector<Step> steps;
@@ -745,6 +747,13 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
   using Program=PreparedProgram::Impl;
   auto p=std::make_unique<Program>();p->session=shared_from_this();p->state=impl->state;
   p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
+  std::set<std::size_t> publicPorts(p->inputs.begin(),p->inputs.end());
+  publicPorts.insert(p->outputs.begin(),p->outputs.end());
+  for(auto index:std::set<std::size_t>(p->outputs.begin(),p->outputs.end())) {
+    if(std::find(p->inputs.begin(),p->inputs.end(),index)!=p->inputs.end()) continue;
+    p->allocatedOutputs.push_back(index);
+    for(auto other:publicPorts) if(other!=index) p->disjointPorts.emplace_back(index,other);
+  }
   p->slotCapacities=std::move(allocation.slot_capacity_bytes);
   s.counters["prepared_internal_slots"]+=p->slotCapacities.size();
   for(auto capacity:p->slotCapacities) s.counters["prepared_internal_bytes"]+=capacity;
@@ -796,6 +805,13 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
 
 PreparedProgram::PreparedProgram(std::unique_ptr<Impl> impl):impl(std::move(impl)){}
 PreparedProgram::~PreparedProgram()=default;
+void PreparedProgram::bindPort(std::vector<std::shared_ptr<DeviceBuffer>> &bound,
+    std::size_t index,const std::shared_ptr<DeviceBuffer> &buffer) const {
+  require(buffer && buffer->impl->state==impl->state,"program tensor belongs to a different CUDA execution session");
+  require(buffer->size()==impl->sizes[index],"program tensor byte count differs from its compiled type");
+  require(!bound[index] || bound[index]->pointer()==buffer->pointer(),"repeated logical buffers must use the same device storage");
+  bound[index]=buffer;
+}
 std::shared_ptr<Event> PreparedProgram::submit(
     const std::vector<std::shared_ptr<DeviceBuffer>> &inputs,
     const std::vector<std::shared_ptr<DeviceBuffer>> &outputs) {
@@ -803,26 +819,20 @@ std::shared_ptr<Event> PreparedProgram::submit(
   auto &s=*session->impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   require(inputs.size()==impl->inputs.size() && outputs.size()==impl->outputs.size(),"program input/output count differs from its contract");
   std::vector<std::shared_ptr<DeviceBuffer>> bound(impl->sizes.size());
-  auto bind=[&](std::size_t index,const std::shared_ptr<DeviceBuffer> &buffer,bool output) {
-    require(buffer && buffer->impl->state==session->impl->state,"program tensor belongs to a different CUDA execution session");
-    require(buffer->size()==impl->sizes[index],"program tensor byte count differs from its compiled type");
-    bool input=std::find(impl->inputs.begin(),impl->inputs.end(),index)!=impl->inputs.end();
-    require(!output || input || !buffer->readonly(),"program output tensor is read-only");
-    require(!bound[index] || bound[index]->pointer()==buffer->pointer(),"repeated logical buffers must use the same device storage");
-    bound[index]=buffer;
-  };
-  for(std::size_t i=0;i<inputs.size();++i) bind(impl->inputs[i],inputs[i],false);
-  for(std::size_t i=0;i<outputs.size();++i) bind(impl->outputs[i],outputs[i],true);
-  for(auto index:impl->outputs) {
-    if(std::find(impl->inputs.begin(),impl->inputs.end(),index)!=impl->inputs.end()) continue;
-    const auto &output=bound[index];
-    for(std::size_t other=0;other<bound.size();++other) {
-      if(other==index || !bound[other]) continue;
-      const auto &buffer=bound[other];
-      require(!output->size() || !buffer->size() || output->pointer()+output->size()<=buffer->pointer() ||
-              buffer->pointer()+buffer->size()<=output->pointer(),"distinct program output buffers must not overlap other ports");
-    }
+  for(std::size_t i=0;i<inputs.size();++i) bindPort(bound,impl->inputs[i],inputs[i]);
+  for(std::size_t i=0;i<outputs.size();++i) bindPort(bound,impl->outputs[i],outputs[i]);
+  for(auto index:impl->allocatedOutputs)
+    require(!bound[index]->readonly(),"program output tensor is read-only");
+  for(const auto &[index,other]:impl->disjointPorts) {
+    const auto &output=bound[index];const auto &buffer=bound[other];
+    require(!output->size() || !buffer->size() || output->pointer()+output->size()<=buffer->pointer() ||
+            buffer->pointer()+buffer->size()<=output->pointer(),"distinct program output buffers must not overlap other ports");
   }
+  return enqueue(session,std::move(bound));
+}
+std::shared_ptr<Event> PreparedProgram::enqueue(const std::shared_ptr<Session> &session,
+    std::vector<std::shared_ptr<DeviceBuffer>> bound) {
+  auto &s=*session->impl->state;
   for(const auto &[index,alignment]:impl->alignedPorts)
     require(bound[index]->pointer()%alignment==0,"matmul buffer address is not aligned to its element type");
   session->reap();
@@ -879,7 +889,7 @@ std::shared_ptr<Event> PreparedProgram::submit(
       workspace->graphValues[i]=workspace->values[i];++s.counters["graph_node_updates"];
     }
   }
-  auto event=session->completion();event->impl->buffers=bound;event->impl->program=shared_from_this();
+  auto event=session->completion();event->impl->buffers=std::move(bound);event->impl->program=shared_from_this();
   workspace->busy=true;event->impl->releaseWorkspace=[workspace]{workspace->busy=false;};
   try {
     if(impl->graph) {
@@ -906,12 +916,11 @@ std::pair<std::vector<std::shared_ptr<DeviceBuffer>>,std::shared_ptr<Event>> Pre
   auto &s=*session->impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   require(inputs.size()==impl->inputs.size(),"program input count differs from its contract");
   std::vector<std::shared_ptr<DeviceBuffer>> bound(impl->sizes.size()),outputs;
-  for(std::size_t i=0;i<inputs.size();++i) bound[impl->inputs[i]]=inputs[i];
-  for(auto index:impl->outputs) {
-    if(!bound[index]) bound[index]=session->allocate(impl->sizes[index]);
-    outputs.push_back(bound[index]);
-  }
-  auto event=submit(inputs,outputs);return {std::move(outputs),std::move(event)};
+  for(std::size_t i=0;i<inputs.size();++i) bindPort(bound,impl->inputs[i],inputs[i]);
+  for(auto index:impl->allocatedOutputs) bound[index]=session->allocate(impl->sizes[index]);
+  outputs.reserve(impl->outputs.size());
+  for(auto index:impl->outputs) outputs.push_back(bound[index]);
+  auto event=enqueue(session,std::move(bound));return {std::move(outputs),std::move(event)};
 }
 void Session::waitForExternalStream(std::uint64_t stream) {
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();

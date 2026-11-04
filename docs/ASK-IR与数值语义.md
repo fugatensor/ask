@@ -76,7 +76,9 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 
 输入使用相同的 f32、f16 或 bf16，秩至少为 2，前导批次维度逐项相同。`transpose_a`、`transpose_b` 是默认 false 的布尔属性，作用于最后两轴；逻辑形状满足 `[..., M, K] × [..., K, N] → [..., M, N]`。CUDA 库步骤的批次数上限为有符号 32 位整数。`K=0` 产生零，空批次或空输出保持空张量。
 
-结果保持输入类型，累加使用 f32。CUDA cuBLASLt 的 f32 输入采用 `CUBLAS_COMPUTE_32F_PEDANTIC`；f16/bf16 使用 f32 累加及 f32 分段归约中间值。库算法决定归约顺序。Host 通过行主序循环计算，f32 乘法和加法分别舍入。末两轴的转置可在优化时吸收到 matmul 标志中。
+结果保持输入类型，累加使用 f32。CUDA cuBLASLt 的 f32 输入采用 `CUBLAS_COMPUTE_32F_FAST_TF32`，允许 TF32 乘法；f16/bf16 使用 f32 累加及 f32 分段归约中间值。Host f32 调用单线程 OpenBLAS SGEMM，由库决定 f32 累加顺序；Host f16 使用 f32 逐步乘加并最终舍入为 f16。末两轴的转置可在优化时吸收到 matmul 标志中。
+
+库矩阵乘法按允许的输入精度与归约误差验证数值。逐元素运算和自有归约继续遵循各自的舍入规则。
 
 <a id="types-and-precision"></a>
 
