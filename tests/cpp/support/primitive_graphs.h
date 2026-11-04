@@ -55,6 +55,23 @@ inline std::string matmul(const std::string &dtype, int64_t batch, bool transpos
       "%z = \"ask.add\"(%y, %y) : (" + ct + ", " + ct + ") -> " + ct + "\n"
       "return %z : " + ct + " } }";
 }
+inline std::string hostMatmul(const std::string &dtype, int64_t batch,
+    int64_t rows, int64_t columns, bool transposeA, bool transposeB, bool epilogue) {
+  constexpr int64_t inner = 5;
+  std::vector<int64_t> a, b, c;
+  if (batch > 0) { a.push_back(batch);b.push_back(batch);c.push_back(batch); }
+  a.insert(a.end(), transposeA ? std::initializer_list<int64_t>{inner, rows}
+                              : std::initializer_list<int64_t>{rows, inner});
+  b.insert(b.end(), transposeB ? std::initializer_list<int64_t>{columns, inner}
+                              : std::initializer_list<int64_t>{inner, columns});
+  c.insert(c.end(), {rows, columns});
+  auto at = tensor(a, dtype), bt = tensor(b, dtype), ct = tensor(c, dtype);
+  auto body = "%y = \"ask.matmul\"(%a, %b) {transpose_a = " + std::string(transposeA ? "true" : "false") +
+      ", transpose_b = " + (transposeB ? "true" : "false") + "} : (" + at + ", " + bt + ") -> " + ct + "\n";
+  if (epilogue) body += "%z = \"ask.add\"(%y, %y) : (" + ct + ", " + ct + ") -> " + ct + "\n";
+  return "module { func.func @matmul(%a: " + at + ", %b: " + bt + ") -> " + ct + " {\n" + body +
+      "return " + (epilogue ? "%z" : "%y") + " : " + ct + " } }";
+}
 inline std::string reductionExpansion(int64_t extent, bool reduceAxis, const std::string &operation) {
   const std::vector<int64_t> shape{2, extent};
   auto reducedShape = reduceAxis ? std::vector<int64_t>{2} : shape;

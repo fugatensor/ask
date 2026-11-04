@@ -14,6 +14,7 @@
 #include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/MC/TargetRegistry.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/TargetSelect.h"
 #include "llvm/Target/TargetMachine.h"
@@ -47,6 +48,7 @@ llvm::Expected<std::unique_ptr<llvm::TargetMachine>> makeHostMachine() {
   if (!target)
     return error("cannot create host target: " + reason);
   llvm::TargetOptions options;
+  options.AllowFPOpFusion = llvm::FPOpFusion::Strict;
   llvm::SubtargetFeatures features;
   for (const auto &feature : llvm::sys::getHostCPUFeatures())
     features.AddFeature(feature.getKey(), feature.getValue());
@@ -213,6 +215,13 @@ WorkspacePlan planWorkspace(mlir::func::FuncOp graph) {
   for (auto &op : graph.front()) {
     if (!op.getNumResults() || !plan.live.contains(op.getResult(0)) ||
         concreteCount(op.getResult(0).getType()) == 0) continue;
+    if (mlir::isa<MatmulOp>(op) && llvm::any_of(op.getResult(0).getUsers(),
+        [&](mlir::Operation *user) {
+          return user->getNumResults() && plan.live.contains(user->getResult(0));
+        })) {
+      plan.materialized.insert(op.getResult(0));
+      expensive.clear();
+    }
     for (auto operand : op.getOperands())
       if ((mlir::isa<MatmulOp>(op) || concreteCount(op.getResult(0).getType()) > concreteCount(operand.getType())) &&
           hasReduction(operand)) {
@@ -221,6 +230,25 @@ WorkspacePlan planWorkspace(mlir::func::FuncOp graph) {
       }
   }
   return plan;
+}
+
+template<class Emit>
+void emitHostLoop(llvm::IRBuilder<> &builder, llvm::Function *function,
+                  uint64_t count, uint64_t step, Emit emit) {
+  if (!count) return;
+  if (count == step) { emit(builder.getInt64(0));return; }
+  auto *before = builder.GetInsertBlock();
+  auto *body = llvm::BasicBlock::Create(builder.getContext(), "tile.loop", function);
+  auto *after = llvm::BasicBlock::Create(builder.getContext(), "tile.done", function);
+  builder.CreateBr(body);
+  builder.SetInsertPoint(body);
+  auto *index = builder.CreatePHI(builder.getInt64Ty(), 2, "tile.index");
+  index->addIncoming(builder.getInt64(0), before);
+  emit(index);
+  auto *next = builder.CreateAdd(index, builder.getInt64(step));
+  index->addIncoming(next, builder.GetInsertBlock());
+  builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(count)), body, after);
+  builder.SetInsertPoint(after);
 }
 
 struct WorkspaceBuffer {
@@ -511,6 +539,50 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       for (const auto &entry : uniformValues) emitter.bindUniform(entry.first, entry.second);
       for (const auto &entry : cachedBuffers) emitter.bindBuffer(entry.first, entry.second);
     };
+    auto emitMatmul = [&](mlir::Value value, llvm::Value *address) {
+      auto type = mlir::cast<mlir::RankedTensorType>(value.getType());
+      const uint64_t columns = type.getShape().back();
+      const uint64_t rows = type.getShape()[type.getRank() - 2];
+      constexpr unsigned width = 16, height = 4;
+      const uint64_t fullColumns = columns / width * width;
+      const uint64_t fullRows = rows / height * height;
+      llvm::SmallVector<mlir::Value> reads;
+      emitHostLoop(builder, function, concreteCount(type) / (rows * columns), 1, [&](llvm::Value *batch) {
+        auto *batchBase = builder.CreateMul(batch, builder.getInt64(rows * columns));
+        auto rowTile = [&](llvm::Value *row, unsigned tileRows) {
+          auto *base = builder.CreateAdd(batchBase, builder.CreateMul(row, builder.getInt64(columns)));
+          auto tile = [&](llvm::Value *column, unsigned lanes) {
+            auto *index = builder.CreateAdd(base, column);
+            lowering::ScalarEmitter emitter(builder, function, false, load);
+            bind(emitter);
+            auto *computed = emitter.emitMatmulTile(value, index, lanes, tileRows);
+            for (unsigned offset = 0; offset < tileRows; ++offset) {
+              llvm::Value *rowValue = computed;
+              if (tileRows > 1) {
+                if (lanes == 1) rowValue = builder.CreateExtractElement(computed, offset);
+                else {
+                  llvm::SmallVector<int> mask;
+                  for (unsigned lane = 0; lane < lanes; ++lane) mask.push_back(offset * lanes + lane);
+                  rowValue = builder.CreateShuffleVector(computed, mask);
+                }
+              }
+              auto *outputIndex = builder.CreateAdd(index, builder.getInt64(offset * columns));
+              auto *destination = builder.CreateGEP(llvmStorageType(type, context), address, outputIndex);
+              builder.CreateAlignedStore(rowValue, destination, llvm::Align(elementByteWidth(type)));
+            }
+            reductionLoops += emitter.reductionLoops;
+            reads.append(emitter.bufferReads);
+          };
+          emitHostLoop(builder, function, fullColumns, width,
+              [&](llvm::Value *column) { tile(column, width); });
+          if (columns != fullColumns) tile(builder.getInt64(fullColumns), columns - fullColumns);
+        };
+        emitHostLoop(builder, function, fullRows, height,
+            [&](llvm::Value *row) { rowTile(row, height); });
+        if (rows != fullRows) rowTile(builder.getInt64(fullRows), rows - fullRows);
+      });
+      return reads;
+    };
     for (auto &op : graph.front()) {
       if (!op.getNumResults()) continue;
       auto value = op.getResult(0);
@@ -527,6 +599,16 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       }
       auto *address = llvm::GetElementPtrInst::Create(builder.getInt8Ty(), workspace,
           {builder.getInt64(0)}, "cached.buffer", builder.GetInsertBlock());
+      if (mlir::isa<MatmulOp>(op)) {
+        auto reads = emitMatmul(value, address);
+        cachedBuffers[value] = address;
+        const auto phase = workspacePhases.size();
+        workspaceBuffers.push_back({value, address,
+            concreteCount(value.getType()) * elementByteWidth(value.getType()),
+            elementByteWidth(value.getType()), phase, phase});
+        workspacePhases.push_back(std::move(reads));
+        continue;
+      }
       auto *before = builder.GetInsertBlock();
       auto *body = llvm::BasicBlock::Create(context, "materialize.loop", function);
       auto *after = llvm::BasicBlock::Create(context, "materialize.done", function);
@@ -558,6 +640,13 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         continue; // No input or output pointer is dereferenced for empty results.
       }
       ++loopCount;
+      auto value = returned.getOperand(batch.outputs.front());
+      if (value.getDefiningOp<MatmulOp>() && !cachedBuffers.contains(value) &&
+          !uniformValues.contains(value)) {
+        workspacePhases.push_back(emitMatmul(value,
+            function->getArg(graph.getNumArguments() + batch.outputs.front())));
+        continue;
+      }
       bool shared = batch.outputs.size() > 1;
       if (shared) {
         ++fusedOutputGroups;
@@ -673,6 +762,18 @@ llvm::Error emitHostObject(llvm::Module &module, llvm::StringRef path) {
   llvm::raw_string_ostream stream(diagnostic);
   if (llvm::verifyModule(module, &stream))
     return error("cannot emit an object for invalid LLVM IR: " + stream.str());
+  llvm::LoopAnalysisManager loops;
+  llvm::FunctionAnalysisManager functions;
+  llvm::CGSCCAnalysisManager calls;
+  llvm::ModuleAnalysisManager modules;
+  llvm::PassBuilder optimizer(target->get());
+  optimizer.registerLoopAnalyses(loops);
+  optimizer.registerFunctionAnalyses(functions);
+  optimizer.registerCGSCCAnalyses(calls);
+  optimizer.registerModuleAnalyses(modules);
+  optimizer.crossRegisterProxies(loops, functions, calls, modules);
+  auto pipeline = optimizer.buildPerModuleDefaultPipeline(llvm::OptimizationLevel::O3);
+  pipeline.run(module, modules);
   std::error_code ec;
   llvm::raw_fd_ostream output(path, ec, llvm::sys::fs::OF_None);
   if (ec)

@@ -93,11 +93,37 @@ void workspaceMatrix() {
       }
   std::cout << "Host workspace matrix: " << cases << " cases\n";
 }
+void hostMatmulMatrix() {
+  std::size_t cases = 0;
+  for (const std::string dtype : {"f32", "f16"})
+    for (int64_t batch : {0, 2})
+     for (int64_t rows : {3, 4, 5, 8})
+      for (int64_t columns : {1, 15, 16, 17, 32, 33})
+        for (bool transposeA : {false, true})
+          for (bool transposeB : {false, true})
+            for (bool epilogue : {false, true}) {
+              const auto elements = (batch ? batch : 1) * rows * columns;
+              const auto bytes = elements * (dtype == "f32" ? 4 : 2);
+              auto result = hostWorkspace(ask::test::hostMatmul(
+                  dtype, batch, rows, columns, transposeA, transposeB, epilogue),
+                  epilogue ? bytes : 0, epilogue ? 1 : 0);
+              require(result.ir.find("fmul <") != std::string::npos,
+                      "Host matmul must accumulate independent columns in f32");
+              require(result.ir.find("fast ") == std::string::npos &&
+                      result.ir.find("contract ") == std::string::npos &&
+                      result.ir.find("@llvm.fma") == std::string::npos,
+                      "Host matmul changed separate multiply/add rounding");
+              require(result.ir.find("@llvm.masked") == std::string::npos,
+                      "static matmul tails must not require runtime lane masks");
+              ++cases;
+            }
+  std::cout << "Host matmul layout matrix: " << cases << " cases\n";
+}
 }
 int main() {
   try {
     const bool host = ask::compilerCapabilitiesJSON().find("\"host_codegen\":true") != std::string::npos;
-    if (host) workspaceMatrix();
+    if (host) { workspaceMatrix();hostMatmulMatrix(); }
     for (const std::string dtype : {"f32", "f16", "bf16"})
       for (bool constant : {false, true}) {
         auto plan = ask::compiler::partition(ask::test::publicScalar(dtype, constant));

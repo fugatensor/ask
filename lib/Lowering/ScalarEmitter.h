@@ -159,7 +159,8 @@ class ScalarEmitter {
       return mlir::isa<ReduceSumOp>(op) ? binary(op, accumulator, value) : maximum(accumulator, value);
     });
   }
-  llvm::Value *matmul(mlir::Operation *op, llvm::Value *index) {
+  llvm::Value *matmul(mlir::Operation *op, llvm::Value *index,
+                       unsigned width = 1, unsigned height = 1) {
     auto a = op->getOperand(0), c = op->getOperand(1);
     auto aShape = shape(a.getType()), cShape = shape(c.getType());
     auto outputShape = shape(op->getResult(0).getType());
@@ -176,17 +177,37 @@ class ScalarEmitter {
     auto *column = coordinate(index, outputShape, rank - 1);
     auto *aBase = b.CreateMul(batch, b.getInt64(aShape[rank - 2] * aShape[rank - 1]));
     auto *cBase = b.CreateMul(batch, b.getInt64(cShape[rank - 2] * cShape[rank - 1]));
-    auto *result = accumulate(k, llvm::ConstantFP::get(b.getFloatTy(), 0.0),
+    const unsigned lanes = width * height;
+    llvm::Type *accumulatorType = b.getFloatTy();
+    if (lanes > 1) accumulatorType = llvm::FixedVectorType::get(accumulatorType, lanes);
+    auto *result = accumulate(k, llvm::Constant::getNullValue(accumulatorType),
         [&](llvm::Value *inner, llvm::Value *accumulator) {
-      auto *aIndex = b.CreateAdd(aBase, b.CreateAdd(
-          b.CreateMul(transposeA ? inner : row, b.getInt64(aShape[rank - 1])), transposeA ? row : inner));
-      auto *cIndex = b.CreateAdd(cBase, b.CreateAdd(
-          b.CreateMul(transposeB ? column : inner, b.getInt64(cShape[rank - 1])), transposeB ? inner : column));
-      auto *left = llir::createNumericCast(b, emit(a, aIndex), b.getFloatTy());
-      auto *right = llir::createNumericCast(b, emit(c, cIndex), b.getFloatTy());
+      llvm::Value *left = lanes > 1 ? llvm::PoisonValue::get(accumulatorType) : nullptr;
+      llvm::Value *right = left;
+      for (unsigned offset = 0; offset < height; ++offset) {
+        auto *outputRow = offset ? b.CreateAdd(row, b.getInt64(offset)) : row;
+        auto *aIndex = b.CreateAdd(aBase, b.CreateAdd(
+            b.CreateMul(transposeA ? inner : outputRow, b.getInt64(aShape[rank - 1])),
+            transposeA ? outputRow : inner));
+        auto *value = llir::createNumericCast(b, emit(a, aIndex), b.getFloatTy());
+        for (unsigned lane = 0; lane < width; ++lane)
+          left = lanes > 1 ? b.CreateInsertElement(left, value, offset * width + lane) : value;
+      }
+      for (unsigned lane = 0; lane < width; ++lane) {
+        auto *outputColumn = lane ? b.CreateAdd(column, b.getInt64(lane)) : column;
+        auto *cIndex = b.CreateAdd(cBase, b.CreateAdd(
+            b.CreateMul(transposeB ? outputColumn : inner, b.getInt64(cShape[rank - 1])),
+            transposeB ? inner : outputColumn));
+        auto *value = llir::createNumericCast(b, emit(c, cIndex), b.getFloatTy());
+        for (unsigned offset = 0; offset < height; ++offset)
+          right = lanes > 1 ? b.CreateInsertElement(right, value, offset * width + lane) : value;
+      }
       return b.CreateFAdd(accumulator, b.CreateFMul(left, right), "matmul.accumulate");
     });
-    return llir::createNumericCast(b, result, llir::scalarLLVMType(op->getResult(0).getType(), b.getContext()));
+    auto *outputType = llir::scalarLLVMType(op->getResult(0).getType(), b.getContext());
+    if (lanes == 1) return llir::createNumericCast(b, result, outputType);
+    return outputType->isFloatTy() ? result
+        : b.CreateFPTrunc(result, llvm::FixedVectorType::get(outputType, lanes));
   }
 
 public:
@@ -199,6 +220,12 @@ public:
 
   void bindUniform(mlir::Value value, llvm::Value *computed) { uniformValues[value] = computed; }
   void bindBuffer(mlir::Value value, llvm::Value *address) { buffers[value] = address; }
+
+  // The host schedules each tile inside one batch, including its static tails.
+  llvm::Value *emitMatmulTile(mlir::Value value, llvm::Value *index,
+                              unsigned width, unsigned height) {
+    return matmul(value.getDefiningOp(), index, width, height);
+  }
 
   llvm::Value *emit(mlir::Value value, llvm::Value *index) {
     if (auto uniform = uniformValues.find(value); uniform != uniformValues.end()) return uniform->second;
