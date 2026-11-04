@@ -157,9 +157,62 @@ class ScalarEmitter {
       if (outputType->isFloatingPointTy()) value = llir::createNumericCast(b, value, b.getFloatTy());
       return combine(previous, value);
     };
-    auto *value = accumulate(count / 32, initial, [&](llvm::Value *block, llvm::Value *previous) {
-      return update(b.CreateAdd(b.CreateMul(block, b.getInt64(32)), warpLane), previous);
-    });
+    const uint64_t warps = count / 32;
+    llvm::Value *value = nullptr;
+    if (warps >= 8) {
+      const uint64_t unrollBlocks = warps / 4;
+      ++reductionLoops;
+      auto *before = b.GetInsertBlock();
+      auto *body = llvm::BasicBlock::Create(b.getContext(), "reduce.unroll.loop", function);
+      auto *after = llvm::BasicBlock::Create(b.getContext(), "reduce.unroll.done", function);
+      b.CreateBr(body);
+      b.SetInsertPoint(body);
+
+      auto *iter = b.CreatePHI(b.getInt64Ty(), 2, "reduce.unroll.iter");
+      auto *phi0 = b.CreatePHI(initial->getType(), 2, "reduce.acc0");
+      auto *phi1 = b.CreatePHI(initial->getType(), 2, "reduce.acc1");
+      auto *phi2 = b.CreatePHI(initial->getType(), 2, "reduce.acc2");
+      auto *phi3 = b.CreatePHI(initial->getType(), 2, "reduce.acc3");
+
+      iter->addIncoming(b.getInt64(0), before);
+      phi0->addIncoming(initial, before);
+      phi1->addIncoming(initial, before);
+      phi2->addIncoming(initial, before);
+      phi3->addIncoming(initial, before);
+
+      auto *baseIdx = b.CreateMul(iter, b.getInt64(128));
+      auto *idx0 = b.CreateAdd(baseIdx, warpLane);
+      auto *idx1 = b.CreateAdd(baseIdx, b.CreateAdd(b.getInt64(32), warpLane));
+      auto *idx2 = b.CreateAdd(baseIdx, b.CreateAdd(b.getInt64(64), warpLane));
+      auto *idx3 = b.CreateAdd(baseIdx, b.CreateAdd(b.getInt64(96), warpLane));
+
+      auto *res0 = update(idx0, phi0);
+      auto *res1 = update(idx1, phi1);
+      auto *res2 = update(idx2, phi2);
+      auto *res3 = update(idx3, phi3);
+
+      auto *nextIter = b.CreateAdd(iter, b.getInt64(1), "reduce.unroll.next");
+      auto *latch = b.GetInsertBlock();
+      iter->addIncoming(nextIter, latch);
+      phi0->addIncoming(res0, latch);
+      phi1->addIncoming(res1, latch);
+      phi2->addIncoming(res2, latch);
+      phi3->addIncoming(res3, latch);
+
+      b.CreateCondBr(b.CreateICmpULT(nextIter, b.getInt64(unrollBlocks)), body, after);
+      b.SetInsertPoint(after);
+
+      value = combine(combine(res0, res1), combine(res2, res3));
+
+      for (uint64_t w = unrollBlocks * 4; w < warps; ++w) {
+        auto *idx = b.CreateAdd(b.getInt64(w * 32), warpLane);
+        value = update(idx, value);
+      }
+    } else {
+      value = accumulate(warps, initial, [&](llvm::Value *block, llvm::Value *previous) {
+        return update(b.CreateAdd(b.CreateMul(block, b.getInt64(32)), warpLane), previous);
+      });
+    }
     if (const uint64_t tail = count % 32) {
       auto *before = b.GetInsertBlock();
       auto *body = llvm::BasicBlock::Create(b.getContext(), "reduce.tail", function);

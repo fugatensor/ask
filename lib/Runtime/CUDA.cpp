@@ -197,6 +197,20 @@ struct SessionState {
   std::size_t pooledBytes = 0;
   static constexpr std::size_t poolLimit = 1024ULL * 1024 * 1024;
   std::vector<Handle> freeEvents;
+  void *stagingHost = nullptr;
+  std::size_t stagingHostCapacity = 0;
+  void *getStagingHost(std::size_t bytes) {
+    if (bytes <= stagingHostCapacity && stagingHost) return stagingHost;
+    if (stagingHost) {
+      driver->cuMemFreeHost(stagingHost);
+      stagingHost = nullptr;
+      stagingHostCapacity = 0;
+    }
+    std::size_t allocBytes = std::max<std::size_t>(bytes, 4ULL * 1024 * 1024);
+    driver->check(driver->cuMemAllocHost(&stagingHost, allocBytes), "cuMemAllocHost");
+    stagingHostCapacity = allocBytes;
+    return stagingHost;
+  }
   std::map<std::string,std::uint64_t> counters = {
       {"context_creations",0},{"primary_context_retains",0},{"stream_creations",0},
       {"module_loads",0},{"module_hits",0},{"allocations",0},{"launches",0},
@@ -221,6 +235,11 @@ struct SessionState {
     pooledBytes = 0;
     for (auto event : freeEvents) driver->cuEventDestroy(event);
     freeEvents.clear();
+    if (stagingHost) {
+      driver->cuMemFreeHost(stagingHost);
+      stagingHost = nullptr;
+      stagingHostCapacity = 0;
+    }
   }
   ~SessionState() {
     if (!context) return;
@@ -330,6 +349,7 @@ struct PreparedProgram::Impl {
   static Handle capture(const Step &, Workspace &, std::size_t, SessionState &);
   static Handle addLibrary(const Step &, Workspace &, std::size_t, SessionState &, const Handle *, std::size_t);
   static void updateLibrary(const Step &, Workspace &, std::size_t, SessionState &);
+  static std::shared_ptr<DeviceBuffer> allocateOutput(Session &session, std::size_t bytes, DevicePointer preferred);
 };
 
 void PreparedProgram::Impl::launchKernel(const Step &, Workspace &w, std::size_t i, SessionState &s) {
@@ -913,6 +933,37 @@ std::shared_ptr<Event> PreparedProgram::enqueue(const std::shared_ptr<Session> &
   }
   ++s.counters["program_submissions"];session->impl->pending.push_back(event);return event;
 }
+std::shared_ptr<DeviceBuffer> PreparedProgram::Impl::allocateOutput(
+    Session &session, std::size_t bytes, DevicePointer preferred) {
+  auto &s=*session.impl->state;
+  ContextScope current(*s.driver,s.context);
+  auto p=std::make_unique<DeviceBuffer::Impl>(); p->state=session.impl->state; p->bytes=bytes; p->owned=true;
+  auto available=s.freeBuffers.find(bytes);
+  if(available!=s.freeBuffers.end() && !available->second.empty()) {
+    auto &vec = available->second;
+    auto it = preferred ? std::find(vec.begin(), vec.end(), preferred) : vec.end();
+    if (it != vec.end()) {
+      p->pointer = *it;
+      vec.erase(it);
+    } else {
+      p->pointer = vec.back();
+      vec.pop_back();
+    }
+    s.pooledBytes-=std::max<std::size_t>(1,bytes);++s.counters["allocation_reuses"];
+    if(available->second.empty()) s.freeBuffers.erase(available);
+  } else {
+    int status=s.driver->cuMemAlloc(&p->pointer,std::max<std::size_t>(1,bytes));
+    if(status==2 && s.pooledBytes) {
+      s.clearPools();status=s.driver->cuMemAlloc(&p->pointer,std::max<std::size_t>(1,bytes));
+    }
+    s.driver->check(status,"cuMemAlloc");
+    ++s.counters["allocations"];
+    auto &resident=s.counters["resident_device_bytes"];
+    resident+=std::max<std::size_t>(1,bytes);
+    s.counters["peak_resident_device_bytes"]=std::max(s.counters["peak_resident_device_bytes"],resident);
+  }
+  return std::shared_ptr<DeviceBuffer>(new DeviceBuffer(std::move(p)));
+}
 std::pair<std::vector<std::shared_ptr<DeviceBuffer>>,std::shared_ptr<Event>> PreparedProgram::run(
     const std::vector<std::shared_ptr<DeviceBuffer>> &inputs) {
   auto session=impl->session.lock();require(bool(session),"program execution session no longer exists");
@@ -920,7 +971,23 @@ std::pair<std::vector<std::shared_ptr<DeviceBuffer>>,std::shared_ptr<Event>> Pre
   require(inputs.size()==impl->inputs.size(),"program input count differs from its contract");
   std::vector<std::shared_ptr<DeviceBuffer>> bound(impl->sizes.size()),outputs;
   for(std::size_t i=0;i<inputs.size();++i) bindPort(bound,impl->inputs[i],inputs[i]);
-  for(auto index:impl->allocatedOutputs) bound[index]=session->allocate(impl->sizes[index]);
+  std::shared_ptr<Impl::Workspace> idleWorkspace;
+  for(const auto &candidate:impl->workspaces) if(!candidate->busy) { idleWorkspace=candidate;break; }
+  for(auto index:impl->allocatedOutputs) {
+    DevicePointer preferred = 0;
+    if (idleWorkspace) {
+      for(auto i:impl->publicSteps) {
+        for(const auto &binding:impl->steps[i].publicBindings) {
+          if (binding.buffer == index && binding.parameter < idleWorkspace->values[i].size()) {
+            preferred = idleWorkspace->values[i][binding.parameter];
+            break;
+          }
+        }
+        if (preferred) break;
+      }
+    }
+    bound[index]=Impl::allocateOutput(*session, impl->sizes[index], preferred);
+  }
   outputs.reserve(impl->outputs.size());
   for(auto index:impl->outputs) outputs.push_back(bound[index]);
   auto event=enqueue(session,std::move(bound));return {std::move(outputs),std::move(event)};
@@ -987,9 +1054,10 @@ bool DeviceBuffer::readonly()const{return impl->readonly;}
 void DeviceBuffer::copyFromHost(const void *data,std::size_t bytes){
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   require(!impl->readonly,"device tensor is read-only");require(bytes==impl->bytes,"host byte count must equal device buffer size");
-  if(!bytes)return;ContextScope current(*s.driver,s.context);HostStorage staging(*s.driver,bytes);
-  std::memcpy(staging.pointer,data,bytes);
-  s.driver->check(s.driver->cuMemcpyHtoDAsync(impl->pointer,staging.pointer,bytes,s.stream),"cuMemcpyHtoDAsync");
+  if(!bytes)return;ContextScope current(*s.driver,s.context);
+  void *staging = s.getStagingHost(bytes);
+  std::memcpy(staging,data,bytes);
+  s.driver->check(s.driver->cuMemcpyHtoDAsync(impl->pointer,staging,bytes,s.stream),"cuMemcpyHtoDAsync");
   s.synchronize();++s.counters["host_to_device_copies"];
 }
 std::string DeviceBuffer::copyToHost()const{
@@ -998,10 +1066,11 @@ std::string DeviceBuffer::copyToHost()const{
 void DeviceBuffer::copyToHost(void *data,std::size_t bytes)const{
   auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);s.checkOpen();
   require(bytes==impl->bytes,"host byte count must equal device buffer size");
-  if(!impl->bytes)return;ContextScope current(*s.driver,s.context);HostStorage staging(*s.driver,impl->bytes);
-  s.driver->check(s.driver->cuMemcpyDtoHAsync(staging.pointer,impl->pointer,impl->bytes,s.stream),"cuMemcpyDtoHAsync");
+  if(!impl->bytes)return;ContextScope current(*s.driver,s.context);
+  void *staging = s.getStagingHost(impl->bytes);
+  s.driver->check(s.driver->cuMemcpyDtoHAsync(staging,impl->pointer,impl->bytes,s.stream),"cuMemcpyDtoHAsync");
   s.synchronize();++s.counters["device_to_host_copies"];
-  std::memcpy(data,staging.pointer,impl->bytes);
+  std::memcpy(data,staging,impl->bytes);
 }
 Kernel::Kernel(std::unique_ptr<Impl> impl):impl(std::move(impl)){}
 Kernel::~Kernel(){if(!impl->module)return;auto &s=*impl->state;std::lock_guard<std::recursive_mutex> lock(s.mutex);
