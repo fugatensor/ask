@@ -1,0 +1,49 @@
+{
+  "baseline_commit": "98a8bc689a69c1db66e6602aa6cd5533a546e7e5",
+  "fuga_commit": "ea33f415d140fa3127ae3fae551627f669088fe6",
+  "machine": "Linux-6.18.33.2-microsoft-standard-WSL2-x86_64-with-glibc2.41",
+  "cpu": "Intel Xeon E5-2696 v4 @ 2.20GHz",
+  "gpu": "NVIDIA GeForce RTX 3080, 10240 MiB",
+  "driver": "616.56",
+  "rounds": 7,
+  "sdk_host_samples_per_process": 21,
+  "sdk_gpu_samples_per_process": 31,
+  "sdk_device_samples_per_process": 21,
+  "fuga_samples_per_process": 21,
+  "cpu_affinity": 2,
+  "source_sha256": {
+    "profile.cpp": "4f4e19ee6dd082a8fdb076110d9afdb8aa5d4185cb3bf5ea60e8c60a3ad18495",
+    "fuga_profile.py": "d64b0ac35ee5d669b5b6a111b59b702546e512363e36b87316cd00f5ad5f81e2",
+    "alloc.cpp": "76b7c5f0a5410c39bee95fb5f64d428ec17e837766be3c480d90265a55b1e1ba",
+    "run.py": "88cb1c58435bbe44fee70939d56e3acdff3e5a966671a23d6f614c7555ed5cde",
+    "summarize.py": "f2ba0d6c1fee915cb3f3eccd3d990da2257f9b1f076c0a343b4e1bd725af97f0"
+  },
+  "binary_sha256": "07edf914517740c56e1a3c300282827c3897526fa6335367ac18f9e01e0ab990",
+  "baseline_hashes": {
+    "lib/libask_runtime.so.0": "879ff57a3394125f58a830cbdbddcd4ddd42c566b29c2772cf65228a9573a7b5",
+    "lib/libask_compiler.so.0": "f4708e28aac391e4ca3c8ed58686b6ae017840ebb43b4e754d7189c63f1d1d66",
+    "bin/ask-opt": "9ad3bb70e13c02d8711b0f2defb240eb8757daa05ff4405eac8150973aca008e"
+  },
+  "baseline_fuga-hashes": {
+    "_native.cpython-313-x86_64-linux-gnu.so": "4a6eb4f277b418df18ff73eb01bc475502dd1d240642f51dedd2e31c0d4130ea",
+    "_lib/libask_compiler.so.0": "f4708e28aac391e4ca3c8ed58686b6ae017840ebb43b4e754d7189c63f1d1d66",
+    "_lib/libask_runtime.so.0": "879ff57a3394125f58a830cbdbddcd4ddd42c566b29c2772cf65228a9573a7b5"
+  },
+  "candidate_hashes": {
+    "lib/libask_runtime.so.0": "bd09c738c2553675d2358383b3665bec72f746deec6753d200b9f3cf332ebcac",
+    "lib/libask_compiler.so.0": "5b30943de8845711e9cdb84cf03a97ab5ea2c010e0bba6fbb73687825a8ea208",
+    "bin/ask-opt": "9deb1488784447f703f6a8ab355ddf226f276c743caaec3a4ef22ed6f3691406"
+  },
+  "candidate_fuga-hashes": {
+    "_native.cpython-313-x86_64-linux-gnu.so": "4a6eb4f277b418df18ff73eb01bc475502dd1d240642f51dedd2e31c0d4130ea",
+    "_lib/libask_compiler.so.0": "5b30943de8845711e9cdb84cf03a97ab5ea2c010e0bba6fbb73687825a8ea208",
+    "_lib/libask_runtime.so.0": "bd09c738c2553675d2358383b3665bec72f746deec6753d200b9f3cf332ebcac"
+  },
+  "normal_source_basename": "profile-hostgate.cpp",
+  "trace_source_sha256": "049af47cdf5899195eb93a88667d93a5e8be1fedbd9757438a7f8e41f98b20e7",
+  "trace_binary_sha256": "020d83d271669889459ef5d302ebb775809cd8d6b3e8d3d027e8414b3ec810eb",
+  "trace_rounds": 1,
+  "trace_samples_per_case": 21,
+  "bounded_device_gate_source_sha256": "22432b0181d48352f46498a8c1b0f3259197760eb48e550ee535ad910a16042f",
+  "event_status": "Both host-callback and mapped-memory GPU gates alter multi-root graph scheduling in this environment; keep diagnostic raw data separate from accepted execution-window and normal end-to-end results."
+}

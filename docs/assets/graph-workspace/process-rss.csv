@@ -1,0 +1,11 @@
+mode,version,peak_rss_kib_p50,peak_rss_kib_min,peak_rss_kib_max
+host,baseline,21288,21240,21308
+host,candidate,31328,31232,31444
+gpu,baseline,109788,109432,109828
+gpu,candidate,112704,110888,113528
+fuga-cpu,baseline,57288,57156,57884
+fuga-cpu,candidate,67188,66532,67780
+fuga-gpu,baseline,152696,151384,153660
+fuga-gpu,candidate,159448,157976,159816
+cold,baseline,109784,106848,109888
+cold,candidate,112776,111924,112996

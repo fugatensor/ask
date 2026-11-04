@@ -1,0 +1,12 @@
+{
+  "compiler": {
+    "/home/asuka/ask/build/core/lib/libask_compiler.so.0": "5b30943de8845711e9cdb84cf03a97ab5ea2c010e0bba6fbb73687825a8ea208",
+    "/home/asuka/ask/build/sdk/lib/libask_compiler.so.0": "5b30943de8845711e9cdb84cf03a97ab5ea2c010e0bba6fbb73687825a8ea208",
+    "/home/asuka/fugatensor/.venv/lib/python3.13/site-packages/fugatensor/_lib/libask_compiler.so.0": "5b30943de8845711e9cdb84cf03a97ab5ea2c010e0bba6fbb73687825a8ea208"
+  },
+  "runtime": {
+    "/home/asuka/ask/build/core/lib/libask_runtime.so.0": "bd09c738c2553675d2358383b3665bec72f746deec6753d200b9f3cf332ebcac",
+    "/home/asuka/ask/build/sdk/lib/libask_runtime.so.0": "bd09c738c2553675d2358383b3665bec72f746deec6753d200b9f3cf332ebcac",
+    "/home/asuka/fugatensor/.venv/lib/python3.13/site-packages/fugatensor/_lib/libask_runtime.so.0": "bd09c738c2553675d2358383b3665bec72f746deec6753d200b9f3cf332ebcac"
+  }
+}

@@ -254,6 +254,61 @@ void scratchPlan(bool graph, std::size_t limit) {
   require(session->stats().at("matmul_preparations") == 2, "scratch chain repeated preparation");
   std::cout << "matmul scratch: " << scratch << " bytes, limit " << limit << ", graph " << graph << '\n';
 }
+
+void branchMatrix() {
+  std::size_t cases = 0;
+  for (const std::string type : {"f32", "f16", "bf16"})
+    for (std::size_t side : {8, 512})
+      for (std::size_t branches : {2, 3})
+        for (std::size_t limit : {std::size_t(0), std::size_t(4 * 1024 * 1024)}) {
+          std::uint64_t serialBytes = 0;
+          for (bool graph : {false, true}) {
+            auto session = Session::create();
+            const auto elements = side * side, bytes = elements * (type == "f32" ? 4 : 2);
+            MatmulDescription description{type, side, side, side};
+            description.workspaceLimit = limit;
+            std::vector<PlanStep> steps;
+            std::vector<std::size_t> outputs;
+            for (std::size_t branch = 0; branch < branches; ++branch) {
+              const auto middle = 2 + 2 * branch, output = middle + 1;
+              PlanStep first, second;
+              first.inputs = {0, 1}; first.outputs = {middle}; first.matmul = description;
+              second.inputs = {middle, 1}; second.outputs = {output}; second.matmul = description;
+              steps.push_back(first); steps.push_back(second); outputs.push_back(output);
+            }
+            auto program = session->prepareProgram(std::vector<std::size_t>(2 + 2 * branches, bytes),
+                                                    {0, 1}, outputs, steps, graph);
+            const auto internalBytes = session->stats().at("prepared_internal_bytes");
+            if (!graph) serialBytes = internalBytes;
+            else require(internalBytes == branches * serialBytes,
+                         "independent matmul branches shared live storage");
+            std::vector<float> identity(elements, 0);
+            for (std::size_t row = 0; row < side; ++row) identity[row * side + row] = 1;
+            auto b = upload(session, identity, type);
+            std::vector<std::vector<std::shared_ptr<DeviceBuffer>>> held;
+            for (int iteration = 1; iteration <= 2; ++iteration) {
+              auto a = upload(session, std::vector<float>(elements, float(iteration)), type);
+              auto [result, completion] = program->run({a, b});
+              completion->wait();
+              held.push_back(result);
+              const auto updates = session->stats().at("graph_node_updates");
+              program->submit({a, b}, result)->wait();
+              require(session->stats().at("graph_node_updates") == updates,
+                      "fixed matmul ports updated graph children");
+            }
+            for (std::size_t iteration = 0; iteration < held.size(); ++iteration)
+              for (const auto &output : held[iteration])
+                check(output, type, std::vector<float>(elements, float(iteration + 1)),
+                      "parallel matmul retained output");
+            const auto stats = session->stats();
+            require(stats.at("matmul_preparations") == branches * 2, "branch replay repeated preparation");
+            require(stats.at("graph_nodes") == (graph ? branches * 2 : 0), "matmul graph node count");
+            require(stats.at("graph_edges") == (graph ? branches : 0), "matmul graph dependency count");
+            ++cases;
+          }
+        }
+  std::cout << "matmul branch matrix: " << cases << " cases\n";
+}
 } // namespace
 
 int main() {
@@ -265,6 +320,7 @@ int main() {
     for (bool graph : {false, true}) mixedPlan(graph, ptx);
     precisionAndResidency();
     importedAddresses();
+    branchMatrix();
     for (bool graph : {false, true})
       for (std::size_t limit : {std::size_t(0), std::size_t(4 * 1024 * 1024)}) scratchPlan(graph, limit);
     return 0;

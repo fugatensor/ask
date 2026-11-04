@@ -1,6 +1,7 @@
 #include <ask/Frontend/CompilerAPI.h>
 #include "support/primitive_graphs.h"
 
+#include <algorithm>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -13,6 +14,13 @@ std::size_t occurrences(const std::string &text, const std::string &part) {
   std::size_t result = 0, pos = 0;
   while ((pos = text.find(part, pos)) != std::string::npos) { ++result;pos += part.size(); }
   return result;
+}
+bool integerField(const std::string &json, const std::string &name, std::size_t value) {
+  auto token = "\"" + name + "\":" + std::to_string(value);
+  auto found = json.find(token);
+  if (found == std::string::npos) return false;
+  auto end = json.find_first_not_of(" \t\n\r", found + token.size());
+  return end != std::string::npos && (json[end] == ',' || json[end] == '}');
 }
 void compile(const std::string &source, bool host) {
   ask::compiler::CodegenOptions options;
@@ -29,21 +37,67 @@ void compile(const std::string &source, bool host) {
   options.target = ask::compiler::CodegenTarget::CUDALLVM;options.architecture = 86;
   require(!ask::compiler::codegen(source, options).ir.empty(), "missing CUDA LLVM");
 }
-void hostWorkspace(const std::string &source, std::size_t bytes, std::size_t buffers) {
-  auto result = ask::compiler::codegen(source, {});
+ask::compiler::CodegenResult hostWorkspace(const std::string &source, std::size_t bytes,
+    std::size_t buffers, const ask::compiler::CodegenOptions &options = {}) {
+  auto result = ask::compiler::codegen(source, options);
   const auto &abi = result.abiJSON.value();
-  require(abi.find("\"temporary_workspace_bytes\":" + std::to_string(bytes)) != std::string::npos,
+  require(integerField(abi, "temporary_workspace_bytes", bytes),
           "wrong Host reduction workspace capacity");
-  require(abi.find("\"materialized_tensor_count\":" + std::to_string(buffers)) != std::string::npos,
+  require(integerField(abi, "materialized_tensor_count", buffers),
           "wrong Host reduction materialization count");
   require(occurrences(result.ir, "call ptr @malloc(") == (bytes ? 1 : 0) &&
           occurrences(result.ir, "call void @free(") == (bytes ? 1 : 0),
           "Host workspace must have one allocation lifetime");
+  return result;
+}
+void workspaceMatrix() {
+  const std::vector<std::pair<std::string, std::size_t>> types{
+      {"i1", 1}, {"i32", 4}, {"i64", 8}, {"f32", 4}, {"f16", 2}};
+  std::size_t cases = 0;
+  for (const auto &[dtype, elementBytes] : types)
+    for (int64_t rows : {0, 1, 5})
+      for (int64_t width : {0, 1, 3})
+        for (const std::string operation : {"reduce_sum", "reduce_max"}) {
+          if (width == 0 && operation == "reduce_max") continue;
+          for (bool transposed : {false, true})
+            for (bool retainFirst : {false, true})
+              for (bool fused : {false, true}) {
+                ask::compiler::CodegenOptions options;
+                options.optimization.fuseElementwise = fused;
+                const bool stored = rows > 1 && width > 1;
+                const auto buffers = stored ? 3 : 0;
+                const auto slots = stored ? (retainFirst ? 3 : 2) : 0;
+                auto result = hostWorkspace(ask::test::materializationChain(
+                    {dtype, dtype, dtype}, rows, width, operation, transposed, retainFirst),
+                    slots * rows * elementBytes, buffers, options);
+                const auto outputLoops = rows && width ? (fused ? 1 : 2) + retainFirst : 0;
+                const auto reductionLoops = rows && width > 1 ? 3 : 0;
+                const auto branches = outputLoops + reductionLoops + buffers + (stored ? 1 : 0);
+                require(occurrences(result.ir, "br i1 ") == std::size_t(branches),
+                        "Host workspace validation added execution branches");
+                ++cases;
+              }
+        }
+  for (const auto &[first, firstBytes] : types)
+    for (const auto &[next, nextBytes] : types)
+      for (bool captureScalar : {false, true}) {
+        // The first slot is reused by a differently sized and aligned dtype.
+        const std::size_t rows = 5;
+        const auto alignment = std::max(firstBytes, nextBytes);
+        const auto firstCapacity = rows * alignment;
+        const auto secondOffset = (firstCapacity + nextBytes - 1) & ~(nextBytes - 1);
+        hostWorkspace(ask::test::materializationChain({first, next, next}, rows, 3,
+                      "reduce_sum", false, false, captureScalar),
+                      secondOffset + rows * nextBytes, 3);
+        ++cases;
+      }
+  std::cout << "Host workspace matrix: " << cases << " cases\n";
 }
 }
 int main() {
   try {
     const bool host = ask::compilerCapabilitiesJSON().find("\"host_codegen\":true") != std::string::npos;
+    if (host) workspaceMatrix();
     for (const std::string dtype : {"f32", "f16", "bf16"})
       for (bool constant : {false, true}) {
         auto plan = ask::compiler::partition(ask::test::publicScalar(dtype, constant));

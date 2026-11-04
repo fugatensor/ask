@@ -75,6 +75,57 @@ inline std::string scalarReductionExpansion(int64_t inputSize, int64_t outputSiz
       "%y = \"ask.splat\"(%r) {shape = " + dimensions({outputSize}) + "} : (f32) -> " + output + "\n"
       "return %y : " + output + " } }";
 }
+inline std::string materializationChain(const std::vector<std::string> &storageTypes,
+    int64_t rows, int64_t width, const std::string &operation,
+    bool transposed, bool retainFirst, bool captureScalar = false) {
+  const std::vector<int64_t> shape = transposed ? std::vector<int64_t>{width, rows}
+                                               : std::vector<int64_t>{rows, width};
+  const unsigned axis = transposed ? 0 : 1;
+  const auto mask = tensor(shape, "i1");
+  std::string input = "%x", inputType = tensor(shape, storageTypes.front());
+  std::string body, first, firstType, scalarType;
+  for (std::size_t stage = 0; stage < storageTypes.size(); ++stage) {
+    const auto &dtype = storageTypes[stage];
+    const auto numeric = dtype == "i1" ? std::string("i32") : dtype;
+    const auto stageType = tensor(shape, numeric), reduced = tensor({rows}, numeric);
+    const auto stored = tensor({rows}, dtype), expanded = tensor(shape, dtype);
+    const auto suffix = std::to_string(stage);
+    if (inputType != stageType) {
+      body += "%c" + suffix + " = \"ask.cast\"(" + input + ") : (" + inputType + ") -> " + stageType + "\n";
+      input = "%c" + suffix;
+    }
+    body += "%r" + suffix + " = \"ask." + operation + "\"(" + input + ") {axes = " + dimensions({axis}) + "} : (" + stageType + ") -> " + reduced + "\n";
+    auto value = "%r" + suffix;
+    if (stored != reduced) {
+      body += "%s" + suffix + " = \"ask.cast\"(" + value + ") : (" + reduced + ") -> " + stored + "\n";
+      value = "%s" + suffix;
+    }
+    body += "%b" + suffix + " = \"ask.broadcast_in_dim\"(" + value + ") {shape = " + dimensions(shape) + ", dimensions = " + dimensions({1 - axis}) + "} : (" + stored + ") -> " + expanded + "\n";
+    input = "%b" + suffix;
+    inputType = expanded;
+    if (!stage) {
+      first = input;
+      firstType = inputType;
+      if (captureScalar) {
+        // The scalar consumes the cached tensor now and remains an SSA value.
+        std::string capture = value;
+        if (stored != reduced) {
+          body += "%capture_input = \"ask.cast\"(" + value + ") : (" + stored + ") -> " + reduced + "\n";
+          capture = "%capture_input";
+        }
+        body += "%capture = \"ask.reduce_sum\"(" + capture + ") {axes = array<i64: 0>} : (" + reduced + ") -> " + numeric + "\n";
+        scalarType = numeric;
+      }
+    }
+  }
+  body += "%mask = \"ask.compare\"(" + input + ", " + input + ") {predicate = \"eq\"} : (" + inputType + ", " + inputType + ") -> " + mask + "\n";
+  auto outputTypes = inputType + ", " + mask;
+  auto outputValues = input + ", %mask";
+  if (retainFirst) { outputTypes += ", " + firstType;outputValues += ", " + first; }
+  if (captureScalar) { outputTypes += ", " + scalarType;outputValues += ", %capture"; }
+  return "module { func.func @materialization_chain(%x: " + tensor(shape, storageTypes.front()) + ") -> (" + outputTypes + ") {\n" +
+      body + "return " + outputValues + " : " + outputTypes + " } }";
+}
 inline std::string publicScalar(const std::string &dtype, bool constant) {
   auto type = tensor({7}, dtype);
   if (constant)

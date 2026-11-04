@@ -19,3 +19,50 @@
 done:
   ret;
 }
+.visible .entry map_i32(.param .u64 src, .param .u64 dst, .param .u32 count) {
+  .reg .pred %p;
+  .reg .b32 %i, %b, %n, %size, %v;
+  .reg .b64 %x, %y, %offset;
+  mov.u32 %i, %tid.x;
+  mov.u32 %b, %ctaid.x;
+  mov.u32 %n, %ntid.x;
+  mad.lo.u32 %i, %b, %n, %i;
+  ld.param.u32 %size, [count];
+  setp.ge.u32 %p, %i, %size;
+  @%p bra map_done;
+  ld.param.u64 %x, [src];
+  ld.param.u64 %y, [dst];
+  mul.wide.u32 %offset, %i, 4;
+  add.u64 %x, %x, %offset;
+  add.u64 %y, %y, %offset;
+  ld.global.u32 %v, [%x];
+  add.u32 %v, %v, %v;
+  st.global.u32 [%y], %v;
+map_done:
+  ret;
+}
+.visible .entry add_i32(.param .u64 lhs, .param .u64 rhs, .param .u64 dst, .param .u32 count) {
+  .reg .pred %p;
+  .reg .b32 %i, %b, %n, %size, %u, %v;
+  .reg .b64 %x, %y, %z, %offset;
+  mov.u32 %i, %tid.x;
+  mov.u32 %b, %ctaid.x;
+  mov.u32 %n, %ntid.x;
+  mad.lo.u32 %i, %b, %n, %i;
+  ld.param.u32 %size, [count];
+  setp.ge.u32 %p, %i, %size;
+  @%p bra add_done;
+  ld.param.u64 %x, [lhs];
+  ld.param.u64 %y, [rhs];
+  ld.param.u64 %z, [dst];
+  mul.wide.u32 %offset, %i, 4;
+  add.u64 %x, %x, %offset;
+  add.u64 %y, %y, %offset;
+  add.u64 %z, %z, %offset;
+  ld.global.u32 %u, [%x];
+  ld.global.u32 %v, [%y];
+  add.u32 %v, %u, %v;
+  st.global.u32 [%z], %v;
+add_done:
+  ret;
+}

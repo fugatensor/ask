@@ -66,6 +66,9 @@ Key keyFor(const AllocationPlan &allocation) {
   for (const auto &entry : allocation.assignments) {
     key.push_back(entry.buffer);key.push_back(entry.slot);
   }
+  key.push_back(allocation.graph);
+  key.push_back(allocation.dependencies.size());
+  for (const auto &predecessors : allocation.dependencies) append(predecessors);
   return key;
 }
 struct ValidationCache {
@@ -115,28 +118,80 @@ Decision checkAllocation(const AllocationPlan &allocation) {
   for (const auto &users : slotUsers)
     if (users.empty()) return invalid("allocation contains an unused slot");
 
+  if (allocation.graph) {
+    if (allocation.dependencies.size() != plan.steps.size())
+      return invalid("graph dependency count differs from the plan");
+    for (std::size_t step = 0; step < plan.steps.size(); ++step) {
+      auto predecessors = allocation.dependencies[step];
+      for (auto predecessor : predecessors)
+        if (predecessor >= step) return invalid("graph dependency is not topologically ordered");
+      std::sort(predecessors.begin(), predecessors.end());
+      if (std::adjacent_find(predecessors.begin(), predecessors.end()) != predecessors.end())
+        return invalid("graph dependency is repeated");
+    }
+  } else if (!allocation.dependencies.empty()) return invalid("stream plan contains graph dependencies");
+
   std::vector<std::size_t> lastUse(plan.buffer_count, 0);
+  std::vector<std::vector<std::size_t>> accesses(allocation.graph ? plan.buffer_count : 0);
   for (std::size_t step = 0; step < plan.steps.size(); ++step) {
-    for (auto buffer : plan.steps[step].outputs)
+    for (auto buffer : plan.steps[step].outputs) {
       lastUse[buffer] = std::max(lastUse[buffer], step);
-    for (auto buffer : plan.steps[step].inputs)
+      if (allocation.graph) accesses[buffer].push_back(step);
+    }
+    for (auto buffer : plan.steps[step].inputs) {
       lastUse[buffer] = std::max(lastUse[buffer], step);
+      if (allocation.graph) accesses[buffer].push_back(step);
+    }
   }
   std::string failures;
   checkAvailability(plan, birth, failures);
   for (const auto &entry : allocation.assignments)
     if (allocation.buffer_sizes[entry.buffer] > allocation.slot_capacity_bytes[entry.slot])
       failed(failures, "CAPACITY_" + std::to_string(entry.buffer));
-  // Disjoint adjacent intervals in producer order imply pairwise separation.
+  std::vector<std::vector<std::size_t>> required(allocation.graph ? plan.steps.size() : 0);
+  if (allocation.graph)
+    for (std::size_t step = 0; step < plan.steps.size(); ++step)
+      for (auto buffer : plan.steps[step].inputs)
+        if (birth[buffer]) required[step].push_back(birth[buffer] - 1);
+  // Ordering all accesses of adjacent occupants also orders every earlier
+  // occupant, because each occupant's producer is itself an access.
   for (auto &users : slotUsers) {
     std::sort(users.begin(), users.end(), [&](auto a, auto b) {
       return std::make_pair(birth[a], a) < std::make_pair(birth[b], b);
     });
     for (std::size_t i = 1; i < users.size(); ++i) {
       auto a = users[i - 1], b = users[i];
-      if (lastUse[a] >= birth[b] - 1)
+      if (allocation.graph)
+        required[birth[b] - 1].insert(required[birth[b] - 1].end(), accesses[a].begin(), accesses[a].end());
+      else if (lastUse[a] >= birth[b] - 1)
         failed(failures, "ADJACENT_" + std::to_string(a) + "_" + std::to_string(b));
     }
+  }
+  // Search only the ancestor region containing an outstanding obligation.
+  // A chain visits its nearest predecessors; independent roots visit none.
+  std::vector<std::size_t> seen(required.size(), required.size()), wanted(required.size(), required.size());
+  std::vector<std::size_t> pending;
+  for (std::size_t step = 0; step < required.size(); ++step) {
+    auto &before = required[step];
+    std::sort(before.begin(), before.end());
+    before.erase(std::unique(before.begin(), before.end()), before.end());
+    if (before.empty()) continue;
+    if (before.back() >= step) {
+      failed(failures, "GRAPH_ORDER_" + std::to_string(step));
+      continue;
+    }
+    for (auto predecessor : before) wanted[predecessor] = step;
+    auto remaining = before.size();
+    pending = allocation.dependencies[step];
+    while (remaining && !pending.empty()) {
+      auto predecessor = pending.back();pending.pop_back();
+      if (predecessor < before.front() || seen[predecessor] == step) continue;
+      seen[predecessor] = step;
+      if (wanted[predecessor] == step) --remaining;
+      const auto &parents = allocation.dependencies[predecessor];
+      pending.insert(pending.end(), parents.begin(), parents.end());
+    }
+    if (remaining) failed(failures, "GRAPH_ORDER_" + std::to_string(step));
   }
   return {failures.empty() ? Verdict::Pass : Verdict::Fail, std::move(failures)};
 }

@@ -76,7 +76,7 @@ FugaTensor 将计划和各步骤产物保存为 `CUDAProgram`。包中使用相�
 
 计划证明与显存复用的分工见[规则证明与计划校验](规则证明与计划校验.md#reuse-boundary)。
 
-传入 `graph=true` 时使用 [CUDA Graph replay](常驻运行时与多级缓存.md#cuda-graph)。每个工作区缓存 graph 实例，复用时更新公开端口地址，自有与外部步骤使用同一机制。
+传入 `graph=true` 时使用 [CUDA Graph replay](常驻运行时与多级缓存.md#cuda-graph)。准备阶段从步骤读写端口推导依赖，冻结节点前驱，并按依赖可达性校验内部槽位复用；独立分支可并行执行。每个工作区缓存 graph 实例，复用时更新公开端口地址，自有与外部步骤使用同一机制。
 
 FugaTensor 将前向或求导后的静态图提交给 ASK，由 ASK 在外部节点处分区并优化自有区域。外部算子的反向规则由上层框架提供。
 

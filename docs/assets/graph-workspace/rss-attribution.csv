@@ -1,0 +1,13 @@
+version,scenario,rss_kib,anonymous_kib,compiler_mapping_kib,heap_kib,children_peak_rss_kib
+baseline,compiler_library_loaded,9268,1080,5284,112,
+baseline,after_llvm,12836,1492,8312,516,
+baseline,after_object,19468,2348,14084,1340,
+baseline,after_object-matrix,20576,3432,14104,2420,
+baseline,original_host_harness_sampled_peak,22376,4868,14104,3804,
+baseline,original_host_harness_fresh_wrapper,,,,,21284
+candidate,compiler_library_loaded,9300,1076,5320,112,
+candidate,after_llvm,12848,1484,8332,512,
+candidate,after_object,19420,2344,14040,1336,
+candidate,after_object-matrix,20512,3412,14060,2404,
+candidate,original_host_harness_sampled_peak,22044,4568,14060,3504,
+candidate,original_host_harness_fresh_wrapper,,,,,21276

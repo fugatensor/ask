@@ -205,4 +205,4 @@ worker 请求、产物格式和标量类型见[外部适配规范](外部编译�
 
 编译接口抛出 `std::runtime_error`，设备层抛出 `ask::runtime::CUDAError`。启动失败时，前序步骤可能已提交；运行时等待这些工作结束，再释放引用并传播错误，设备写入不回滚。
 
-计划使用静态连续缓冲区，在单 stream 上执行 kernel 和 cuBLASLt 步骤。FugaTensor 负责 Python API 和框架级控制流，CUDA Graph 用于减少计划提交开销。
+计划使用静态连续缓冲区执行 kernel 和 cuBLASLt 步骤。普通 stream 按序启动，CUDA Graph 按端口依赖调度并重放。FugaTensor 负责 Python API 和框架级控制流。

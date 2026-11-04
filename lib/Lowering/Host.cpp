@@ -177,8 +177,6 @@ llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
 
 struct WorkspacePlan {
   llvm::DenseSet<mlir::Value> live, materialized;
-  llvm::DenseMap<mlir::Value, uint64_t> offsets;
-  uint64_t bytes = 0;
 };
 
 // Inputs and results have already passed the static byte-size checks.
@@ -190,7 +188,7 @@ uint64_t concreteCount(mlir::Type type) {
   return 1;
 }
 
-llvm::Expected<WorkspacePlan> planWorkspace(mlir::func::FuncOp graph, uint64_t limit) {
+WorkspacePlan planWorkspace(mlir::func::FuncOp graph) {
   WorkspacePlan plan;
   std::function<void(mlir::Value)> visit = [&](mlir::Value value) {
     if (!plan.live.insert(value).second) return;
@@ -222,19 +220,100 @@ llvm::Expected<WorkspacePlan> planWorkspace(mlir::func::FuncOp graph, uint64_t l
         expensive.clear();
       }
   }
-  for (auto &op : graph.front()) {
-    if (!op.getNumResults()) continue;
-    auto value = op.getResult(0);
-    if (!plan.materialized.contains(value) || concreteCount(value.getType()) <= 1) continue;
-    const uint64_t bytes = concreteCount(value.getType()) * elementByteWidth(value.getType());
-    // One malloc block, with every static subrange aligned for all ASK dtypes.
-    if (plan.bytes > limit - 7) return error("host reduction workspace size overflows the address range");
-    uint64_t offset = (plan.bytes + 7) & ~uint64_t(7);
-    if (bytes > limit - offset) return error("host reduction workspace size overflows the address range");
-    plan.offsets[value] = offset;
-    plan.bytes = offset + bytes;
-  }
   return plan;
+}
+
+struct WorkspaceBuffer {
+  mlir::Value value;
+  llvm::GetElementPtrInst *address;
+  uint64_t bytes;
+  unsigned alignment;
+  std::size_t first, last, slot = 0;
+};
+struct WorkspaceSlot {
+  uint64_t bytes, offset = 0;
+  unsigned alignment;
+  std::size_t last;
+};
+
+llvm::Error validateWorkspace(llvm::ArrayRef<WorkspaceBuffer> buffers,
+    llvm::ArrayRef<llvm::SmallVector<mlir::Value>> phases,
+    llvm::ArrayRef<WorkspaceSlot> slots, uint64_t bytes) {
+  llvm::DenseMap<mlir::Value, const WorkspaceBuffer *> definitions;
+  for (const auto &buffer : buffers) {
+    if (!definitions.try_emplace(buffer.value, &buffer).second ||
+        buffer.slot >= slots.size() || buffer.first > buffer.last || buffer.last >= phases.size())
+      return error("invalid host workspace definition or lifetime");
+    const auto &slot = slots[buffer.slot];
+    if (buffer.bytes > slot.bytes || slot.offset % buffer.alignment ||
+        slot.offset > bytes || slot.bytes > bytes - slot.offset)
+      return error("host workspace slot violates capacity or alignment");
+  }
+  for (auto [phase, reads] : llvm::enumerate(phases))
+    for (auto value : reads) {
+      auto found = definitions.find(value);
+      if (found == definitions.end() || found->second->first >= phase || found->second->last < phase)
+        return error("host workspace read is outside its produced lifetime");
+    }
+  for (auto [index, slot] : llvm::enumerate(slots))
+    if (index && slots[index - 1].offset + slots[index - 1].bytes > slot.offset)
+      return error("host workspace slots overlap");
+  llvm::SmallVector<const WorkspaceBuffer *> previous(slots.size(), nullptr);
+  for (const auto &buffer : buffers) {
+    auto *prior = previous[buffer.slot];
+    if (prior && prior->last >= buffer.first)
+      return error("host workspace aliases live materializations");
+    previous[buffer.slot] = &buffer;
+  }
+  return llvm::Error::success();
+}
+
+llvm::Expected<uint64_t> assignWorkspace(llvm::MutableArrayRef<WorkspaceBuffer> buffers,
+    llvm::ArrayRef<llvm::SmallVector<mlir::Value>> phases, uint64_t limit) {
+  llvm::DenseMap<mlir::Value, std::size_t> indices;
+  for (auto [index, buffer] : llvm::enumerate(buffers)) indices[buffer.value] = index;
+  for (auto [phase, reads] : llvm::enumerate(phases))
+    for (auto value : reads) {
+      auto found = indices.find(value);
+      if (found == indices.end()) return error("host workspace read lacks a materialization");
+      buffers[found->second].last = phase;
+    }
+
+  llvm::SmallVector<WorkspaceSlot> slots;
+  for (auto &buffer : buffers) {
+    std::size_t selected = slots.size();
+    uint64_t growth = buffer.bytes, capacity = std::numeric_limits<uint64_t>::max();
+    for (auto [index, slot] : llvm::enumerate(slots)) {
+      if (slot.last >= buffer.first) continue;
+      uint64_t added = buffer.bytes > slot.bytes ? buffer.bytes - slot.bytes : 0;
+      if (added < growth || (added == growth && slot.bytes < capacity)) {
+        selected = index;
+        growth = added;
+        capacity = slot.bytes;
+      }
+    }
+    buffer.slot = selected;
+    if (selected == slots.size()) slots.push_back({buffer.bytes, 0, buffer.alignment, buffer.last});
+    else {
+      auto &slot = slots[selected];
+      slot.bytes = std::max(slot.bytes, buffer.bytes);
+      slot.alignment = std::max(slot.alignment, buffer.alignment);
+      slot.last = buffer.last;
+    }
+  }
+  uint64_t bytes = 0;
+  for (auto &slot : slots) {
+    const uint64_t padding = slot.alignment - 1;
+    if (bytes > limit - padding) return error("host reduction workspace size overflows the address range");
+    slot.offset = (bytes + padding) & ~padding;
+    if (slot.bytes > limit - slot.offset) return error("host reduction workspace size overflows the address range");
+    bytes = slot.offset + slot.bytes;
+  }
+  if (auto failure = validateWorkspace(buffers, phases, slots, bytes)) return std::move(failure);
+  for (const auto &buffer : buffers)
+    buffer.address->setOperand(1, llvm::ConstantInt::get(
+        buffer.address->getOperand(1)->getType(), slots[buffer.slot].offset));
+  return bytes;
 }
 
 llvm::Error validateFunction(mlir::func::FuncOp function) {
@@ -317,9 +396,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     const unsigned pointerBits = result->getDataLayout().getPointerSizeInBits();
     const uint64_t workspaceLimit = pointerBits < 64 ? (uint64_t(1) << pointerBits) - 1
         : uint64_t(std::numeric_limits<int64_t>::max());
-    auto planned = planWorkspace(graph, workspaceLimit);
-    if (!planned) return planned.takeError();
-    const auto &workspacePlan = *planned;
+    const auto workspacePlan = planWorkspace(graph);
 
     llvm::SmallVector<llvm::Type *> parameters;
     for (mlir::Type type : graph.getArgumentTypes())
@@ -395,12 +472,17 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     }
 
     llvm::json::Array fusedGroups;
-    llvm::Value *workspace = nullptr;
-    if (workspacePlan.bytes) {
+    llvm::CallInst *workspace = nullptr;
+    llvm::SmallVector<WorkspaceBuffer> workspaceBuffers;
+    llvm::SmallVector<llvm::SmallVector<mlir::Value>> workspacePhases;
+    if (llvm::any_of(workspacePlan.materialized, [](mlir::Value value) {
+          return concreteCount(value.getType()) > 1;
+        })) {
       auto *sizeType = builder.getIntPtrTy(result->getDataLayout());
+      // Layout constants are filled after collecting the emitted phase reads.
       workspace = builder.CreateCall(result->getOrInsertFunction("malloc",
           llvm::FunctionType::get(pointer, {sizeType}, false)),
-          {llvm::ConstantInt::get(sizeType, workspacePlan.bytes)}, "workspace");
+          {llvm::ConstantInt::get(sizeType, 0)}, "workspace");
       auto *ready = llvm::BasicBlock::Create(context, "workspace.ready", function);
       auto *failed = llvm::BasicBlock::Create(context, "workspace.failed", function);
       builder.CreateCondBr(builder.CreateICmpNE(workspace, llvm::ConstantPointerNull::get(pointer)), ready, failed);
@@ -440,10 +522,11 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         bind(emitter);
         uniformValues[value] = emitter.emit(value, builder.getInt64(0));
         reductionLoops += emitter.reductionLoops;
+        workspacePhases.push_back(std::move(emitter.bufferReads));
         continue;
       }
-      auto *address = builder.CreateGEP(builder.getInt8Ty(), workspace,
-          builder.getInt64(workspacePlan.offsets.lookup(value)), "cached.buffer");
+      auto *address = llvm::GetElementPtrInst::Create(builder.getInt8Ty(), workspace,
+          {builder.getInt64(0)}, "cached.buffer", builder.GetInsertBlock());
       auto *before = builder.GetInsertBlock();
       auto *body = llvm::BasicBlock::Create(context, "materialize.loop", function);
       auto *after = llvm::BasicBlock::Create(context, "materialize.done", function);
@@ -463,6 +546,11 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(concreteCount(value.getType()))), body, after);
       builder.SetInsertPoint(after);
       cachedBuffers[value] = address;
+      const auto phase = workspacePhases.size();
+      workspaceBuffers.push_back({value, address,
+          concreteCount(value.getType()) * elementByteWidth(value.getType()),
+          elementByteWidth(value.getType()), phase, phase});
+      workspacePhases.push_back(std::move(emitter.bufferReads));
     }
     for (const OutputBatch &batch : batches) {
       if (batch.count == 0) {
@@ -506,7 +594,12 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       index->addIncoming(next, builder.GetInsertBlock());
       builder.CreateCondBr(builder.CreateICmpULT(next, builder.getInt64(batch.count)), body, after);
       builder.SetInsertPoint(after);
+      workspacePhases.push_back(std::move(emitter.bufferReads));
     }
+    auto workspaceBytes = assignWorkspace(workspaceBuffers, workspacePhases, workspaceLimit);
+    if (!workspaceBytes) return workspaceBytes.takeError();
+    if (workspace)
+      workspace->setArgOperand(0, llvm::ConstantInt::get(workspace->getArgOperand(0)->getType(), *workspaceBytes));
     if (workspace)
       builder.CreateCall(result->getOrInsertFunction("free",
           llvm::FunctionType::get(builder.getVoidTy(), {pointer}, false)), {workspace});
@@ -528,7 +621,7 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
             {"fused_output_groups", int64_t(fusedOutputGroups)},
             {"input_load_count", int64_t(inputLoads)},
             {"reduction_loop_count", int64_t(reductionLoops)},
-            {"temporary_workspace_bytes", int64_t(workspacePlan.bytes)},
+            {"temporary_workspace_bytes", int64_t(*workspaceBytes)},
             {"materialized_tensor_count", int64_t(cachedBuffers.size())},
             {"zero_element_outputs", int64_t(emptyOutputs)},
             {"groups", std::move(fusedGroups)}}}});

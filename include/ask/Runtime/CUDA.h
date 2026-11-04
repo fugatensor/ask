@@ -87,6 +87,8 @@ public:
   int device() const;
   std::array<int, 2> capability() const;
   std::string deviceName() const;
+  // Cumulative diagnostics: prepared_internal_{slots,bytes} sum successful
+  // preparation capacities; graph_{nodes,edges} sum instantiated graph DAGs.
   std::map<std::string, std::uint64_t> stats() const;
 private:
   friend class PreparedProgram;

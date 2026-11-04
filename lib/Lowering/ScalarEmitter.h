@@ -191,6 +191,8 @@ class ScalarEmitter {
 
 public:
   uint64_t reductionLoops = 0;
+  // Reads emitted into this phase, after uniform and per-index memo hits.
+  llvm::SmallVector<mlir::Value> bufferReads;
   ScalarEmitter(llvm::IRBuilder<> &builder, llvm::Function *function, bool cuda,
                 std::function<llvm::Value *(mlir::Value, llvm::Value *)> loader)
       : b(builder), function(function), cuda(cuda), load(std::move(loader)) {}
@@ -206,6 +208,7 @@ public:
     if (cached != values.end()) return cached->second;
     llvm::Value *computed;
     if (auto stored = buffers.find(value); stored != buffers.end()) {
+      bufferReads.push_back(value);
       auto *type = llir::scalarLLVMType(value.getType(), b.getContext());
       const bool boolean = type->isIntegerTy(1);
       if (boolean) type = b.getInt8Ty();

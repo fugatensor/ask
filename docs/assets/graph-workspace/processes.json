@@ -1,0 +1,674 @@
+[
+  {
+    "version": "baseline",
+    "mode": "host",
+    "run": 0,
+    "wall_seconds": 4.468856573104858,
+    "peak_rss_kib": 21240,
+    "rows": 16
+  },
+  {
+    "version": "candidate",
+    "mode": "host",
+    "run": 0,
+    "wall_seconds": 4.429618835449219,
+    "peak_rss_kib": 31376,
+    "rows": 16
+  },
+  {
+    "version": "baseline",
+    "mode": "gpu",
+    "run": 0,
+    "wall_seconds": 3.3642070293426514,
+    "peak_rss_kib": 109432,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "gpu",
+    "run": 0,
+    "wall_seconds": 3.306619882583618,
+    "peak_rss_kib": 112948,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "device",
+    "run": 0,
+    "wall_seconds": 3.369358777999878,
+    "peak_rss_kib": 110168,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "device",
+    "run": 0,
+    "wall_seconds": 3.3396644592285156,
+    "peak_rss_kib": 112772,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "cold",
+    "run": 0,
+    "wall_seconds": 0.5009379386901855,
+    "peak_rss_kib": 109788,
+    "rows": 1
+  },
+  {
+    "version": "candidate",
+    "mode": "cold",
+    "run": 0,
+    "wall_seconds": 0.49697232246398926,
+    "peak_rss_kib": 112868,
+    "rows": 1
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-cpu",
+    "run": 0,
+    "wall_seconds": 4.460965394973755,
+    "peak_rss_kib": 57288,
+    "rows": 8
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-cpu",
+    "run": 0,
+    "wall_seconds": 4.5162482261657715,
+    "peak_rss_kib": 67188,
+    "rows": 8
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-gpu",
+    "run": 0,
+    "wall_seconds": 4.338194847106934,
+    "peak_rss_kib": 152696,
+    "rows": 6
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-gpu",
+    "run": 0,
+    "wall_seconds": 4.430382966995239,
+    "peak_rss_kib": 159816,
+    "rows": 6
+  },
+  {
+    "version": "candidate",
+    "mode": "host",
+    "run": 1,
+    "wall_seconds": 4.496387720108032,
+    "peak_rss_kib": 31312,
+    "rows": 16
+  },
+  {
+    "version": "baseline",
+    "mode": "host",
+    "run": 1,
+    "wall_seconds": 4.621963024139404,
+    "peak_rss_kib": 21260,
+    "rows": 16
+  },
+  {
+    "version": "candidate",
+    "mode": "gpu",
+    "run": 1,
+    "wall_seconds": 3.304094076156616,
+    "peak_rss_kib": 110888,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "gpu",
+    "run": 1,
+    "wall_seconds": 3.337376594543457,
+    "peak_rss_kib": 109760,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "device",
+    "run": 1,
+    "wall_seconds": 3.370288372039795,
+    "peak_rss_kib": 112792,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "device",
+    "run": 1,
+    "wall_seconds": 3.309262275695801,
+    "peak_rss_kib": 110448,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "cold",
+    "run": 1,
+    "wall_seconds": 0.510016918182373,
+    "peak_rss_kib": 112996,
+    "rows": 1
+  },
+  {
+    "version": "baseline",
+    "mode": "cold",
+    "run": 1,
+    "wall_seconds": 0.48993754386901855,
+    "peak_rss_kib": 109788,
+    "rows": 1
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-cpu",
+    "run": 1,
+    "wall_seconds": 4.489812135696411,
+    "peak_rss_kib": 67780,
+    "rows": 8
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-cpu",
+    "run": 1,
+    "wall_seconds": 4.478825092315674,
+    "peak_rss_kib": 57156,
+    "rows": 8
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-gpu",
+    "run": 1,
+    "wall_seconds": 4.354236125946045,
+    "peak_rss_kib": 159272,
+    "rows": 6
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-gpu",
+    "run": 1,
+    "wall_seconds": 4.577605724334717,
+    "peak_rss_kib": 152664,
+    "rows": 6
+  },
+  {
+    "version": "baseline",
+    "mode": "host",
+    "run": 2,
+    "wall_seconds": 4.499242305755615,
+    "peak_rss_kib": 21308,
+    "rows": 16
+  },
+  {
+    "version": "candidate",
+    "mode": "host",
+    "run": 2,
+    "wall_seconds": 4.484177350997925,
+    "peak_rss_kib": 31276,
+    "rows": 16
+  },
+  {
+    "version": "baseline",
+    "mode": "gpu",
+    "run": 2,
+    "wall_seconds": 3.3401029109954834,
+    "peak_rss_kib": 109788,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "gpu",
+    "run": 2,
+    "wall_seconds": 3.300858497619629,
+    "peak_rss_kib": 113188,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "device",
+    "run": 2,
+    "wall_seconds": 3.320488452911377,
+    "peak_rss_kib": 109784,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "device",
+    "run": 2,
+    "wall_seconds": 3.3233766555786133,
+    "peak_rss_kib": 112452,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "cold",
+    "run": 2,
+    "wall_seconds": 0.5057318210601807,
+    "peak_rss_kib": 109784,
+    "rows": 1
+  },
+  {
+    "version": "candidate",
+    "mode": "cold",
+    "run": 2,
+    "wall_seconds": 0.5257163047790527,
+    "peak_rss_kib": 112848,
+    "rows": 1
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-cpu",
+    "run": 2,
+    "wall_seconds": 4.619011878967285,
+    "peak_rss_kib": 57292,
+    "rows": 8
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-cpu",
+    "run": 2,
+    "wall_seconds": 4.463498592376709,
+    "peak_rss_kib": 66532,
+    "rows": 8
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-gpu",
+    "run": 2,
+    "wall_seconds": 4.404139280319214,
+    "peak_rss_kib": 151384,
+    "rows": 6
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-gpu",
+    "run": 2,
+    "wall_seconds": 4.499468088150024,
+    "peak_rss_kib": 159448,
+    "rows": 6
+  },
+  {
+    "version": "candidate",
+    "mode": "host",
+    "run": 3,
+    "wall_seconds": 4.508235454559326,
+    "peak_rss_kib": 31328,
+    "rows": 16
+  },
+  {
+    "version": "baseline",
+    "mode": "host",
+    "run": 3,
+    "wall_seconds": 4.528321027755737,
+    "peak_rss_kib": 21296,
+    "rows": 16
+  },
+  {
+    "version": "candidate",
+    "mode": "gpu",
+    "run": 3,
+    "wall_seconds": 3.40250825881958,
+    "peak_rss_kib": 112680,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "gpu",
+    "run": 3,
+    "wall_seconds": 3.2906577587127686,
+    "peak_rss_kib": 109732,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "device",
+    "run": 3,
+    "wall_seconds": 3.4175407886505127,
+    "peak_rss_kib": 112800,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "device",
+    "run": 3,
+    "wall_seconds": 3.3119544982910156,
+    "peak_rss_kib": 109432,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "cold",
+    "run": 3,
+    "wall_seconds": 0.5773262977600098,
+    "peak_rss_kib": 112704,
+    "rows": 1
+  },
+  {
+    "version": "baseline",
+    "mode": "cold",
+    "run": 3,
+    "wall_seconds": 0.5261633396148682,
+    "peak_rss_kib": 109784,
+    "rows": 1
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-cpu",
+    "run": 3,
+    "wall_seconds": 4.5438127517700195,
+    "peak_rss_kib": 67216,
+    "rows": 8
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-cpu",
+    "run": 3,
+    "wall_seconds": 4.436219215393066,
+    "peak_rss_kib": 57884,
+    "rows": 8
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-gpu",
+    "run": 3,
+    "wall_seconds": 4.315446376800537,
+    "peak_rss_kib": 157976,
+    "rows": 6
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-gpu",
+    "run": 3,
+    "wall_seconds": 4.348485708236694,
+    "peak_rss_kib": 152472,
+    "rows": 6
+  },
+  {
+    "version": "baseline",
+    "mode": "host",
+    "run": 4,
+    "wall_seconds": 4.590745687484741,
+    "peak_rss_kib": 21308,
+    "rows": 16
+  },
+  {
+    "version": "candidate",
+    "mode": "host",
+    "run": 4,
+    "wall_seconds": 4.4497389793396,
+    "peak_rss_kib": 31444,
+    "rows": 16
+  },
+  {
+    "version": "baseline",
+    "mode": "gpu",
+    "run": 4,
+    "wall_seconds": 3.3294084072113037,
+    "peak_rss_kib": 109828,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "gpu",
+    "run": 4,
+    "wall_seconds": 3.3270702362060547,
+    "peak_rss_kib": 113528,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "device",
+    "run": 4,
+    "wall_seconds": 3.349102020263672,
+    "peak_rss_kib": 109792,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "device",
+    "run": 4,
+    "wall_seconds": 3.3435850143432617,
+    "peak_rss_kib": 113256,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "cold",
+    "run": 4,
+    "wall_seconds": 0.5127551555633545,
+    "peak_rss_kib": 106848,
+    "rows": 1
+  },
+  {
+    "version": "candidate",
+    "mode": "cold",
+    "run": 4,
+    "wall_seconds": 0.49767255783081055,
+    "peak_rss_kib": 111924,
+    "rows": 1
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-cpu",
+    "run": 4,
+    "wall_seconds": 4.4456586837768555,
+    "peak_rss_kib": 57288,
+    "rows": 8
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-cpu",
+    "run": 4,
+    "wall_seconds": 4.525544881820679,
+    "peak_rss_kib": 67156,
+    "rows": 8
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-gpu",
+    "run": 4,
+    "wall_seconds": 4.414371013641357,
+    "peak_rss_kib": 153072,
+    "rows": 6
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-gpu",
+    "run": 4,
+    "wall_seconds": 4.437038421630859,
+    "peak_rss_kib": 159716,
+    "rows": 6
+  },
+  {
+    "version": "candidate",
+    "mode": "host",
+    "run": 5,
+    "wall_seconds": 4.512859106063843,
+    "peak_rss_kib": 31232,
+    "rows": 16
+  },
+  {
+    "version": "baseline",
+    "mode": "host",
+    "run": 5,
+    "wall_seconds": 4.479029417037964,
+    "peak_rss_kib": 21288,
+    "rows": 16
+  },
+  {
+    "version": "candidate",
+    "mode": "gpu",
+    "run": 5,
+    "wall_seconds": 3.33774995803833,
+    "peak_rss_kib": 112704,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "gpu",
+    "run": 5,
+    "wall_seconds": 3.3354406356811523,
+    "peak_rss_kib": 109828,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "device",
+    "run": 5,
+    "wall_seconds": 3.412924289703369,
+    "peak_rss_kib": 112500,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "device",
+    "run": 5,
+    "wall_seconds": 3.3882999420166016,
+    "peak_rss_kib": 109096,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "cold",
+    "run": 5,
+    "wall_seconds": 0.5058088302612305,
+    "peak_rss_kib": 112776,
+    "rows": 1
+  },
+  {
+    "version": "baseline",
+    "mode": "cold",
+    "run": 5,
+    "wall_seconds": 0.515009880065918,
+    "peak_rss_kib": 109888,
+    "rows": 1
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-cpu",
+    "run": 5,
+    "wall_seconds": 4.661972999572754,
+    "peak_rss_kib": 66708,
+    "rows": 8
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-cpu",
+    "run": 5,
+    "wall_seconds": 4.69156289100647,
+    "peak_rss_kib": 57368,
+    "rows": 8
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-gpu",
+    "run": 5,
+    "wall_seconds": 4.4142279624938965,
+    "peak_rss_kib": 159632,
+    "rows": 6
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-gpu",
+    "run": 5,
+    "wall_seconds": 4.5555431842803955,
+    "peak_rss_kib": 153660,
+    "rows": 6
+  },
+  {
+    "version": "baseline",
+    "mode": "host",
+    "run": 6,
+    "wall_seconds": 5.282482385635376,
+    "peak_rss_kib": 21284,
+    "rows": 16
+  },
+  {
+    "version": "candidate",
+    "mode": "host",
+    "run": 6,
+    "wall_seconds": 5.333693742752075,
+    "peak_rss_kib": 31388,
+    "rows": 16
+  },
+  {
+    "version": "baseline",
+    "mode": "gpu",
+    "run": 6,
+    "wall_seconds": 3.401519298553467,
+    "peak_rss_kib": 109796,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "gpu",
+    "run": 6,
+    "wall_seconds": 3.323589324951172,
+    "peak_rss_kib": 111664,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "device",
+    "run": 6,
+    "wall_seconds": 3.332834482192993,
+    "peak_rss_kib": 109868,
+    "rows": 32
+  },
+  {
+    "version": "candidate",
+    "mode": "device",
+    "run": 6,
+    "wall_seconds": 3.4274978637695312,
+    "peak_rss_kib": 112764,
+    "rows": 32
+  },
+  {
+    "version": "baseline",
+    "mode": "cold",
+    "run": 6,
+    "wall_seconds": 0.5024425983428955,
+    "peak_rss_kib": 109784,
+    "rows": 1
+  },
+  {
+    "version": "candidate",
+    "mode": "cold",
+    "run": 6,
+    "wall_seconds": 0.5096800327301025,
+    "peak_rss_kib": 111964,
+    "rows": 1
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-cpu",
+    "run": 6,
+    "wall_seconds": 4.650916337966919,
+    "peak_rss_kib": 57288,
+    "rows": 8
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-cpu",
+    "run": 6,
+    "wall_seconds": 4.698996305465698,
+    "peak_rss_kib": 67204,
+    "rows": 8
+  },
+  {
+    "version": "baseline",
+    "mode": "fuga-gpu",
+    "run": 6,
+    "wall_seconds": 4.379180908203125,
+    "peak_rss_kib": 153272,
+    "rows": 6
+  },
+  {
+    "version": "candidate",
+    "mode": "fuga-gpu",
+    "run": 6,
+    "wall_seconds": 4.6111438274383545,
+    "peak_rss_kib": 158668,
+    "rows": 6
+  }
+]

@@ -1,0 +1,42 @@
+{
+  "host-raw.csv": {
+    "rows": 224,
+    "verified": 224
+  },
+  "gpu-raw.csv": {
+    "rows": 448,
+    "verified": 448
+  },
+  "cold-raw.csv": {
+    "rows": 14,
+    "verified": 14
+  },
+  "fuga-cpu-raw.csv": {
+    "rows": 112,
+    "verified": 112
+  },
+  "fuga-gpu-raw.csv": {
+    "rows": 84,
+    "verified": 84
+  },
+  "trace-raw.csv": {
+    "rows": 64,
+    "verified": 64
+  },
+  "baseline-host-memory.csv": {
+    "rows": 16,
+    "verified": 16
+  },
+  "candidate-host-memory.csv": {
+    "rows": 16,
+    "verified": 16
+  },
+  "event-host-gate-raw.csv": {
+    "rows": 448,
+    "verified": 448
+  },
+  "event-device-gate-candidate-smoke.csv": {
+    "rows": 32,
+    "verified": 32
+  }
+}

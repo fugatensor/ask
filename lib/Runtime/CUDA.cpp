@@ -205,7 +205,9 @@ struct SessionState {
       {"allocation_reuses",0},{"event_creations",0},{"event_reuses",0},
       {"resident_device_bytes",0},{"peak_resident_device_bytes",0},{"matmul_preparations",0},
       {"program_submissions",0},{"workspace_reuses",0},
-      {"graph_instantiations",0},{"graph_launches",0},{"graph_node_updates",0}};
+      {"graph_instantiations",0},{"graph_launches",0},{"graph_node_updates",0},
+      {"graph_nodes",0},{"graph_edges",0},
+      {"prepared_internal_bytes",0},{"prepared_internal_slots",0}};
   void checkOpen() const { require(!closed, "CUDA execution session is closed"); }
   void synchronize() {
     driver->check(driver->cuStreamSynchronize(stream), "cuStreamSynchronize");
@@ -281,6 +283,7 @@ struct PreparedProgram::Impl {
     std::size_t outputBytes = 0;
     std::vector<DevicePointer> constants;
     std::vector<Binding> publicBindings, internalBindings;
+    std::vector<std::size_t> dependencies;
     using Execute = void (*)(const Step &, Workspace &, std::size_t, SessionState &);
     using AddGraph = Handle (*)(const Step &, Workspace &, std::size_t, SessionState &, const Handle *, std::size_t);
     Execute execute = nullptr, updateGraph = nullptr;
@@ -314,6 +317,7 @@ struct PreparedProgram::Impl {
   std::vector<std::size_t> publicSteps;
   std::vector<std::pair<std::size_t,unsigned>> alignedPorts;
   std::vector<std::shared_ptr<Workspace>> workspaces;
+  std::size_t graphEdges = 0;
   bool graph = false;
   static void launchKernel(const Step &, Workspace &, std::size_t, SessionState &);
   static void launchMatmul(const Step &, Workspace &, std::size_t, SessionState &);
@@ -567,6 +571,77 @@ std::shared_ptr<Event> Session::submit(const std::shared_ptr<Kernel> &kernel,
   impl->pending.push_back(event);return event;
 }
 
+namespace {
+void assignGraphSlots(pass::AllocationPlan &allocation, std::vector<std::size_t> &slotOfBuffer,
+                      const std::set<std::size_t> &publicPorts,
+                      const std::vector<std::size_t> &lastUse) {
+  const auto &plan = allocation.plan;
+  const auto count = plan.steps.size(), absent = std::numeric_limits<std::size_t>::max();
+  allocation.graph = true;
+  allocation.dependencies.resize(count);
+  std::vector<std::size_t> producer(plan.buffer_count, absent), accessCount(plan.buffer_count);
+  std::vector<std::vector<std::size_t>> accesses(count), released(count);
+  std::vector<bool> hasSuccessor(count);
+  for (std::size_t i = 0; i < count; ++i) {
+    auto &parents = allocation.dependencies[i];
+    for (auto buffer : plan.steps[i].inputs)
+      if (producer[buffer] != absent) parents.push_back(producer[buffer]);
+    std::sort(parents.begin(), parents.end());
+    parents.erase(std::unique(parents.begin(), parents.end()), parents.end());
+    for (auto predecessor : parents) hasSuccessor[predecessor] = true;
+    for (auto buffer : plan.steps[i].outputs) producer[buffer] = i;
+    auto &used = accesses[i];used = plan.steps[i].inputs;
+    used.insert(used.end(), plan.steps[i].outputs.begin(), plan.steps[i].outputs.end());
+    std::sort(used.begin(), used.end());used.erase(std::unique(used.begin(), used.end()), used.end());
+    for (auto buffer : used) ++accessCount[buffer];
+  }
+  // A terminal last access cannot precede a later writer in this DAG.
+  for (const auto &step : plan.steps)
+    for (auto buffer : step.outputs)
+      if (!publicPorts.count(buffer) && lastUse[buffer] + 1 < count && hasSuccessor[lastUse[buffer]])
+        released[lastUse[buffer] + 1].push_back(buffer);
+  std::vector<std::size_t> visited(count, count), owner, epoch, remaining, ancestors, reusable;
+  std::set<std::pair<std::size_t, std::size_t>> candidates;
+  for (std::size_t i = 0; i < count; ++i) {
+    for (auto buffer : released[i]) candidates.emplace(producer[buffer], slotOfBuffer[buffer]);
+    ancestors = allocation.dependencies[i];reusable.clear();
+    for (auto buffer : plan.steps[i].outputs) {
+      if (publicPorts.count(buffer)) continue;
+      // Visit actual ancestors until every access of one old slot occupant
+      // has been seen. This keeps independent branches independent and stops
+      // close to the current node for ordinary chains.
+      // No candidate can have an access older than its producer. This bound
+      // prevents independent branches from repeatedly walking a deep prefix.
+      const auto firstAccess = candidates.empty() ? count : candidates.begin()->first;
+      while (reusable.empty() && !ancestors.empty()) {
+        auto predecessor = ancestors.back();ancestors.pop_back();
+        if (predecessor < firstAccess || visited[predecessor] == i) continue;
+        visited[predecessor] = i;
+        for (auto old : accesses[predecessor]) {
+          auto slot = slotOfBuffer[old];
+          if (slot == absent || owner[slot] != old || lastUse[old] >= i) continue;
+          if (epoch[slot] != i) { epoch[slot] = i;remaining[slot] = accessCount[old]; }
+          if (--remaining[slot] == 0) reusable.push_back(slot);
+        }
+        const auto &parents = allocation.dependencies[predecessor];
+        ancestors.insert(ancestors.end(), parents.begin(), parents.end());
+      }
+      std::size_t slot;
+      if (reusable.empty()) {
+        slot = owner.size();owner.push_back(buffer);epoch.push_back(count);remaining.push_back(0);
+        allocation.slot_capacity_bytes.push_back(allocation.buffer_sizes[buffer]);
+      } else {
+        slot = reusable.back();reusable.pop_back();
+        candidates.erase({producer[owner[slot]], slot});owner[slot] = buffer;
+        allocation.slot_capacity_bytes[slot] = std::max(allocation.slot_capacity_bytes[slot], allocation.buffer_sizes[buffer]);
+      }
+      slotOfBuffer[buffer] = slot;
+      allocation.assignments.push_back({buffer, slot});
+    }
+  }
+}
+} // namespace
+
 std::shared_ptr<PreparedProgram> Session::prepareProgram(
     std::vector<std::size_t> sizes,std::vector<std::size_t> inputs,
     std::vector<std::size_t> outputs,std::vector<PlanStep> steps,bool graph) {
@@ -638,7 +713,7 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
     require(available.size()==sizes.size(),"program contains an undefined buffer");
     allocation.plan.buffer_count=allocation.buffer_sizes.size();
     slotOfBuffer.assign(allocation.plan.buffer_count,noSlot);
-    // Strictly separate same-stream lifetimes for tensors and library scratch.
+    // Every producer is an access, including unconsumed tensors and scratch.
     std::vector<std::size_t> lastUse(allocation.plan.buffer_count,0);
     for(std::size_t i=0;i<steps.size();++i) {
       for(auto buffer:allocation.plan.steps[i].inputs) lastUse[buffer]=std::max(lastUse[buffer],i);
@@ -647,7 +722,8 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
     std::set<std::size_t> publicPorts(inputs.begin(),inputs.end());
     publicPorts.insert(outputs.begin(),outputs.end());
     std::vector<std::size_t> slotLastUse;
-    for(std::size_t i=0;i<steps.size();++i)
+    if(graph) assignGraphSlots(allocation,slotOfBuffer,publicPorts,lastUse);
+    else for(std::size_t i=0;i<steps.size();++i)
       for(auto buffer:allocation.plan.steps[i].outputs) {
         if(publicPorts.count(buffer)) continue;
         std::size_t slot=0;
@@ -670,10 +746,16 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
   auto p=std::make_unique<Program>();p->session=shared_from_this();p->state=impl->state;
   p->sizes=std::move(sizes);p->inputs=std::move(inputs);p->outputs=std::move(outputs);
   p->slotCapacities=std::move(allocation.slot_capacity_bytes);
+  s.counters["prepared_internal_slots"]+=p->slotCapacities.size();
+  for(auto capacity:p->slotCapacities) s.counters["prepared_internal_bytes"]+=capacity;
   p->steps.reserve(steps.size());p->graph=graph && !steps.empty();
   std::map<std::size_t,unsigned> alignments;
   for(std::size_t i=0;i<steps.size();++i) {
     auto &source=steps[i];Program::Step step;
+    if(graph) {
+      step.dependencies=std::move(allocation.dependencies[i]);
+      p->graphEdges+=step.dependencies.size();
+    }
     const auto bind=[&](std::size_t parameter,std::size_t buffer,unsigned alignment=1) {
       auto slot=slotOfBuffer[buffer];
       if(slot==noSlot) {
@@ -780,15 +862,18 @@ std::shared_ptr<Event> PreparedProgram::submit(
       // Retain a partially constructed graph only within this attempt.
       if(workspace->graph) { d.cuGraphDestroy(workspace->graph);workspace->graph=nullptr;workspace->nodes.clear(); }
       d.check(d.cuGraphCreate(&workspace->graph,0),"cuGraphCreate");
+      std::vector<Handle> dependencies;
       for(std::size_t i=0;i<impl->steps.size();++i) {
         const auto &step=impl->steps[i];
-        auto node=step.addGraph(step,*workspace,i,s,
-            workspace->nodes.empty()?nullptr:&workspace->nodes.back(),workspace->nodes.empty()?0:1);
+        dependencies.clear();
+        for(auto predecessor:step.dependencies) dependencies.push_back(workspace->nodes[predecessor]);
+        auto node=step.addGraph(step,*workspace,i,s,dependencies.data(),dependencies.size());
         workspace->nodes.push_back(node);
       }
       d.check(d.cuGraphInstantiate(&workspace->executable,workspace->graph,nullptr,nullptr,0),"cuGraphInstantiate");
       workspace->graphValues=workspace->values;
       ++s.counters["graph_instantiations"];
+      s.counters["graph_nodes"]+=impl->steps.size();s.counters["graph_edges"]+=impl->graphEdges;
     } else for(auto i:impl->publicSteps) if(workspace->graphValues[i]!=workspace->values[i]) {
       const auto &step=impl->steps[i];step.updateGraph(step,*workspace,i,s);
       workspace->graphValues[i]=workspace->values[i];++s.counters["graph_node_updates"];

@@ -1,5 +1,6 @@
 #include "Pass.h"
 #include "support/plan_matrix.h"
+#include "support/graph_matrix.h"
 
 #include <iostream>
 #include <limits>
@@ -14,6 +15,7 @@ using ask::pass::Plan;
 using ask::pass::PlanStep;
 using ask::pass::Verdict;
 namespace matrix = ask::test::plan_matrix;
+namespace graph = ask::test::graph_matrix;
 
 void expect(const Decision &decision, Verdict verdict, const char *caseName) {
   if (decision.verdict != verdict)
@@ -82,6 +84,131 @@ std::size_t largePlanMatrix() {
       }
   return cases;
 }
+
+// Exhaustive closure and pairwise accesses are deliberately separate from
+// the validator's ancestor search and adjacent-slot obligations.
+bool validGraph(const AllocationPlan &allocation) {
+  if (!matrix::valid(allocation)) return false;
+  if (!allocation.graph) return allocation.dependencies.empty();
+  const auto &plan = allocation.plan;
+  const auto count = plan.steps.size();
+  if (allocation.dependencies.size() != count) return false;
+  std::vector<std::vector<bool>> before(count, std::vector<bool>(count));
+  for (std::size_t step = 0; step < count; ++step) {
+    std::vector<bool> unique(count);
+    for (auto predecessor : allocation.dependencies[step]) {
+      if (predecessor >= step || unique[predecessor]) return false;
+      unique[predecessor] = true;before[predecessor][step] = true;
+      for (std::size_t ancestor = 0; ancestor < predecessor; ++ancestor)
+        before[ancestor][step] = before[ancestor][step] || before[ancestor][predecessor];
+    }
+  }
+  std::vector<std::size_t> producer(plan.buffer_count, count);
+  std::vector<std::vector<std::size_t>> accesses(plan.buffer_count);
+  for (std::size_t step = 0; step < count; ++step) {
+    for (auto buffer : plan.steps[step].outputs) {
+      producer[buffer] = step;accesses[buffer].push_back(step);
+    }
+    for (auto buffer : plan.steps[step].inputs) {
+      accesses[buffer].push_back(step);
+      if (producer[buffer] != count && !before[producer[buffer]][step]) return false;
+    }
+  }
+  for (const auto &a : allocation.assignments)
+    for (const auto &b : allocation.assignments) {
+      if (a.buffer == b.buffer || a.slot != b.slot || producer[a.buffer] > producer[b.buffer]) continue;
+      for (auto access : accesses[a.buffer])
+        if (!before[access][producer[b.buffer]]) return false;
+    }
+  return true;
+}
+
+AllocationPlan graphAllocation(const graph::Plan &source, bool scratch, std::size_t bytes,
+                               std::size_t period) {
+  AllocationPlan allocation;
+  auto &plan = allocation.plan;
+  plan.buffer_count = source.factors.size();plan.public_inputs = {0};plan.public_outputs = source.outputs;
+  allocation.graph = true;
+  for (const auto &step : source.steps) {
+    plan.steps.push_back({step.inputs, step.outputs});
+    if (scratch) plan.steps.back().outputs.push_back(plan.buffer_count++);
+    auto &parents = allocation.dependencies.emplace_back();
+    for (auto input : step.inputs) if (input) parents.push_back(input - 1);
+  }
+  allocation.buffer_sizes.assign(plan.buffer_count, bytes);
+  std::vector<bool> publicPort(plan.buffer_count);
+  publicPort[0] = true;
+  for (auto output : plan.public_outputs) publicPort[output] = true;
+  for (std::size_t buffer = 0; buffer < plan.buffer_count; ++buffer)
+    if (!publicPort[buffer]) {
+      auto slot = allocation.assignments.size() % period;
+      if (slot == allocation.slot_capacity_bytes.size()) allocation.slot_capacity_bytes.push_back(bytes);
+      allocation.assignments.push_back({buffer, slot});
+    }
+  return allocation;
+}
+
+std::size_t graphMatrix() {
+  std::size_t cases = 0;
+  for (auto topology : graph::topologies)
+    for (std::size_t depth : {2, 4})
+      for (std::size_t width : {2, 3})
+        for (bool scratch : {false, true})
+          for (std::size_t bytes : {0, 1, 16}) {
+            auto source = graph::make(topology, depth, width);
+            for (std::size_t period = 1; period <= source.steps.size() * (scratch ? 2 : 1); ++period) {
+              auto allocation = graphAllocation(source, scratch, bytes, period);
+              for (bool shortCapacity : {false, true}) {
+                auto candidate = allocation;
+                if (shortCapacity && bytes && !candidate.slot_capacity_bytes.empty())
+                  --candidate.slot_capacity_bytes[0];
+                expect(ask::pass::checkAllocationPlan(candidate), validGraph(candidate) ? Verdict::Pass : Verdict::Fail,
+                       "generated graph allocation");
+                ++cases;
+              }
+            }
+            auto original = graphAllocation(source, scratch, bytes, source.steps.size() * 2);
+            expect(ask::pass::checkAllocationPlan(original), Verdict::Pass, "graph cache source");
+            // Mutate every dependency in a cached valid plan, including missing,
+            // repeated and backwards edges; cache keys must retain the full DAG.
+            for (std::size_t step = 0; step < original.dependencies.size(); ++step)
+              for (std::size_t port = 0; port < original.dependencies[step].size(); ++port)
+                for (int mutation = 0; mutation < 3; ++mutation) {
+                  auto candidate = original;
+                  auto &parents = candidate.dependencies[step];
+                  if (mutation == 0) parents.erase(parents.begin() + port);
+                  if (mutation == 1) parents.push_back(parents[port]);
+                  if (mutation == 2) parents[port] = step;
+                  expect(ask::pass::checkAllocationPlan(candidate), validGraph(candidate) ? Verdict::Pass : Verdict::Fail,
+                         "graph cache edge mutation");
+                  ++cases;
+                }
+            auto candidate = original;candidate.graph = false;
+            expect(ask::pass::checkAllocationPlan(candidate), Verdict::Fail, "graph cache schedule mutation");
+            candidate = original;candidate.dependencies.pop_back();
+            expect(ask::pass::checkAllocationPlan(candidate), Verdict::Fail, "graph cache dependency count mutation");
+          }
+  // Scratch-like unused writes have lifetimes too. Adding a data-independent
+  // ordering edge permits reuse, and removing it must invalidate that plan.
+  auto unused = graphAllocation(graph::make(graph::Topology::Unused, 3, 2), true, 16, 2);
+  for (std::size_t i = 1; i < unused.dependencies.size(); ++i) unused.dependencies[i] = {i - 1};
+  // Buffer-index cyclic assignment may place simultaneous scratch/tensor writes
+  // together; assign the two outputs of every step to their own reused slots.
+  unused.assignments.clear();
+  for (const auto &step : unused.plan.steps)
+    for (std::size_t port = 0; port < step.outputs.size(); ++port)
+      unused.assignments.push_back({step.outputs[port], port});
+  expect(ask::pass::checkAllocationPlan(unused), Verdict::Pass, "ordered unused producers");
+  unused.dependencies[1].clear();
+  expect(ask::pass::checkAllocationPlan(unused), Verdict::Fail, "unordered unused producers");
+  for (std::size_t count : {128, 1024, 4096}) {
+    auto allocation = matrix::cyclic(matrix::Topology::Chain, count, 16);
+    allocation.graph = true;allocation.dependencies.resize(count);
+    for (std::size_t i = 1; i < count; ++i) allocation.dependencies[i] = {i - 1};
+    expect(ask::pass::checkAllocationPlan(allocation), Verdict::Pass, "large graph chain");
+  }
+  return cases;
+}
 } // namespace
 
 int main() {
@@ -89,6 +216,7 @@ int main() {
     const auto smallCases = allocationMatrix();
     const auto cacheCases = cacheMutationMatrix();
     const auto largeCases = largePlanMatrix();
+    const auto graphCases = graphMatrix();
     auto plan = chain(4);
     AllocationPlan allocation{plan, {16, 16, 16, 16, 16},
                               {{1, 0}, {2, 1}, {3, 0}}, {16, 16}};
@@ -190,7 +318,7 @@ int main() {
     expect(ask::pass::checkPlan(early), Verdict::Fail, "read before write");
 
     std::cout << "allocation matrix: " << smallCases << ", cache mutations: " << cacheCases
-              << ", large plans: " << largeCases << '\n';
+              << ", large plans: " << largeCases << ", graph cases: " << graphCases << '\n';
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

@@ -1,0 +1,14 @@
+{
+  "dag_runtime": {
+    "path": "/tmp/ask-graph-workspace-audit/candidate-sdk/lib/libask_runtime.so.0",
+    "sha256": "bd09c738c2553675d2358383b3665bec72f746deec6753d200b9f3cf332ebcac"
+  },
+  "empty_runtime": {
+    "path": "/tmp/ask-graph-workspace-audit/empty-root/libask_runtime.so.0",
+    "sha256": "15cf95e8fec250ca5055d281f2fdedde14f82e9e3597ead87c9ee2c66423a642"
+  },
+  "harness": {
+    "path": "/tmp/ask-graph-workspace-audit/profile/profile",
+    "sha256": "07edf914517740c56e1a3c300282827c3897526fa6335367ac18f9e01e0ab990"
+  }
+}
