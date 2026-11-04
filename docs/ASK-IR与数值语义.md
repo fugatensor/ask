@@ -56,7 +56,7 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 
 `transpose` 的 `permutation` 列出各输出轴对应的输入轴。归约的 `axes` 严格递增且唯一，结果移除指定轴；全部轴被移除时结果为标量，可用 `splat` 或 `broadcast_in_dim` 扩展。正秩张量的空轴列表保持原值。
 
-`reduce_sum` 按归约轴的行主序累计，每步使用输入类型舍入，整数回绕，空域结果为零。需要 f32 累加时先 `cast`。`reduce_max` 接受整数和浮点，传播 NaN，区分正负零，要求归约域非空。
+`reduce_sum` 支持 Warp Shuffle 与指令并行折叠累加，不严格限制为串行 IEEE-754 累加顺序，整数回绕，空域结果为零。需要 f32 累加时先 `cast`。`reduce_max` 接受整数和浮点，传播 NaN，区分正负零，要求归约域非空。
 
 <a id="elementwise-primitives"></a>
 

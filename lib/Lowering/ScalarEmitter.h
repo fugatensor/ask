@@ -52,8 +52,17 @@ class ScalarEmitter {
       right = llir::extendBF16(b, right);
     }
     llvm::Value *computed;
-    if (mlir::isa<AddOp, ReduceSumOp>(op)) computed = b.CreateFAdd(left, right, "add");
-    else if (mlir::isa<DivOp>(op)) computed = b.CreateFDiv(left, right, "div");
+    if (mlir::isa<AddOp, ReduceSumOp>(op)) {
+      computed = b.CreateFAdd(left, right, "add");
+      if (mlir::isa<ReduceSumOp>(op)) {
+        if (auto *inst = llvm::dyn_cast<llvm::Instruction>(computed)) {
+          llvm::FastMathFlags flags;
+          flags.setAllowReassoc(true);
+          flags.setAllowContract(true);
+          inst->setFastMathFlags(flags);
+        }
+      }
+    } else if (mlir::isa<DivOp>(op)) computed = b.CreateFDiv(left, right, "div");
     else computed = b.CreateFMul(left, right, "mul");
     return bf16 ? llir::truncateBF16(b, computed) : computed;
   }
@@ -148,7 +157,14 @@ class ScalarEmitter {
     auto combine = [&](llvm::Value *left, llvm::Value *right) -> llvm::Value * {
       if (isSum) {
         if (left->getType()->isIntegerTy()) return b.CreateAdd(left, right, "add.wrap");
-        return b.CreateFAdd(left, right, "add");
+        auto *add = b.CreateFAdd(left, right, "add");
+        if (auto *inst = llvm::dyn_cast<llvm::Instruction>(add)) {
+          llvm::FastMathFlags flags;
+          flags.setAllowReassoc(true);
+          flags.setAllowContract(true);
+          inst->setFastMathFlags(flags);
+        }
+        return add;
       }
       return maximum(left, right);
     };
