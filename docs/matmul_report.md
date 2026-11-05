@@ -1,8 +1,8 @@
-返回核心思想：[自有代码生成](核心思想.md#ask-owned-codegen) · [图切分与执行计划](核心思想.md#execution-plan) · 相关细节：[原语语义](ASK-IR与数值语义.md#tensor-primitives) · [矩阵乘法 API](用户API.md#matmul-api) · [FugaTensor 基础运算](../../fugatensor/docs/API/基础运算.md)
+返回核心思想：[自有代码生成](concepts.md#ask-owned-codegen) · [图切分与执行计划](concepts.md#execution-plan) · 相关细节：[原语语义](ir.md#tensor-primitives) · [矩阵乘法 API](api.md#matmul-api) · [FugaTensor 基础运算](../../fugatensor/docs/API/ops.md)
 
 # 原语、融合与矩阵乘法验证报告
 
-性能表保存原语与矩阵乘法交付阶段的采样结果；当前执行计划校验实现见[专用静态校验](规则证明与计划校验.md#plan-proof)，校验策略的独立成本对照见[评估报告](Rin成本与验证价值评估.md#cost)。
+性能表保存原语与矩阵乘法交付阶段的采样结果；当前执行计划校验实现见[专用静态校验](verification.md#plan-proof)。
 
 本次增加 10 个正交原语和矩阵乘法，并打通 Fuga 的类型推导、自动微分、编译包和原生执行。逐元素计算保持融合，CUDA 矩阵乘法使用 NVIDIA cuBLASLt。CPU 张量和代码生成使用 `bool/i32/i64/f32/f16` 五种类型，BF16 使用 CUDA。
 

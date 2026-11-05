@@ -1,4 +1,4 @@
-返回核心思想：[构建与进程内接入](核心思想.md#ask-frontend-build) · 相关细节：[安装](安装.md) · [外部编译器接入](外部编译器适配接入规范.md) · [常驻运行时](常驻运行时与多级缓存.md)
+返回核心思想：[构建与进程内接入](concepts.md#ask-frontend-build) · 相关细节：[安装](install.md) · [外部编译器接入](compilers.md) · [常驻运行时](runtime.md)
 
 # ASK 用户 API
 
@@ -40,7 +40,7 @@ module attributes {ask.schema_version = 1 : i64} {
 }
 ```
 
-IR 类型包括 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 写作 `i1`。Host 使用前五种类型；`bf16` 的执行目标为 CUDA `sm_80+`。类型转换用 `ask.cast`，标量填充用 `ask.splat`，执行前所有形状须确定。`tensor<f32>` 是通过指针传递的单元素 0-D 张量；Host 标量 `f32` 输入按值传递。舍入和溯源规则见 [ASK IR](ASK-IR与数值语义.md)。
+IR 类型包括 `bool/i32/i64/f32/f16/bf16`，MLIR 的 bool 写作 `i1`。Host 使用前五种类型；`bf16` 的执行目标为 CUDA `sm_80+`。类型转换用 `ask.cast`，标量填充用 `ask.splat`，执行前所有形状须确定。`tensor<f32>` 是通过指针传递的单元素 0-D 张量；Host 标量 `f32` 输入按值传递。舍入和溯源规则见 [ASK IR](ir.md)。
 
 形状变化使用 `ask.reshape`，例如 `"ask.reshape"(%x) {shape = array<i64: 2, 2>} : (tensor<4xi32>) -> tensor<2x2xi32>`。输入输出保持相同元素类型、总数和连续次序；目标形状中的 `-1` 须先由调用方解析。外部 kernel 会接收变换后的 `2×2` 端口。
 
@@ -96,7 +96,7 @@ auto result = ask::compiler::codegen(source, options);
 
 </details>
 
-构建信息、CLI 和 JSON 报告接口见[前端接入](前端接入与构建配置.md#native-compiler)。
+构建信息、CLI 和 JSON 报告接口见[前端接入](build.md#native-compiler)。
 
 <a id="execution-api"></a>
 
@@ -131,7 +131,7 @@ outputs.front()->copyToHost(result, sizeof(result));
 
 `prepareProgram(bufferSizes, inputs, outputs, steps, graph=false)` 接收逻辑缓冲区字节数、公开输入输出索引和步骤列表。它校验计划并生成内部槽位映射，返回可反复执行的 `PreparedProgram`。`run(inputs)` 自动分配公开输出；已有输出缓冲区时使用 `submit(inputs, outputs)`，得到完成事件。
 
-传 `graph=true` 使用 CUDA Graph replay。计划固定 kernel、形状和启动配置，每次可以传入新的公开缓冲区地址。工作区与事件的复用方式见[常驻运行时](常驻运行时与多级缓存.md#cuda-graph)。
+传 `graph=true` 使用 CUDA Graph replay。计划固定 kernel、形状和启动配置，每次可以传入新的公开缓冲区地址。工作区与事件的复用方式见[常驻运行时](runtime.md#cuda-graph)。
 
 <details>
 <summary>kernel 参数和缓冲区契约</summary>
@@ -140,7 +140,7 @@ outputs.front()->copyToHost(result, sizeof(result));
 
 `PlanStep` 保存 `kernel`、`arguments`、三维 `grid/block`、`sharedBytes` 和逻辑输入输出索引。`PlanArgument.buffer` 指向计划的缓冲区表，`-1` 表示 null；`scalar` 保存冻结的标量 ABI 字节。修改标量或启动配置时准备新程序。
 
-公开输入允许共享存储。不同逻辑输出须与其它公开端口分离；重复输出或输入别名须绑定同一存储。每次提交核对实际缓冲区的设备、字节数、可写性和别名。内部槽位的容量和生存期在准备阶段由 [ASK PASS](规则证明与计划校验.md) 验证。
+公开输入允许共享存储。不同逻辑输出须与其它公开端口分离；重复输出或输入别名须绑定同一存储。每次提交核对实际缓冲区的设备、字节数、可写性和别名。内部槽位的容量和生存期在准备阶段由 [ASK PASS](verification.md) 验证。
 
 </details>
 
@@ -159,7 +159,7 @@ auto program = session->prepareProgram(
     {32 * 64 * 2, 64 * 48 * 2, 32 * 48 * 2}, {0, 1}, {2}, {mm});
 ```
 
-准备时创建 cuBLASLt 描述和算法，执行时绑定 A、B、C 地址。矩阵按连续行主序存储；批次、转置和数值约定见[矩阵语义](ASK-IR与数值语义.md#matmul-semantics)。构建依赖见[CUDA 工具](安装.md#cuda-and-adapters)。
+准备时创建 cuBLASLt 描述和算法，执行时绑定 A、B、C 地址。矩阵按连续行主序存储；批次、转置和数值约定见[矩阵语义](ir.md#matmul-semantics)。构建依赖见[CUDA 工具](install.md#cuda-and-adapters)。
 
 <details>
 <summary>批次与工作区</summary>
@@ -176,7 +176,7 @@ auto program = session->prepareProgram(
 
 适配器提供 cubin/PTX、入口、端口和启动配置，通过 `load` 与 `prepareProgram` 接入。编译器检查 `ask.external` 的声明，`ask::compiler::partition` 将每个外部节点分为独立步骤，自有区域内部继续融合。
 
-worker 请求、产物格式和标量类型见[外部适配规范](外部编译器适配接入规范.md)。调用方负责 worker、工具环境、磁盘缓存和原生程序准备，FugaTensor 已提供相应实现。
+worker 请求、产物格式和标量类型见[外部适配规范](compilers.md)。调用方负责 worker、工具环境、磁盘缓存和原生程序准备，FugaTensor 已提供相应实现。
 
 借用外部设备指针时，调用方须保留实际存储所有者直到完成事件结束；`importBuffer` 仅持有 ASK 包装对象。使用 `session->waitForExternalStream(producerStream)` 等待生产者，外部框架再次访问缓冲区前也须等待 ASK 完成或建立等价依赖。
 
@@ -197,7 +197,7 @@ worker 请求、产物格式和标量类型见[外部适配规范](外部编译�
 
 会话保留待完成事件，事件保留程序、参数缓冲区和工作区，直到设备工作结束。完成后的工作区和事件句柄可复用，旧事件对象保持已完成状态，调用方持有的旧结果继续使用原存储。
 
-调用方保存编译产物及其目标、端口和参数 ABI、启动配置、内容摘要，并在加载时校验。执行计划 JSON v1 见[图切分与计划](图切分与多Kernel执行计划.md#plan-v1)。
+调用方保存编译产物及其目标、端口和参数 ABI、启动配置、内容摘要，并在加载时校验。执行计划 JSON v1 见[图切分与计划](partitioning.md#plan-v1)。
 
 <a id="errors-and-limits"></a>
 

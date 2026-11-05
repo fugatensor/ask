@@ -1,4 +1,4 @@
-返回核心思想：[双层 IR 模型](核心思想.md#ask-ir-model) · 相关细节：[前端接入与构建配置](前端接入与构建配置.md) · [图优化与自有代码生成](图优化与自有代码生成.md) · [Fuga IR 降级到 ASK](../../fugatensor/docs/ir/降级到ASK.md)
+返回核心思想：[双层 IR 模型](concepts.md#ask-ir-model) · 相关细节：[前端接入与构建配置](build.md) · [图优化与自有代码生成](codegen.md) · [Fuga IR 降级到 ASK](../../fugatensor/docs/ir/lowering.md)
 
 # ASK IR 与数值语义
 
@@ -40,7 +40,7 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 %matrix = "ask.reshape"(%flat) {shape = array<i64: 2, 2>} : (tensor<4xf32>) -> tensor<2x2xf32>
 ```
 
-`shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，见 [FugaTensor reshape](../../fugatensor/docs/API/张量与数据交换.md#reshape)。reshape 保持元素类型和线性次序，外部 kernel 接收变换后的形状。自有逐元素循环复用对应的输入值，公开输出使用独立缓冲区。
+`shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，见 [FugaTensor reshape](../../fugatensor/docs/API/tensor.md#reshape)。reshape 保持元素类型和线性次序，外部 kernel 接收变换后的形状。自有逐元素循环复用对应的输入值，公开输出使用独立缓冲区。
 
 <a id="tensor-primitives"></a>
 
@@ -64,7 +64,7 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 
 `div`、`exp`、`log`、`sqrt` 接受 f32/f16/bf16；低精度超越函数先扩展至 f32，再 RNE 回原类型。CUDA 的 exp/log 使用 NVIDIA libdevice。比较的 `predicate` 为 `eq`、`ne`、`lt`、`le`、`gt` 或 `ge`；浮点 NaN 仅使 `ne` 成立。`select(condition, yes, no)` 三个操作数形状相同，条件为 bool，两个分支类型相同。
 
-相邻逐元素操作由共享循环执行，广播和转置映射读取下标。具体物化边界见[图切分](图切分与多Kernel执行计划.md#partition-boundaries)。
+相邻逐元素操作由共享循环执行，广播和转置映射读取下标。具体物化边界见[图切分](partitioning.md#partition-boundaries)。
 
 <a id="matmul-semantics"></a>
 
@@ -118,7 +118,7 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 2. **推导形状快照**：检查逐元素算子的输入输出形状一致、reshape 前后元素数相同，按 `same_as`（跟随指定输入操作数形状）或 `fixed`（使用语义签名中的静态形状）确定 `ask.external` 的输出形状，在 `shapeSnapshotJSON` 的 `shape_bindings` 中输出张量值的形状，并记录输入特化、语义修订与快照摘要。
 3. **提取并擦除 `ask.mark`**：收集 `mark_id`、`value_id`、`role`（`value` / `input` / `output`）与可选 `port_id` 到 `diagnosticsJSON` 的 `markers` 字段，随后从 IR 中移除 `ask.mark` 并将原值直连下游算子。对准备后的 IR 再次运行 `--prepare`，IR 与修订计数保持不变；新的报告不再含已擦除的标记。
 
-CLI 和完整 JSON 接口将形状快照保存在完整报告的 `shape_snapshot` 字段，标记保存在 `markers` 字段。具名结果见[编译接口](用户API.md#compiler-api)。
+CLI 和完整 JSON 接口将形状快照保存在完整报告的 `shape_snapshot` 字段，标记保存在 `markers` 字段。具名结果见[编译接口](api.md#compiler-api)。
 
 <a id="external-declaration"></a>
 
@@ -129,4 +129,4 @@ CLI 和完整 JSON 接口将形状快照保存在完整报告的 `shape_snapshot
 - `ask.semantics` 描述图级接口（输入输出秩与 dtype、形状规则及 `effects = "none"`），供图校验和端口连接使用。高层 DCE 保留 `ask.external`。
 - `ask.implementation` 描述具体编译配置（`compiler = "triton"`、DSL 源码、`entry`、`signature`、`source_bindings`、`constants`、`options`、`target`、`grid`）。
 
-`prepare` 通过结果的 `externalRequestsJSON` 导出协议 v2 请求，调用方按 `compiler` 选择 worker；CLI 和完整 JSON 接口对应完整报告的 `external_requests` 字段。编译后的产物通过[外部执行接口](外部产物与执行接口.md)交给运行时。
+`prepare` 通过结果的 `externalRequestsJSON` 导出协议 v2 请求，调用方按 `compiler` 选择 worker；CLI 和完整 JSON 接口对应完整报告的 `external_requests` 字段。编译后的产物通过[外部执行接口](artifacts.md)交给运行时。

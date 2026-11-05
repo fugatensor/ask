@@ -1,4 +1,4 @@
-返回核心思想：[外部产物与执行接口](核心思想.md#external-execution) · 相关细节：[外部算子声明](ASK-IR与数值语义.md#external-declaration) · [Worker 协议](外部编译器适配接入规范.md#worker-protocol) · [图切分与调度](图切分与多Kernel执行计划.md)
+返回核心思想：[外部产物与执行接口](concepts.md#external-execution) · 相关细节：[外部算子声明](ir.md#external-declaration) · [Worker 协议](compilers.md#worker-protocol) · [图切分与调度](partitioning.md)
 
 # 外部产物与执行接口
 
@@ -18,7 +18,7 @@ ASK 负责请求与产物协议、图分区、ABI 检查和设备调度。调用
 
 ## 2. 可执行产物与端口
 
-Worker 返回 base64 编码的 cubin 或 PTX 文本，以及入口、目标架构、生产者、启动配置、参数顺序和所需元素类型，格式见[产物协议](外部编译器适配接入规范.md#artifact-contract)。
+Worker 返回 base64 编码的 cubin 或 PTX 文本，以及入口、目标架构、生产者、启动配置、参数顺序和所需元素类型，格式见[产物协议](compilers.md#artifact-contract)。
 
 调用方根据请求中的 `signature`、`source_bindings`、`port_shapes` 构造 invocation v2，核对文件摘要和张量端口，再将产物字节交给 `Session::load`。PTX 在加载时由 CUDA 驱动 JIT。
 
@@ -34,6 +34,6 @@ Worker 返回 base64 编码的 cubin 或 PTX 文本，以及入口、目标架�
 
 `ask.implementation.compiler` 是调用方选择 worker 的键。worker 可以是可执行文件，也可以由指定的 Python 解释器运行脚本。
 
-FugaTensor 提供 Triton worker，配置方式见[上层执行说明](../../fugatensor/docs/architecture/ASK桥接与多后端执行.md#cuda-and-triton)。其他框架可实现同一[请求/响应协议](外部编译器适配接入规范.md)。
+FugaTensor 提供 Triton worker，配置方式见[上层执行说明](../../fugatensor/docs/architecture/backend.md#cuda-and-triton)。其他框架可实现同一[请求/响应协议](compilers.md)。
 
 外部步骤使用 worker 的编译环境；混合图中的 owned 步骤由调用方运行 `llc` / `ptxas`。缺失 worker、非法请求、编译失败、损坏产物和 ABI 不匹配均应报错。

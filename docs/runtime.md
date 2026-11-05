@@ -1,4 +1,4 @@
-返回核心思想：[常驻运行时与缓存](核心思想.md#ask-runtime-cache) · 相关细节：[外部产物与执行接口](外部产物与执行接口.md) · [图优化与自有代码生成](图优化与自有代码生成.md) · [FugaTensor 多后端执行](../../fugatensor/docs/architecture/ASK桥接与多后端执行.md)
+返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[外部产物与执行接口](artifacts.md) · [图优化与自有代码生成](codegen.md) · [FugaTensor 多后端执行](../../fugatensor/docs/architecture/backend.md)
 
 # 常驻运行时与多级缓存
 
@@ -14,7 +14,7 @@ C++ 接口位于 [CUDA.h](../include/ask/Runtime/CUDA.h)，实现位于 `lib/Run
 
 `Session::load` 接收 cubin/PTX 字节、入口、架构和参数宽度，检查目标设备与 kernel 资源限制。同一会话按产物内容和入口复用模块。PTX 首次加载时由驱动编译，cubin 则直接加载。
 
-C++ 调用示例见[原生会话与计划执行](用户API.md#execution-api)。
+C++ 调用示例见[原生会话与计划执行](api.md#execution-api)。
 
 <a id="device-tensor-and-cai"></a>
 
@@ -24,7 +24,7 @@ C++ 调用示例见[原生会话与计划执行](用户API.md#execution-api)。
 
 `DeviceBuffer::copyFromHost(pointer, nbytes)` 和 `copyToHost(pointer, nbytes)` 批量拷贝连续内存；另有返回字节字符串的 `copyToHost()`。拷贝按原始字节进行，长度须完全匹配，返回前等待会话 stream 完成。
 
-借用外部内存时，调用方须保留实际存储所有者，直到 GPU 使用结束。FugaTensor 的绑定层负责解析 CUDA Array Interface、检查 shape/dtype/连续性、保留 Python 所有者，并调用 `waitForExternalStream` 等待生产者 stream。交换接口见 [FugaTensor 张量与数据交换](../../fugatensor/docs/API/张量与数据交换.md)。
+借用外部内存时，调用方须保留实际存储所有者，直到 GPU 使用结束。FugaTensor 的绑定层负责解析 CUDA Array Interface、检查 shape/dtype/连续性、保留 Python 所有者，并调用 `waitForExternalStream` 等待生产者 stream。交换接口见 [FugaTensor 张量与数据交换](../../fugatensor/docs/API/tensor.md)。
 
 外部生产者再次访问同一存储前，须等待 ASK 的完成事件或建立等价 stream 依赖。
 
@@ -32,7 +32,7 @@ C++ 调用示例见[原生会话与计划执行](用户API.md#execution-api)。
 
 ## 3. 整计划提交、资源保活与复用
 
-`Session::prepareProgram(bufferSizes, inputs, outputs, steps, graph)` 固定缓冲区索引、物理参数、标量字节与启动配置，返回 `PreparedProgram`。调用方在准备前核对张量 shape/dtype 和编译包；原生层验证步骤引用与 kernel ABI，[ASK PASS](规则证明与计划校验.md#plan-proof) 直接检查读端口、公开输出及内部槽位映射；相同计划复用进程内的成功校验缓存。cuBLASLt 描述、算法和实际 scratch 容量在准备时固定，scratch 加入同一份槽位校验；每步的执行函数在此时选定，提交循环直接调用。
+`Session::prepareProgram(bufferSizes, inputs, outputs, steps, graph)` 固定缓冲区索引、物理参数、标量字节与启动配置，返回 `PreparedProgram`。调用方在准备前核对张量 shape/dtype 和编译包；原生层验证步骤引用与 kernel ABI，[ASK PASS](verification.md#plan-proof) 直接检查读端口、公开输出及内部槽位映射；相同计划复用进程内的成功校验缓存。cuBLASLt 描述、算法和实际 scratch 容量在准备时固定，scratch 加入同一份槽位校验；每步的执行函数在此时选定，提交循环直接调用。
 
 每次执行调用 `PreparedProgram::submit(inputs, outputs)`，或使用 `run(inputs)` 由运行时分配输出。准备阶段生成待分配输出和端口别名约束表；`run` 校验输入后，只为独立的输出分配存储，重复输出和输入别名复用原缓冲区。`submit` 校验调用方给定的端口，两条入口共用已绑定计划的提交实现。公开端口的设备、字节数、可写性和别名在提交边界校验，随后更新地址并执行全部步骤。整个计划记录一个完成事件，事件覆盖全部缓冲区、kernel 和工作区。
 
@@ -61,7 +61,7 @@ C++ 调用示例见[原生会话与计划执行](用户API.md#execution-api)。
 
 `graph_nodes` / `graph_edges` 累计已实例化 Graph 的顶层节点和依赖边，cuBLASLt 子图计为一个顶层节点。`prepared_internal_slots` / `prepared_internal_bytes` 累计成功准备计划中单份内部工作区的槽数和容量，包含库 scratch；实际驻留量随在途工作区及分配池变化。
 
-矩阵乘法的 Graph replay、TF32、提交延迟和内存数据见 [FugaTensor 矩阵乘法与提交优化](../../fugatensor/docs/矩阵乘法与提交优化.md#layers)。
+矩阵乘法的 Graph replay、TF32 与提交机制见 [FugaTensor 算术运算](../../fugatensor/docs/API/ops.md#matmul)。
 
 <a id="two-tier-cache"></a>
 
@@ -75,6 +75,6 @@ FugaTensor 的 `_ask` 接入层维护以下磁盘缓存，校验产物后将字�
 | 自有 cubin | `llc` 与 `ptxas` | LLVM IR、产物描述、工具及环境摘要 |
 | 外部产物 | Worker 编译 | 标准化请求、probe 结果、worker/解释器、依赖与环境摘要 |
 
-外部缓存保存 cubin 或原始 PTX，查找前探测生产者，编译后再次核对依赖。缓存使用锁、临时目录和原子发布，读取时检查清单、长度和 SHA-256。失效规则见[FugaTensor 缓存分工](../../fugatensor/docs/architecture/ASK桥接与多后端执行.md#cache-hierarchy)及[worker 缓存身份](外部编译器适配接入规范.md#cache-identity)。
+外部缓存保存 cubin 或原始 PTX，查找前探测生产者，编译后再次核对依赖。缓存使用锁、临时目录和原子发布，读取时检查清单、长度和 SHA-256。失效规则见[FugaTensor 缓存分工](../../fugatensor/docs/architecture/backend.md#cache-hierarchy)及[worker 缓存身份](compilers.md#cache-identity)。
 
-ASK 在计划准备时缓存成功校验，会话缓存驻留模块、工作区、显存和事件。校验缓存的键和容量见[成功校验缓存](规则证明与计划校验.md#proof-cache)。
+ASK 在计划准备时缓存成功校验，会话缓存驻留模块、工作区、显存和事件。校验缓存的键和容量见[成功校验缓存](verification.md#proof-cache)。

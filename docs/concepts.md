@@ -12,7 +12,7 @@ FugaTensor 负责 Tensor API、组图、函数式 `grad` 和 Python 控制流。
 
 ASK 负责图校验、优化、代码生成和设备调度。FugaTensor 的扩展直接链接 ASK C++ 库，同时管理第三方 worker 和磁盘缓存。
 
-工程细节：[职责划分](FugaTensor协同与演进路线.md#division-of-labor) · [C++ 接口边界](前端接入与构建配置.md#python-sdk)
+工程细节：[职责划分](fugatensor.md#division-of-labor) · [C++ 接口边界](build.md#python-sdk)
 
 <a id="ask-ir-model"></a>
 
@@ -22,7 +22,7 @@ ASK 负责图校验、优化、代码生成和设备调度。FugaTensor 的扩�
 
 逐元素输入须同形状、同类型；类型转换使用 `ask.cast`，标量填充使用 `ask.splat`。广播、转置和归约各有独立原语；`ask.matmul` 表达矩阵与同批次矩阵相乘。Host 使用 `bool/i32/i64/f32/f16`；`bf16` 用于 CUDA `sm_80+`。外部算子通过 cubin/PTX 接入运行时。
 
-工程细节：[IR 结构与类型](ASK-IR与数值语义.md#ir-structure) · [数值转换](ASK-IR与数值语义.md#cast-semantics) · [张量原语](ASK-IR与数值语义.md#tensor-primitives) · [矩阵乘法](ASK-IR与数值语义.md#matmul-semantics) · [形状与溯源](ASK-IR与数值语义.md#shape-and-markers)
+工程细节：[IR 结构与类型](ir.md#ir-structure) · [数值转换](ir.md#cast-semantics) · [张量原语](ir.md#tensor-primitives) · [矩阵乘法](ir.md#matmul-semantics) · [形状与溯源](ir.md#shape-and-markers)
 
 <a id="ask-frontend-build"></a>
 
@@ -32,7 +32,7 @@ ASK 负责图校验、优化、代码生成和设备调度。FugaTensor 的扩�
 
 `ASK::Compiler` 接收 MLIR 文本和具名选项，按准备、分区、代码生成分别返回结果类型；形状、外部请求、执行计划、ABI 和产物使用独立字段，诊断保存溯源与统计。`ASK::Runtime` 管理设备执行。直接操作 MLIR/LLVM 时使用 `ASK::Core`。命令行工具 `ask-opt` 提供相同的编译步骤和完整 JSON 报告。
 
-工程细节：[独立安装](安装.md) · [用户 API](用户API.md#api-entrypoints) · [构建流程](前端接入与构建配置.md#build-workflow) · [Worker 配置](外部产物与执行接口.md#worker-interface)
+工程细节：[独立安装](install.md) · [用户 API](api.md#api-entrypoints) · [构建流程](build.md#build-workflow) · [Worker 配置](artifacts.md#worker-interface)
 
 <a id="ask-owned-codegen"></a>
 
@@ -42,7 +42,7 @@ ASK 对自有计算执行常量和类型折叠、死代码消除及多输出逐�
 
 Host 后端将同形状的多输出计算放入共享循环，生成 `.o`；f32 matmul 调用 OpenBLAS SGEMM。CUDA 后端生成带 64 位 grid-stride 循环的 LLVM IR，再经 `llc` 和 `ptxas` 生成 cubin。广播和转置通过下标映射参与融合；归约结果扩展时物化。CUDA matmul 交给 cuBLASLt，算法与 scratch 在准备阶段固定。
 
-工程细节：[高层优化](图优化与自有代码生成.md#graph-passes) · [Host 代码生成](图优化与自有代码生成.md#host-codegen) · [自有 CUDA](图优化与自有代码生成.md#owned-cuda) · [原语与矩阵乘法验证](原语与矩阵乘法验证报告.md#fusion-profile)
+工程细节：[高层优化](codegen.md#graph-passes) · [Host 代码生成](codegen.md#host-codegen) · [自有 CUDA](codegen.md#owned-cuda) · [原语与矩阵乘法验证](matmul_report.md#fusion-profile)
 
 <a id="external-execution"></a>
 
@@ -52,7 +52,7 @@ Host 后端将同形状的多输出计算放入共享循环，生成 `.o`；f32 
 
 `P → 外部 F → Q` 形成三个步骤：P、Q 由 ASK 编译，F 由第三方编译器生成。步骤通过设备缓冲区传递数据；外部 kernel 保留其编译器的数值策略。
 
-工程细节：[产物与端口](外部产物与执行接口.md#binary-artifact) · [Worker 协议](外部编译器适配接入规范.md#worker-protocol)
+工程细节：[产物与端口](artifacts.md#binary-artifact) · [Worker 协议](compilers.md#worker-protocol)
 
 <a id="ask-runtime-cache"></a>
 
@@ -64,7 +64,7 @@ CUDA Graph 按读写依赖连接节点，独立分支保留并行机会。准备
 
 FugaTensor 按工具、依赖和内容摘要缓存编译产物；ASK 缓存已加载模块和执行资源。PTX 在驱动加载时 JIT。
 
-工程细节：[会话](常驻运行时与多级缓存.md#execution-session) · [设备张量](常驻运行时与多级缓存.md#device-tensor-and-cai) · [缓存](常驻运行时与多级缓存.md#two-tier-cache) · [依赖调度与临时区复用验证](依赖调度与临时区复用验证报告.md)
+工程细节：[会话](runtime.md#execution-session) · [设备张量](runtime.md#device-tensor-and-cai) · [缓存](runtime.md#two-tier-cache) · [依赖调度与临时区复用验证](workspace_report.md)
 
 <a id="ask-pipeline"></a>
 
@@ -84,7 +84,7 @@ flowchart TD
     E --> R["ASK C++：缓冲区、整计划提交、Graph replay、完成事件"]
 ```
 
-工程细节：[分区表示](图切分与多Kernel执行计划.md#partition-ir) · [编译包与运行](图切分与多Kernel执行计划.md#program-runtime)
+工程细节：[分区表示](partitioning.md#partition-ir) · [编译包与运行](partitioning.md#program-runtime)
 
 <a id="ask-testing-roadmap"></a>
 
@@ -92,7 +92,7 @@ flowchart TD
 
 `ask-core`、`ask-compiler`、`ask-primitives` 和 `ask-pass` 验证图准备、优化、代码生成与计划证明，`ask-host-blas` 验证 OpenBLAS 链接及数值；启用 `ASK_TEST_CUDA=ON` 后，`ask-runtime` 验证 GPU 执行、槽位复用和 Graph replay；启用 cuBLASLt 的构建另有 `ask-matmul` 矩阵。[FugaTensor](../../fugatensor/README.md) 提供接入示例和端到端测试。
 
-工程细节：[测试体系](工程结构与测试体系.md#ctest-targets) · [编译与执行能力](FugaTensor协同与演进路线.md#implemented-scope) · [项目依赖](FugaTensor协同与演进路线.md#roadmap)
+工程细节：[测试体系](testing.md#ctest-targets) · [编译与执行能力](fugatensor.md#implemented-scope) · [项目依赖](fugatensor.md#roadmap)
 
 <a id="execution-plan"></a>
 
@@ -100,4 +100,4 @@ flowchart TD
 
 分区结果是一组 MLIR 函数，JSON v1 记录缓冲区、端口、依赖和执行顺序。自有区域内部融合，每个外部节点和 matmul 单独执行。所有步骤提交到同一 stream，中间结果留在显存。
 
-工程细节：[分区表示](图切分与多Kernel执行计划.md#partition-ir) · [JSON v1](图切分与多Kernel执行计划.md#plan-v1) · [计划规则证明](规则证明与计划校验.md#plan-proof) · [常驻调度](图切分与多Kernel执行计划.md#program-runtime) · [跨项目审查](跨项目审查报告.md#proof)
+工程细节：[分区表示](partitioning.md#partition-ir) · [JSON v1](partitioning.md#plan-v1) · [计划规则证明](verification.md#plan-proof) · [常驻调度](partitioning.md#program-runtime)

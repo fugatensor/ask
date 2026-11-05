@@ -3,9 +3,9 @@
 ---
 
 <p align="center">
-  <a href="docs/安装.md#requirements"><img src="https://img.shields.io/badge/C%2B%2B-17-00599c" alt="C++17"></a>
-  <a href="docs/前端接入与构建配置.md#version-contract"><img src="https://img.shields.io/badge/LLVM-23.1.x-64748b" alt="LLVM 23.1.x"></a>
-  <a href="docs/核心思想.md#ask-owned-codegen"><img src="https://img.shields.io/badge/backend-CPU%20%7C%20CUDA-76b900" alt="CPU / CUDA"></a>
+  <a href="docs/install.md#requirements"><img src="https://img.shields.io/badge/C%2B%2B-17-00599c" alt="C++17"></a>
+  <a href="docs/build.md#version-contract"><img src="https://img.shields.io/badge/LLVM-23.1.x-64748b" alt="LLVM 23.1.x"></a>
+  <a href="docs/concepts.md#ask-owned-codegen"><img src="https://img.shields.io/badge/backend-CPU%20%7C%20CUDA-76b900" alt="CPU / CUDA"></a>
 </p>
 
 ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态图，生成 CPU/CUDA 代码，并调度自有及第三方 cubin/PTX。
@@ -17,11 +17,11 @@ ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态�
 
 项目提供 C++ SDK 与 `ask-opt`。Compiler SDK 使用具名编译选项和按阶段区分的结果，将执行计划、ABI、产物与诊断分开返回。[FugaTensor](../fugatensor/README.md) 在此基础上实现 Python API、自动组图、求导和第三方编译器适配。
 
-接口见[用户 API](docs/用户API.md)，设计见[核心思想](docs/核心思想.md)。接入示例推荐看 FugaTensor 的 [Tensor API](../fugatensor/docs/API/README.md) 和[图降级、原生绑定与执行](../fugatensor/docs/architecture/ASK桥接与多后端执行.md)。
+接口见[用户 API](docs/api.md)，设计见[核心思想](docs/concepts.md)。接入示例推荐看 FugaTensor 的 [Tensor API](../fugatensor/docs/API/README.md) 和[图降级、原生绑定与执行](../fugatensor/docs/architecture/backend.md)。
 
 ## 构建、安装与验证
 
-构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)。执行计划由 ASK 自有 C++ 静态校验器检查，用途见[计划校验](docs/规则证明与计划校验.md)。下载脚本使用 Python 3 标准库，并通过 C 编译器与 Make 构建锁定的原生 OpenBLAS SDK，供 Host f32 矩阵乘法使用。
+构建需要 C++17、CMake 3.28+、Ninja 和同一套 LLVM/MLIR 23.1.x SDK。默认下载 Linux x86-64 的 23.1.4 发行版，版本和摘要见[依赖记录](cmake/llvm.lock.json)。执行计划由 ASK 自有 C++ 静态校验器检查，用途见[计划校验](docs/verification.md)。下载脚本使用 Python 3 标准库，并通过 C 编译器与 Make 构建锁定的原生 OpenBLAS SDK，供 Host f32 矩阵乘法使用。
 
 ```bash
 python3 tools/fetch_deps.py
@@ -31,7 +31,7 @@ ctest --preset core --output-on-failure
 cmake --install build/core --prefix /path/to/ask-sdk
 ```
 
-调用方链接 `ASK::Compiler` 和 `ASK::Runtime`；直接操作 MLIR/LLVM 时使用 `ASK::Core`，并提供匹配的 LLVM/MLIR SDK。组件和依赖见[安装说明](docs/安装.md)。
+调用方链接 `ASK::Compiler` 和 `ASK::Runtime`；直接操作 MLIR/LLVM 时使用 `ASK::Core`，并提供匹配的 LLVM/MLIR SDK。组件和依赖见[安装说明](docs/install.md)。
 
 ```cmake
 find_package(ASK CONFIG REQUIRED COMPONENTS Compiler Runtime)
@@ -51,12 +51,12 @@ cmake --build --preset core
 ctest --preset core --output-on-failure
 ```
 
-默认 CTest 运行 `ask-core`、`ask-compiler`、`ask-pass`、`ask-primitives` 和 `ask-host-blas`，启用 GPU 后增加 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。源码与 SDK 消费测试位于 `tests/`，覆盖范围见[测试体系](docs/工程结构与测试体系.md)。
+默认 CTest 运行 `ask-core`、`ask-compiler`、`ask-pass`、`ask-primitives` 和 `ask-host-blas`，启用 GPU 后增加 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。源码与 SDK 消费测试位于 `tests/`，覆盖范围见[测试体系](docs/testing.md)。
 
-FugaTensor 的[端到端测试](../fugatensor/docs/测试.md)覆盖图降级、数值、求导和外部 kernel 调度。
+FugaTensor 的[端到端测试](../fugatensor/docs/testing.md)覆盖图降级、数值、求导和外部 kernel 调度。
 
 ## 许可证
 
 本项目采用 [Apache-2.0](LICENSE) 许可证开源。
 
-[文档目录](docs/README.md) · [外部 Worker 协议](docs/外部编译器适配接入规范.md) · [执行计划](docs/图切分与多Kernel执行计划.md)
+[文档目录](docs/README.md) · [外部 Worker 协议](docs/compilers.md) · [执行计划](docs/partitioning.md)

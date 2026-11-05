@@ -1,4 +1,4 @@
-返回核心思想：[外部产物与执行接口](核心思想.md#external-execution) · 相关细节：[可执行产物边界](外部产物与执行接口.md#binary-artifact) · [多 Kernel 执行计划](图切分与多Kernel执行计划.md#complex-external)
+返回核心思想：[外部产物与执行接口](concepts.md#external-execution) · 相关细节：[可执行产物边界](artifacts.md#binary-artifact) · [多 Kernel 执行计划](partitioning.md#complex-external)
 
 # 外部编译器适配接入规范
 
@@ -72,7 +72,7 @@ FugaTensor 的 [`normalize_artifact`](../../fugatensor/src/fugatensor/_ask/adapt
 
 FugaTensor 查找外部编译缓存前执行带请求的 `--probe`，编译后再次探测，确认期间依赖保持一致。缓存键包含请求、探测结果、worker/解释器文件摘要、环境变量及调用流程的实现摘要；命中后仍校验产物。Worker 的指纹应覆盖自身导入的辅助模块和第三方依赖。
 
-产物使用普通 CUDA kernel、静态连续的多输入多输出、指针与标量混合参数、固定启动配置和动态共享内存。scratch 为空；`null` 用于实际允许为空的指针。启动要求见[可执行产物与端口](外部产物与执行接口.md#binary-artifact)。
+产物使用普通 CUDA kernel、静态连续的多输入多输出、指针与标量混合参数、固定启动配置和动态共享内存。scratch 为空；`null` 用于实际允许为空的指针。启动要求见[可执行产物与端口](artifacts.md#binary-artifact)。
 
 <a id="conformance"></a>
 

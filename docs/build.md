@@ -1,4 +1,4 @@
-返回核心思想：[构建与进程内绑定](核心思想.md#ask-frontend-build) · 相关细节：[用户 API](用户API.md) · [ASK IR 与数值语义](ASK-IR与数值语义.md) · [工程结构与测试体系](工程结构与测试体系.md)
+返回核心思想：[构建与进程内绑定](concepts.md#ask-frontend-build) · 相关细节：[用户 API](api.md) · [ASK IR 与数值语义](ir.md) · [工程结构与测试体系](testing.md)
 
 # 前端接入与构建配置
 
@@ -18,17 +18,17 @@ ctest --preset core --output-on-failure
 cmake --install build/core --prefix /path/to/ask-install
 ```
 
-获取脚本支持 `--only llvm`，检查 SHA-256、归档路径和软链，将获取记录写入 `.deps/<dir>/.ask-sdk.json`。CMake 自动查找 `.deps/` 中的 SDK；也可通过 `-DLLVM_DIR` / `-DMLIR_DIR` 指定同系列稳定版。LLVM 和 MLIR 须来自同一版本、同一安装。安装布局见[安装说明](安装.md)。
+获取脚本支持 `--only llvm`，检查 SHA-256、归档路径和软链，将获取记录写入 `.deps/<dir>/.ask-sdk.json`。CMake 自动查找 `.deps/` 中的 SDK；也可通过 `-DLLVM_DIR` / `-DMLIR_DIR` 指定同系列稳定版。LLVM 和 MLIR 须来自同一版本、同一安装。安装布局见[安装说明](install.md)。
 
 <a id="compiler-selection"></a>
 
 ## 2. 核心配置与外部编译器
 
-`core` 预设构建 CPU/CUDA 降级和设备运行时。`ASK_TARGET_BACKENDS=host` 启用 Host 对象代码生成，`none` 关闭它；两种配置都保留 CUDA LLVM 降级。`ASK_ENABLE_CUBLASLT` 控制 Runtime 的库提供者，构建和动态加载要求见[CUDA 工具](安装.md#cuda-and-adapters)。
+`core` 预设构建 CPU/CUDA 降级和设备运行时。`ASK_TARGET_BACKENDS=host` 启用 Host 对象代码生成，`none` 关闭它；两种配置都保留 CUDA LLVM 降级。`ASK_ENABLE_CUBLASLT` 控制 Runtime 的库提供者，构建和动态加载要求见[CUDA 工具](install.md#cuda-and-adapters)。
 
 默认 CTest 运行 Compiler、Core、Pass、Primitives 和 Host OpenBLAS 链接数值测试。配置 `-DASK_TEST_CUDA=ON` 后增加 GPU 运行时测试，并在启用 cuBLASLt 时增加 matmul 矩阵；执行需有可用的驱动和设备。
 
-调用方管理第三方编译器的 worker、运行环境和产物缓存。ASK 检查 `ask.external`，生成分区计划，再调度 cubin/PTX。FugaTensor 提供了 Triton worker；协议见[外部产物接口](外部产物与执行接口.md)。
+调用方管理第三方编译器的 worker、运行环境和产物缓存。ASK 检查 `ask.external`，生成分区计划，再调度 cubin/PTX。FugaTensor 提供了 Triton worker；协议见[外部产物接口](artifacts.md)。
 
 <a id="native-compiler"></a>
 <a id="python-sdk"></a>
@@ -40,11 +40,11 @@ find_package(ASK 0.1.0 EXACT CONFIG REQUIRED COMPONENTS Compiler Runtime)
 target_link_libraries(my_framework PRIVATE ASK::Compiler ASK::Runtime)
 ```
 
-`ASK::Compiler` 的公开头文件是 `ask/Frontend/CompilerAPI.h`。`ask::compiler::prepare`、`partition`、`codegen` 接收 ASK MLIR 字符串和具名选项，分别返回 `PrepareResult`、`PartitionResult`、`CodegenResult`。结果通过独立字段提供 IR、形状快照、外部请求、执行计划、步骤源码和目标 ABI/产物，`diagnosticsJSON` 用于阶段、溯源和统计信息。接口仅使用 C++17 标准库类型，具体字段见[编译接口](用户API.md#compiler-api)。
+`ASK::Compiler` 的公开头文件是 `ask/Frontend/CompilerAPI.h`。`ask::compiler::prepare`、`partition`、`codegen` 接收 ASK MLIR 字符串和具名选项，分别返回 `PrepareResult`、`PartitionResult`、`CodegenResult`。结果通过独立字段提供 IR、形状快照、外部请求、执行计划、步骤源码和目标 ABI/产物，`diagnosticsJSON` 用于阶段、溯源和统计信息。接口仅使用 C++17 标准库类型，具体字段见[编译接口](api.md#compiler-api)。
 
 每次请求使用独立的 MLIR context，解析、优化和降级在该 context 内完成。失败抛出 `std::runtime_error`。`namespace ask` 中的 `prepareJSON`、`partitionJSON`、`codegenJSON` 返回 `{ir, reportJSON}`，CLI 同样提供完整 JSON 报告。
 
-`ASK::Runtime` 的公开头文件是 `ask/Runtime/CUDA.h`，提供 `Session`、`PreparedProgram`、`DeviceBuffer`、`Kernel` 和 `Event`，支持顺序提交和 CUDA Graph replay。调用示例见[用户 API](用户API.md)。
+`ASK::Runtime` 的公开头文件是 `ask/Runtime/CUDA.h`，提供 `Session`、`PreparedProgram`、`DeviceBuffer`、`Kernel` 和 `Event`，支持顺序提交和 CUDA Graph replay。调用示例见[用户 API](api.md)。
 
 <a id="cpp-sdk"></a>
 
@@ -93,4 +93,4 @@ FugaTensor 默认调用共享库完成编译和执行；调用方使用 `llc` / 
 
 安装产物包括 `libask_compiler.so`、`libask_runtime.so`、`libask_core.a`、公开头文件、CMake targets、`ask-opt` 和依赖锁记录；Host 编译组件同时携带 OpenBLAS 库及许可证。编译缓存应记录实际代码生成库的摘要，以区分同版本的不同构建；`ask::compilerLibraryPath()` 返回已加载的 Compiler 共享库路径。
 
-共享库使用 C++ 标准库 ABI，调用方应采用兼容工具链。验证方式见[CI 与安装验收](工程结构与测试体系.md#continuous-integration)。
+共享库使用 C++ 标准库 ABI，调用方应采用兼容工具链。验证方式见[CI 与安装验收](testing.md#continuous-integration)。

@@ -1,4 +1,4 @@
-返回核心思想：[常驻运行时与缓存](核心思想.md#ask-runtime-cache) · 相关细节：[计划静态校验](规则证明与计划校验.md#plan-proof) · [Host 代码生成](图优化与自有代码生成.md#host-codegen) · [Fuga 接入](../../fugatensor/docs/architecture/ASK桥接与多后端执行.md#native-plan-replay)
+返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[计划静态校验](verification.md#plan-proof) · [Host 代码生成](codegen.md#host-codegen) · [Fuga 接入](../../fugatensor/docs/architecture/backend.md#native-plan-replay)
 
 # CUDA Graph 依赖调度与 CPU 临时区复用验证报告
 

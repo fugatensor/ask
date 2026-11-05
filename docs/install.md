@@ -1,4 +1,4 @@
-返回文档目录：[ASK 文档](README.md) · 返回核心思想：[构建与绑定](核心思想.md#ask-frontend-build) · 相关细节：[构建参数与版本契约](前端接入与构建配置.md#version-contract)
+返回文档目录：[ASK 文档](README.md) · 返回核心思想：[构建与绑定](concepts.md#ask-frontend-build) · 相关细节：[构建参数与版本契约](build.md#version-contract)
 
 # ASK 独立安装
 
@@ -83,7 +83,7 @@ cmake --build /path/to/runtime-consumer
 ctest --test-dir /path/to/runtime-consumer --output-on-failure
 ```
 
-该测试检查 PTX 执行和资源复用，运行时需要兼容的 NVIDIA GPU。将 `ASK_TEST_COMPONENT` 改为 `Compiler` 或 `Core` 可测试另外两类组件。接口见[用户 API](用户API.md)，测试范围见[测试体系](工程结构与测试体系.md#ctest-targets)。
+该测试检查 PTX 执行和资源复用，运行时需要兼容的 NVIDIA GPU。将 `ASK_TEST_COMPONENT` 改为 `Compiler` 或 `Core` 可测试另外两类组件。接口见[用户 API](api.md)，测试范围见[测试体系](testing.md#ctest-targets)。
 
 <a id="cuda-and-adapters"></a>
 
@@ -93,7 +93,7 @@ ctest --test-dir /path/to/runtime-consumer --output-on-failure
 
 CUDA matmul 使用 cuBLASLt。`ASK_ENABLE_CUBLASLT=ON`（默认）在找到 `cublasLt.h` 时启用它；CMake 搜索 `CUDA_PATH`、`CUDA_HOME` 和 `/usr/local/cuda/include`，也可指定 `ASK_CUBLASLT_INCLUDE_DIR`。运行时动态加载 `libcublasLt.so.13`、`.12` 或无版本名，库目录须在动态加载器搜索路径中。`ASK_ENABLE_CUBLASLT=OFF` 构建基础 Runtime，准备非空 matmul 时会报错。Compiler/Runtime 的公开头文件使用标准 C++ 类型。
 
-第三方 kernel 由调用方的 worker 编译，ASK 按[协议](../schemas/)接收 cubin/PTX 和启动信息。FugaTensor 提供 Triton worker，环境配置见 [FugaTensor 安装](../../fugatensor/docs/安装.md)。
+第三方 kernel 由调用方的 worker 编译，ASK 按[协议](../schemas/)接收 cubin/PTX 和启动信息。FugaTensor 提供 Triton worker，环境配置见 [FugaTensor 安装](../../fugatensor/docs/install.md)。
 
 <a id="framework-install"></a>
 
@@ -101,4 +101,4 @@ CUDA matmul 使用 cuBLASLt。`ASK_ENABLE_CUBLASLT=ON`（默认）在找到 `cub
 
 先安装 ASK SDK，再通过 `CMAKE_PREFIX_PATH` 将其传给 FugaTensor 构建。FugaTensor 的 nanobind 扩展链接 `ASK::Compiler` 和 `ASK::Runtime`，wheel 携带这两个共享库、Host OpenBLAS 库及其许可证。
 
-FugaTensor 的 `pure` / `all` 选项决定是否由 pip 安装 Triton。安装命令及 CUDA 工具配置见 [FugaTensor 安装](../../fugatensor/docs/安装.md#installation-variants)。
+FugaTensor 的 `pure` / `all` 选项决定是否由 pip 安装 Triton。安装命令及 CUDA 工具配置见 [FugaTensor 安装](../../fugatensor/docs/install.md#installation-variants)。

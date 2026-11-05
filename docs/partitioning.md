@@ -1,4 +1,4 @@
-返回核心思想：[图切分与执行计划](核心思想.md#execution-plan) · 相关细节：[自有代码生成](图优化与自有代码生成.md) · [外部产物与执行接口](外部产物与执行接口.md) · [常驻运行时](常驻运行时与多级缓存.md)
+返回核心思想：[图切分与执行计划](concepts.md#execution-plan) · 相关细节：[自有代码生成](codegen.md) · [外部产物与执行接口](artifacts.md) · [常驻运行时](runtime.md)
 
 # 图切分与多 Kernel 执行计划
 
@@ -8,7 +8,7 @@
 
 ASK 图描述数据依赖，执行计划确定 kernel 及其间的设备缓冲区。切分器先在 MLIR 中检查类型、推导形状并优化图，再划分 kernel。每个分区使用 `func.func` 和 `ask` 算子，以 `ask.kernel_id`、`ask.kernel_kind` 属性记录身份和类型；模块的 `ask.execution_plan` 字符串属性保存 JSON 计划。
 
-`ask::compiler::partition(source, options)` 返回 `PartitionResult`：`ir` 是切分后的 MLIR，`executionPlanJSON` 保存计划，`stepSources` 按步骤 ID 保存可单独编译的 MLIR，包含该步骤引用的语义和实现声明；`externalRequestsJSON` 提供外部编译请求。原始 `ask.id`、值身份及 `diagnosticsJSON` 中的溯源记录用于关联切分前后的图。接口字段见[用户 API](用户API.md#compiler-api)。
+`ask::compiler::partition(source, options)` 返回 `PartitionResult`：`ir` 是切分后的 MLIR，`executionPlanJSON` 保存计划，`stepSources` 按步骤 ID 保存可单独编译的 MLIR，包含该步骤引用的语义和实现声明；`externalRequestsJSON` 提供外部编译请求。原始 `ask.id`、值身份及 `diagnosticsJSON` 中的溯源记录用于关联切分前后的图。接口字段见[用户 API](api.md#compiler-api)。
 
 CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。CLI 与 `ask::partitionJSON` 的完整报告保留 `execution_plan`、`step_sources` 和 `external_requests` 字段。
 
@@ -50,7 +50,7 @@ CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。
 - `library` 步骤设置 `library = "cublaslt"` 和 `matmul` 描述（`element_type`、`m/n/k`、`batch_count`、`transpose_a/b`），输入为 A、B，输出为 C。
 - v1 在同一 `Session` 的单条 stream 上顺序提交静态设备计算。校验失败会报错。
 
-运行时将读端口、公开输出和内部槽位映射交由 [ASK PASS 规则证明](规则证明与计划校验.md#plan-proof)检查；索引、单一生产者和 kernel ABI 由 ASK 检查。
+运行时将读端口、公开输出和内部槽位映射交由 [ASK PASS 规则证明](verification.md#plan-proof)检查；索引、单一生产者和 kernel ABI 由 ASK 检查。
 
 <a id="partition-boundaries"></a>
 
@@ -74,9 +74,9 @@ FugaTensor 将计划和各步骤产物保存为 `CUDAProgram`。包中使用相�
 
 每个在途调用占用独立工作区，事件完成后才能复用。工作区内按已验证的步骤生存期共享物理槽位，公开端口单独绑定。事件保留程序和缓冲区，会话保留待完成事件，因此调用方释放对象后，在途资源仍然有效。启动失败时，运行时等待已排队的步骤结束再传播异常；设备写入不回滚。零步骤别名计划记录完成事件，覆盖此前的 stream 依赖，保持异步提交。
 
-计划证明与显存复用的分工见[规则证明与计划校验](规则证明与计划校验.md#reuse-boundary)。
+计划证明与显存复用的分工见[规则证明与计划校验](verification.md#reuse-boundary)。
 
-传入 `graph=true` 时使用 [CUDA Graph replay](常驻运行时与多级缓存.md#cuda-graph)。准备阶段从步骤读写端口推导依赖，冻结节点前驱，并按依赖可达性校验内部槽位复用；独立分支可并行执行。每个工作区缓存 graph 实例，复用时更新公开端口地址，自有与外部步骤使用同一机制。
+传入 `graph=true` 时使用 [CUDA Graph replay](runtime.md#cuda-graph)。准备阶段从步骤读写端口推导依赖，冻结节点前驱，并按依赖可达性校验内部槽位复用；独立分支可并行执行。每个工作区缓存 graph 实例，复用时更新公开端口地址，自有与外部步骤使用同一机制。
 
 FugaTensor 将前向或求导后的静态图提交给 ASK，由 ASK 在外部节点处分区并优化自有区域。外部算子的反向规则由上层框架提供。
 
@@ -84,8 +84,8 @@ FugaTensor 将前向或求导后的静态图提交给 ASK，由 ASK 在外部节
 
 ## 5. 复杂外部算子接入
 
-外部 kernel 可使用多输入、多输出、不同形状和存储类型、内部 FP32 累加及动态共享内存。worker 负责生成产物并报告所需资源，启动限制见[外部执行接口](外部产物与执行接口.md#binary-artifact)。
+外部 kernel 可使用多输入、多输出、不同形状和存储类型、内部 FP32 累加及动态共享内存。worker 负责生成产物并报告所需资源，启动限制见[外部执行接口](artifacts.md#binary-artifact)。
 
 例如 FugaTensor 的 [attention API](../../fugatensor/docs/API/attention.md) 使用 FlashAttention 的 Triton kernel，并通过 `ft.fun.vjp` 定义纯余切规则。ASK 将前向、统计量、dQ、dK、dV 分为独立步骤，在同一 stream 上调度；算法和梯度的数值验证由 FugaTensor 维护。
 
-接入新 DSL 见[适配规范](外部编译器适配接入规范.md#adapter-contract)，请求和产物格式见 [schemas/](../schemas/)。
+接入新 DSL 见[适配规范](compilers.md#adapter-contract)，请求和产物格式见 [schemas/](../schemas/)。
