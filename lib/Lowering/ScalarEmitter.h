@@ -36,11 +36,17 @@ class ScalarEmitter {
   }
   llvm::Value *coordinate(llvm::Value *index, llvm::ArrayRef<int64_t> dimensions, unsigned axis) {
     if (dimensions[axis] == 1) return b.getInt64(0);
+    if (dimensions.size() == 1 && axis == 0) return index;
     const uint64_t stride = product(dimensions.drop_front(axis + 1));
-    return b.CreateURem(b.CreateUDiv(index, b.getInt64(stride)), b.getInt64(dimensions[axis]));
+    llvm::Value *divided = (stride == 1) ? index : b.CreateUDiv(index, b.getInt64(stride));
+    if (axis == 0) return divided;
+    return b.CreateURem(divided, b.getInt64(dimensions[axis]));
   }
   llvm::Value *atStride(llvm::Value *coordinate, llvm::ArrayRef<int64_t> dimensions, unsigned axis) {
-    return b.CreateMul(coordinate, b.getInt64(product(dimensions.drop_front(axis + 1))));
+    const uint64_t stride = product(dimensions.drop_front(axis + 1));
+    if (stride == 1) return coordinate;
+    if (stride == 0) return b.getInt64(0);
+    return b.CreateMul(coordinate, b.getInt64(stride));
   }
   llvm::Value *binary(mlir::Operation *op, llvm::Value *left, llvm::Value *right) {
     if (left->getType()->isIntegerTy())
