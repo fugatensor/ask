@@ -898,9 +898,14 @@ std::shared_ptr<Event> PreparedProgram::enqueue(const std::shared_ptr<Session> &
   auto &s=*session->impl->state;
   for(const auto &[index,alignment]:impl->alignedPorts)
     require(bound[index]->pointer()%alignment==0,"matmul buffer address is not aligned to its element type");
-  session->reap();
   std::shared_ptr<Impl::Workspace> workspace;
   for(const auto &candidate:impl->workspaces) if(!candidate->busy) { workspace=candidate;break; }
+  if(!workspace || session->impl->pending.size() >= 64) {
+    session->reap();
+    if(!workspace) {
+      for(const auto &candidate:impl->workspaces) if(!candidate->busy) { workspace=candidate;break; }
+    }
+  }
   if(workspace) ++s.counters["workspace_reuses"];
   else {
     workspace=std::make_shared<Impl::Workspace>();workspace->state=session->impl->state;
