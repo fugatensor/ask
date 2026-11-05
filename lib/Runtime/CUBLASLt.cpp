@@ -1,7 +1,9 @@
 #include "CUBLASLt.h"
 
 #include <limits>
+#include <map>
 #include <mutex>
+#include <tuple>
 
 #if ASK_WITH_CUBLASLT
 #include <cublasLt.h>
@@ -43,6 +45,14 @@ void check(cublasStatus_t status, const char *operation) {
     throw CUDAError(std::string(operation) + " failed (cuBLASLt status " +
                     std::to_string(int(status)) + ")");
 }
+
+struct CachedAlgo {
+  cublasLtMatmulAlgo_t algo;
+  std::size_t workspace = 0;
+};
+using AlgoKey = std::tuple<std::string, std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t, bool, bool, std::size_t>;
+static std::mutex globalAlgoMutex;
+static std::map<AlgoKey, CachedAlgo> globalAlgoCache;
 
 struct Library {
   void *library = nullptr;
@@ -134,7 +144,8 @@ struct CUBLASLtMatmul::Impl {
 };
 
 std::shared_ptr<CUBLASLtMatmul> CUBLASLtMatmul::prepare(
-    const MatmulDescription &d, std::shared_ptr<CUBLASLtContext> &context) {
+    const MatmulDescription &d, std::shared_ptr<CUBLASLtContext> &context,
+    const MatmulTuningBridge *bridge) {
   if (!context) context = std::make_shared<CUBLASLtContext>();
   auto p = std::make_unique<Impl>(); p->context = context;
   auto &library = *context->library;
@@ -164,27 +175,99 @@ std::shared_ptr<CUBLASLtMatmul> CUBLASLtMatmul::prepare(
   layout(p->a, d.transposeA ? d.k : d.m, d.transposeA ? d.m : d.k);
   layout(p->b, d.transposeB ? d.n : d.k, d.transposeB ? d.k : d.n);
   layout(p->c, d.m, d.n);
+  const auto key = std::make_tuple(d.elementType, d.m, d.n, d.k, d.batchCount, d.transposeA, d.transposeB, d.workspaceLimit);
+  {
+    std::lock_guard<std::mutex> lock(globalAlgoMutex);
+    auto it = globalAlgoCache.find(key);
+    if (it != globalAlgoCache.end()) {
+      p->algorithm = it->second.algo;
+      p->workspace = it->second.workspace;
+      return std::shared_ptr<CUBLASLtMatmul>(new CUBLASLtMatmul(std::move(p)));
+    }
+  }
   cublasLtMatmulPreference_t preference = nullptr;
   check(library.cublasLtMatmulPreferenceCreate(&preference), "cublasLtMatmulPreferenceCreate");
   try {
     check(library.cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
         &d.workspaceLimit, sizeof(d.workspaceLimit)), "cublasLtMatmulPreferenceSetAttribute(workspace)");
-    // Split-K intermediates must retain the FP32 accumulator precision.
-    const std::uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_COMPUTE_TYPE;
+    const std::uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_MASK;
     check(library.cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
         &reduction, sizeof(reduction)), "cublasLtMatmulPreferenceSetAttribute(reduction)");
-    const std::uint32_t alignment = matmulElementBytes(d.elementType);
-    for (auto attribute : {CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_A_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_B_BYTES,
-                           CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_C_BYTES, CUBLASLT_MATMUL_PREF_MIN_ALIGNMENT_D_BYTES})
-      check(library.cublasLtMatmulPreferenceSetAttribute(preference, attribute, &alignment, sizeof(alignment)),
-            "cublasLtMatmulPreferenceSetAttribute(alignment)");
-    cublasLtMatmulHeuristicResult_t result{};
+
+    constexpr int maxAlgos = 16;
+    cublasLtMatmulHeuristicResult_t results[maxAlgos]{};
     int found = 0;
     check(library.cublasLtMatmulAlgoGetHeuristic(context->handle, p->operation, p->a, p->b, p->c, p->c,
-        preference, 1, &result, &found), "cublasLtMatmulAlgoGetHeuristic");
-    if (!found || result.state != CUBLAS_STATUS_SUCCESS)
+        preference, maxAlgos, results, &found), "cublasLtMatmulAlgoGetHeuristic");
+    if (!found)
       throw CUDAError("cuBLASLt has no algorithm for the requested shape, precision and workspace limit");
-    p->algorithm = result.algo; p->workspace = result.workspaceSize;
+
+    int bestIdx = -1;
+    for (int i = 0; i < found; ++i) {
+      if (results[i].state == CUBLAS_STATUS_SUCCESS) {
+        bestIdx = i;
+        break;
+      }
+    }
+    if (bestIdx < 0)
+      throw CUDAError("cuBLASLt returned no successful algorithm for the requested configuration");
+
+    if (found > 1 && bridge && bridge->measure && bridge->scratch &&
+        d.m >= 64 && d.n >= 64 && d.k >= 64) {
+      float bestTime = 1e9f;
+      void *matPtr = reinterpret_cast<void *>(bridge->scratch);
+      const float alpha = 1.0f, beta = 0.0f;
+      if (results[bestIdx].workspaceSize <= bridge->scratchBytes) {
+        try {
+          void *ws0 = results[bestIdx].workspaceSize
+                          ? reinterpret_cast<void *>(bridge->scratch + (bridge->scratchBytes - results[bestIdx].workspaceSize))
+                          : nullptr;
+          float t0 = bridge->measure([&]() {
+            check(library.cublasLtMatmul(context->handle, p->operation,
+                &alpha, matPtr, p->a, matPtr, p->b, &beta, matPtr, p->c, matPtr, p->c,
+                &results[bestIdx].algo, ws0, results[bestIdx].workspaceSize,
+                static_cast<cudaStream_t>(bridge->stream)), "cublasLtMatmul (tune)");
+          });
+          if (t0 > 0.0f) bestTime = t0;
+        } catch (...) {}
+      }
+
+      for (int i = 0; i < found; ++i) {
+        if (i == bestIdx || results[i].state != CUBLAS_STATUS_SUCCESS) continue;
+        if (results[i].workspaceSize > bridge->scratchBytes) continue;
+        void *wsPtr = results[i].workspaceSize
+                          ? reinterpret_cast<void *>(bridge->scratch + (bridge->scratchBytes - results[i].workspaceSize))
+                          : nullptr;
+        try {
+          float elapsed = bridge->measure([&]() {
+            check(library.cublasLtMatmul(context->handle, p->operation,
+                &alpha, matPtr, p->a, matPtr, p->b, &beta, matPtr, p->c, matPtr, p->c,
+                &results[i].algo, wsPtr, results[i].workspaceSize,
+                static_cast<cudaStream_t>(bridge->stream)), "cublasLtMatmul (tune)");
+          });
+          if (elapsed <= 0.0f) continue;
+          bool better = false;
+          if (elapsed < bestTime * 0.99f) {
+            better = true;
+          } else if (elapsed <= bestTime * 1.01f) {
+            if (results[i].workspaceSize < results[bestIdx].workspaceSize) {
+              better = true;
+            }
+          }
+          if (better) {
+            bestTime = elapsed;
+            bestIdx = i;
+          }
+        } catch (...) {}
+      }
+    }
+
+    p->algorithm = results[bestIdx].algo;
+    p->workspace = results[bestIdx].workspaceSize;
+    {
+      std::lock_guard<std::mutex> lock(globalAlgoMutex);
+      globalAlgoCache[key] = {p->algorithm, p->workspace};
+    }
   } catch (...) { library.cublasLtMatmulPreferenceDestroy(preference); throw; }
   library.cublasLtMatmulPreferenceDestroy(preference);
   return std::shared_ptr<CUBLASLtMatmul>(new CUBLASLtMatmul(std::move(p)));
@@ -203,7 +286,8 @@ void CUBLASLtMatmul::launch(const std::uint64_t *arguments, void *stream) const 
 struct CUBLASLtContext {};
 struct CUBLASLtMatmul::Impl { std::size_t workspace = 0; };
 std::shared_ptr<CUBLASLtMatmul> CUBLASLtMatmul::prepare(
-    const MatmulDescription &, std::shared_ptr<CUBLASLtContext> &) {
+    const MatmulDescription &, std::shared_ptr<CUBLASLtContext> &,
+    const MatmulTuningBridge *) {
   throw CUDAError("ASK Runtime was built without cuBLASLt headers");
 }
 void CUBLASLtMatmul::launch(const std::uint64_t *, void *) const {}

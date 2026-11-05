@@ -41,7 +41,7 @@ struct MatmulDescription {
   std::string elementType = "f32";
   std::uint64_t m = 0, n = 0, k = 0, batchCount = 1;
   bool transposeA = false, transposeB = false;
-  std::size_t workspaceLimit = 4 * 1024 * 1024;
+  std::size_t workspaceLimit = 32 * 1024 * 1024;
 };
 
 struct PlanStep {

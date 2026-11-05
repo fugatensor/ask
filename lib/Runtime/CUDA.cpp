@@ -68,6 +68,7 @@ struct Driver {
   CUDA_FUNCTION(cuEventQuery, (Handle));
   CUDA_FUNCTION(cuEventSynchronize, (Handle));
   CUDA_FUNCTION(cuEventDestroy, (Handle));
+  CUDA_FUNCTION(cuEventElapsedTime, (float *, Handle, Handle));
   CUDA_FUNCTION(cuLaunchKernel, (Handle, unsigned, unsigned, unsigned, unsigned, unsigned,
                                 unsigned, unsigned, Handle, void **, void **));
   CUDA_FUNCTION(cuGraphCreate, (Handle *, unsigned));
@@ -119,6 +120,7 @@ struct Driver {
       B(cuMemsetD8Async);
       B(cuPointerGetAttribute); V(cuMemGetAddressRange);
       B(cuEventCreate); B(cuEventRecord); B(cuEventQuery); B(cuEventSynchronize); V(cuEventDestroy);
+      V(cuEventElapsedTime);
       B(cuLaunchKernel); B(cuGetErrorName); B(cuGetErrorString);
       // Graph support is required only when the caller explicitly enables it.
 #define G(name) name = reinterpret_cast<name##Type>(symbol(#name))
@@ -703,7 +705,45 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
                 sizes[step.outputs[0]]==bytes[2],"matmul buffer byte counts differ from its dimensions");
         if(bytes[2] && step.matmul->k) {
           ContextScope current(*s.driver,s.context);
-          auto operation=detail::CUBLASLtMatmul::prepare(*step.matmul,s.cublas);
+          detail::MatmulTuningBridge bridge;
+          std::shared_ptr<DeviceBuffer> tuningBuffer;
+          Handle start = nullptr, end = nullptr;
+          if (s.driver->cuEventElapsedTime) {
+            std::size_t maxMatrix = std::max({bytes[0], bytes[1], bytes[2]});
+            std::size_t wsOffset = (maxMatrix + 255) & ~std::size_t(255);
+            std::size_t autotuneBytes = wsOffset + step.matmul->workspaceLimit;
+            try {
+              tuningBuffer = allocate(autotuneBytes);
+              bridge.stream = s.stream;
+              bridge.scratch = tuningBuffer->pointer();
+              bridge.scratchBytes = autotuneBytes;
+              s.driver->check(s.driver->cuEventCreate(&start, 0), "cuEventCreate");
+              s.driver->check(s.driver->cuEventCreate(&end, 0), "cuEventCreate");
+              bridge.measure = [&](const std::function<void()> &launch) -> float {
+                launch();
+                float bestMs = 1e9f;
+                for (int rep = 0; rep < 2; ++rep) {
+                  s.driver->check(s.driver->cuEventRecord(start, s.stream), "cuEventRecord");
+                  launch();
+                  s.driver->check(s.driver->cuEventRecord(end, s.stream), "cuEventRecord");
+                  s.driver->check(s.driver->cuEventSynchronize(end), "cuEventSynchronize");
+                  float ms = 0.0f;
+                  s.driver->check(s.driver->cuEventElapsedTime(&ms, start, end), "cuEventElapsedTime");
+                  if (ms > 0.0f && ms < bestMs) bestMs = ms;
+                }
+                return bestMs;
+              };
+            } catch (...) {
+              if (start) { s.driver->cuEventDestroy(start); start = nullptr; }
+              if (end) { s.driver->cuEventDestroy(end); end = nullptr; }
+              tuningBuffer.reset();
+              bridge = {};
+            }
+          }
+          auto operation=detail::CUBLASLtMatmul::prepare(
+              *step.matmul, s.cublas, bridge.measure ? &bridge : nullptr);
+          if (start) s.driver->cuEventDestroy(start);
+          if (end) s.driver->cuEventDestroy(end);
           ++s.counters["matmul_preparations"];
           if(auto workspace=operation->workspaceBytes()) {
             // Scratch is a private logical buffer with this step's lifetime.
