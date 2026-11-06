@@ -18,7 +18,7 @@ CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。
 
 ## 2. 执行计划 JSON v1
 
-格式定义见 [JSON Schema](../schemas/execution-plan-v1.schema.json)。下面的计划先执行自有计算，再调用外部算子：
+格式定义见 [JSON Schema](../../schemas/execution-plan-v1.schema.json)。下面的计划先执行自有计算，再调用外部算子：
 
 ```json
 {
@@ -86,6 +86,6 @@ FugaTensor 将前向或求导后的静态图提交给 ASK，由 ASK 在外部节
 
 外部 kernel 可使用多输入、多输出、不同形状和存储类型、内部 FP32 累加及动态共享内存。worker 负责生成产物并报告所需资源，启动限制见[外部执行接口](artifacts.md#binary-artifact)。
 
-例如 FugaTensor 的 [attention API](../../fugatensor/docs/API/attention.md) 使用 FlashAttention 的 Triton kernel，并通过 `ft.fun.vjp` 定义纯余切规则。ASK 将前向、统计量、dQ、dK、dV 分为独立步骤，在同一 stream 上调度；算法和梯度的数值验证由 FugaTensor 维护。
+例如 FugaTensor 的 [attention API](../../../fugatensor/docs/zh/API/attention.md) 使用 FlashAttention 的 Triton kernel，并通过 `ft.fun.vjp` 定义纯余切规则。ASK 将前向、统计量、dQ、dK、dV 分为独立步骤，在同一 stream 上调度；算法和梯度的数值验证由 FugaTensor 维护。
 
-接入新 DSL 见[适配规范](compilers.md#adapter-contract)，请求和产物格式见 [schemas/](../schemas/)。
+接入新 DSL 见[适配规范](compilers.md#adapter-contract)，请求和产物格式见 [schemas/](../../schemas/)。

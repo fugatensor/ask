@@ -63,9 +63,9 @@ GPU 测试要求可用的驱动和设备；启用后缺少设备按失败处理�
 
 ## 3. FugaTensor 接入与端到端验证
 
-[FugaTensor](../../fugatensor/README.md) 是推荐的接入示例：从 [Tensor API](../../fugatensor/docs/API/README.md) 组图，在 Fuga IR 中求导，再经[原生绑定](../../fugatensor/docs/architecture/backend.md)交给 ASK 编译和调度。
+[FugaTensor](../../../fugatensor/README.zh.md) 是推荐的接入示例：从 [Tensor API](../../../fugatensor/docs/zh/API/README.md) 组图，在 Fuga IR 中求导，再经[原生绑定](../../../fugatensor/docs/zh/architecture/backend.md)交给 ASK 编译和调度。
 
-FugaTensor 的端到端测试覆盖图语义、缓存、CPU/CUDA 数值、外部 kernel 和多步骤计划。基础 API 测试从注册表生成算子组合，再与精度、形状和求导阶数交叉；CAI 契约独立交叉 dtype、shape 和 layout；运行和筛选方式见[测试矩阵](../../fugatensor/docs/testing.md)。
+FugaTensor 的端到端测试覆盖图语义、缓存、CPU/CUDA 数值、外部 kernel 和多步骤计划。基础 API 测试从注册表生成算子组合，再与精度、形状和求导阶数交叉；CAI 契约独立交叉 dtype、shape 和 layout；运行和筛选方式见[测试矩阵](../../../fugatensor/docs/zh/testing.md)。
 
 数值参考使用 Python 任意精度整数，覆盖单步 RNE、次正规数、整数回绕、饱和转换、大整数、负零、无穷、NaN 和非整块尾元素。新增组合复用该参考和 `plan_matrix`。外部算法公式由生产者测试，ASK 侧检查 ABI、资源寿命和步骤连接。
 

@@ -1,4 +1,4 @@
-返回核心思想：[双层 IR 模型](concepts.md#ask-ir-model) · 相关细节：[前端接入与构建配置](build.md) · [图优化与自有代码生成](codegen.md) · [Fuga IR 降级到 ASK](../../fugatensor/docs/ir/lowering.md)
+返回核心思想：[双层 IR 模型](concepts.md#ask-ir-model) · 相关细节：[前端接入与构建配置](build.md) · [图优化与自有代码生成](codegen.md) · [Fuga IR 降级到 ASK](../../../fugatensor/docs/zh/ir/lowering.md)
 
 # ASK IR 与数值语义
 
@@ -40,7 +40,7 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 %matrix = "ask.reshape"(%flat) {shape = array<i64: 2, 2>} : (tensor<4xf32>) -> tensor<2x2xf32>
 ```
 
-`shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，见 [FugaTensor reshape](../../fugatensor/docs/API/tensor.md#reshape)。reshape 保持元素类型和线性次序，外部 kernel 接收变换后的形状。自有逐元素循环复用对应的输入值，公开输出使用独立缓冲区。
+`shape = array<i64>` 表示 0-D 张量；`-1` 等维度推断由调用方完成，见 [FugaTensor reshape](../../../fugatensor/docs/zh/API/tensor.md#reshape)。reshape 保持元素类型和线性次序，外部 kernel 接收变换后的形状。自有逐元素循环复用对应的输入值，公开输出使用独立缓冲区。
 
 <a id="tensor-primitives"></a>
 
@@ -93,7 +93,7 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 | `"f16"` | `f16` | 2 Bytes | `half` | IEEE-754 binary16（5 位指数 + 10 位尾数）。 |
 | `"bf16"` | `bf16` | 2 Bytes | `bfloat` | bfloat16（8 位指数 + 7 位尾数）；执行目标为 CUDA `sm_80+`。 |
 
-`ask.constant` 的 `f16`、`bf16`、`f32` 字面量采用单步最近偶数舍入（RNE），直接舍入到目标位宽，避免先转 `f32` 再截断到 `f16`/`bf16` 的双重舍入误差，并保留 `-0.0`、`±inf` 和 `NaN`。FugaTensor 的[数值编码](../../fugatensor/src/fugatensor/_ask/numerics.py)按同一规则将 Python 输入转换为目标格式，再由内部图桥接层输出 ASK IR。
+`ask.constant` 的 `f16`、`bf16`、`f32` 字面量采用单步最近偶数舍入（RNE），直接舍入到目标位宽，避免先转 `f32` 再截断到 `f16`/`bf16` 的双重舍入误差，并保留 `-0.0`、`±inf` 和 `NaN`。FugaTensor 的[数值编码](../../../fugatensor/src/fugatensor/_ask/numerics.py)按同一规则将 Python 输入转换为目标格式，再由内部图桥接层输出 ASK IR。
 
 <a id="cast-semantics"></a>
 

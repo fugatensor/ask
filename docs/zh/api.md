@@ -2,7 +2,7 @@
 
 # ASK 用户 API
 
-ASK 的 C++ 接口分为编译器和运行时。接入示例见 [FugaTensor](../../fugatensor/README.md)，其原生扩展链接 Compiler 与 Runtime；Python 用法见 [FugaTensor API](../../fugatensor/docs/API/README.md)。
+ASK 的 C++ 接口分为编译器和运行时。接入示例见 [FugaTensor](../../../fugatensor/README.zh.md)，其原生扩展链接 Compiler 与 Runtime；Python 用法见 [FugaTensor API](../../../fugatensor/docs/zh/API/README.md)。
 
 <a id="api-entrypoints"></a>
 
@@ -92,7 +92,7 @@ auto result = ask::compiler::codegen(source, options);
 | `optimize` | `prepare` 默认 `false`；`partition` 和 `codegen` 默认 `true` |
 | `optimization` | `foldConstants`、`eliminateDeadCode`、`fuseElementwise` 默认均为 `true` |
 
-`abiJSON` 和 `cudaArtifactJSON` 是可选字符串，按目标返回对应字段。完整类型定义见 [CompilerAPI.h](../include/ask/Frontend/CompilerAPI.h)。
+`abiJSON` 和 `cudaArtifactJSON` 是可选字符串，按目标返回对应字段。完整类型定义见 [CompilerAPI.h](../../include/ask/Frontend/CompilerAPI.h)。
 
 </details>
 

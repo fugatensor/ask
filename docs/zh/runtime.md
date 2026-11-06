@@ -1,4 +1,4 @@
-返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[外部产物与执行接口](artifacts.md) · [图优化与自有代码生成](codegen.md) · [FugaTensor 多后端执行](../../fugatensor/docs/architecture/backend.md)
+返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[外部产物与执行接口](artifacts.md) · [图优化与自有代码生成](codegen.md) · [FugaTensor 多后端执行](../../../fugatensor/docs/zh/architecture/backend.md)
 
 # 常驻运行时与多级缓存
 
@@ -8,7 +8,7 @@
 
 ## 1. 动态驱动加载与常驻 Session
 
-C++ 接口位于 [CUDA.h](../include/ask/Runtime/CUDA.h)，实现位于 `lib/Runtime/CUDA.cpp`。创建 `Session` 时动态加载驱动库 `libcuda.so.1`。
+C++ 接口位于 [CUDA.h](../../include/ask/Runtime/CUDA.h)，实现位于 `lib/Runtime/CUDA.cpp`。创建 `Session` 时动态加载驱动库 `libcuda.so.1`。
 
 `Session::create(device)` 保留目标设备原有的 primary context，并创建非阻塞 stream。每次驱动操作设置当前线程的 context；会话用互斥锁保护驱动状态，支持多个宿主线程提交。
 
@@ -24,7 +24,7 @@ C++ 调用示例见[原生会话与计划执行](api.md#execution-api)。
 
 `DeviceBuffer::copyFromHost(pointer, nbytes)` 和 `copyToHost(pointer, nbytes)` 批量拷贝连续内存；另有返回字节字符串的 `copyToHost()`。拷贝按原始字节进行，长度须完全匹配，返回前等待会话 stream 完成。
 
-借用外部内存时，调用方须保留实际存储所有者，直到 GPU 使用结束。FugaTensor 的绑定层负责解析 CUDA Array Interface、检查 shape/dtype/连续性、保留 Python 所有者，并调用 `waitForExternalStream` 等待生产者 stream。交换接口见 [FugaTensor 张量与数据交换](../../fugatensor/docs/API/tensor.md)。
+借用外部内存时，调用方须保留实际存储所有者，直到 GPU 使用结束。FugaTensor 的绑定层负责解析 CUDA Array Interface、检查 shape/dtype/连续性、保留 Python 所有者，并调用 `waitForExternalStream` 等待生产者 stream。交换接口见 [FugaTensor 张量与数据交换](../../../fugatensor/docs/zh/API/tensor.md)。
 
 外部生产者再次访问同一存储前，须等待 ASK 的完成事件或建立等价 stream 依赖。
 
@@ -61,7 +61,7 @@ C++ 调用示例见[原生会话与计划执行](api.md#execution-api)。
 
 `graph_nodes` / `graph_edges` 累计已实例化 Graph 的顶层节点和依赖边，cuBLASLt 子图计为一个顶层节点。`prepared_internal_slots` / `prepared_internal_bytes` 累计成功准备计划中单份内部工作区的槽数和容量，包含库 scratch；实际驻留量随在途工作区及分配池变化。
 
-矩阵乘法的 Graph replay、TF32 与提交机制见 [FugaTensor 算术运算](../../fugatensor/docs/API/ops.md#matmul)。
+矩阵乘法的 Graph replay、TF32 与提交机制见 [FugaTensor 算术运算](../../../fugatensor/docs/zh/API/ops.md#matmul)。
 
 <a id="two-tier-cache"></a>
 
@@ -75,6 +75,6 @@ FugaTensor 的 `_ask` 接入层维护以下磁盘缓存，校验产物后将字�
 | 自有 cubin | `llc` 与 `ptxas` | LLVM IR、产物描述、工具及环境摘要 |
 | 外部产物 | Worker 编译 | 标准化请求、probe 结果、worker/解释器、依赖与环境摘要 |
 
-外部缓存保存 cubin 或原始 PTX，查找前探测生产者，编译后再次核对依赖。缓存使用锁、临时目录和原子发布，读取时检查清单、长度和 SHA-256。失效规则见[FugaTensor 缓存分工](../../fugatensor/docs/architecture/backend.md#cache-hierarchy)及[worker 缓存身份](compilers.md#cache-identity)。
+外部缓存保存 cubin 或原始 PTX，查找前探测生产者，编译后再次核对依赖。缓存使用锁、临时目录和原子发布，读取时检查清单、长度和 SHA-256。失效规则见[FugaTensor 缓存分工](../../../fugatensor/docs/zh/architecture/backend.md#cache-hierarchy)及[worker 缓存身份](compilers.md#cache-identity)。
 
 ASK 在计划准备时缓存成功校验，会话缓存驻留模块、工作区、显存和事件。校验缓存的键和容量见[成功校验缓存](verification.md#proof-cache)。

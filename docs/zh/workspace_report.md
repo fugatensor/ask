@@ -1,4 +1,4 @@
-返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[计划静态校验](verification.md#plan-proof) · [Host 代码生成](codegen.md#host-codegen) · [Fuga 接入](../../fugatensor/docs/architecture/backend.md#native-plan-replay)
+返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[计划静态校验](verification.md#plan-proof) · [Host 代码生成](codegen.md#host-codegen) · [Fuga 接入](../../../fugatensor/docs/zh/architecture/backend.md#native-plan-replay)
 
 # CUDA Graph 依赖调度与 CPU 临时区复用验证报告
 
@@ -120,9 +120,9 @@ ASK 已构建并安装到 `build/sdk`，Fuga 已以该 SDK 重新构建。构建
 
 ## 测量记录与清理
 
-- [完整汇总](assets/graph-workspace/summary.csv)、[详细方法](assets/graph-workspace/method.md)、[环境与哈希](assets/graph-workspace/profile-metadata.json)。汇总保留各版中位数、最小/最大值及逐轮成对变化。
-- [CPU 原始数据](assets/graph-workspace/host-raw.csv)、[基线 malloc](assets/graph-workspace/baseline-host-memory.csv)、[修改后 malloc](assets/graph-workspace/candidate-host-memory.csv)。
-- [GPU 原始数据](assets/graph-workspace/gpu-raw.csv)、[冷准备](assets/graph-workspace/cold-raw.csv)、[设备时间戳](assets/graph-workspace/trace-raw.csv)、[Fuga CPU](assets/graph-workspace/fuga-cpu-raw.csv)、[Fuga GPU](assets/graph-workspace/fuga-gpu-raw.csv)。
-- [规模审计](assets/graph-workspace/scaling.csv)、[empty-root 对照](assets/graph-workspace/empty-root-summary.csv)、[RSS 原记录](assets/graph-workspace/process-rss.csv)、[RSS 归因复核](assets/graph-workspace/rss-attribution.csv)、[安装库一致性](assets/graph-workspace/installed-libraries.json)。
+- [完整汇总](../assets/graph-workspace/summary.csv)、[详细方法](../assets/graph-workspace/method.md)、[环境与哈希](../assets/graph-workspace/profile-metadata.json)。汇总保留各版中位数、最小/最大值及逐轮成对变化。
+- [CPU 原始数据](../assets/graph-workspace/host-raw.csv)、[基线 malloc](../assets/graph-workspace/baseline-host-memory.csv)、[修改后 malloc](../assets/graph-workspace/candidate-host-memory.csv)。
+- [GPU 原始数据](../assets/graph-workspace/gpu-raw.csv)、[冷准备](../assets/graph-workspace/cold-raw.csv)、[设备时间戳](../assets/graph-workspace/trace-raw.csv)、[Fuga CPU](../assets/graph-workspace/fuga-cpu-raw.csv)、[Fuga GPU](../assets/graph-workspace/fuga-gpu-raw.csv)。
+- [规模审计](../assets/graph-workspace/scaling.csv)、[empty-root 对照](../assets/graph-workspace/empty-root-summary.csv)、[RSS 原记录](../assets/graph-workspace/process-rss.csv)、[RSS 归因复核](../assets/graph-workspace/rss-attribution.csv)、[安装库一致性](../assets/graph-workspace/installed-libraries.json)。
 
 临时测量驱动、独立原型、插桩 kernel、内存探针、生成产物及基线快照在归档后统一删除。仓库保留生产代码、生成式测试矩阵和报告数据。

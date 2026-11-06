@@ -38,7 +38,7 @@ worker --request /path/to/request.json --output /path/to/artifact.json
 
 标量支持 `i1`（布尔）、`i8/i16/i32/i64`、`u8/u16/u32/u64`、`fp16/bf16/fp32/fp64`。`source_bindings = {"x": "input:0", "n": 1024, "scale": 0.5, "y": "output:0"}` 配合对应签名即可传入普通 kernel 标量参数；它们由 CUDA 启动 ABI 按值传递，区别于编译期 `constants`。整数须在相应位宽的范围内；浮点按目标格式 RNE 编码。
 
-启动值在构图时冻结，参与请求缓存和编译包身份；修改值须重新构造调用。`PreparedProgram` 提交时绑定张量缓冲区，保留准备时的标量值。编译期配置的整数范围为 `[-2^63, 2^64-1]`。请求仅携带张量元信息，格式见 [external-compiler-request-v2.schema.json](../schemas/external-compiler-request-v2.schema.json)。
+启动值在构图时冻结，参与请求缓存和编译包身份；修改值须重新构造调用。`PreparedProgram` 提交时绑定张量缓冲区，保留准备时的标量值。编译期配置的整数范围为 `[-2^63, 2^64-1]`。请求仅携带张量元信息，格式见 [external-compiler-request-v2.schema.json](../../schemas/external-compiler-request-v2.schema.json)。
 
 <a id="artifact-contract"></a>
 
@@ -64,7 +64,7 @@ worker --request /path/to/request.json --output /path/to/artifact.json
 
 `required_element_types` 声明运行时须检查的张量元素类型，调用方将它与端口类型合并后传给 `Session::load`。生产者按 `target` 编译，负责满足内部指令的架构要求。
 
-FugaTensor 的 [`normalize_artifact`](../../fugatensor/src/fugatensor/_ask/adapters.py) 根据请求构造 `port_map` 和 invocation v2，校验产物后转成原生计划。其它调用方可采用同一规则。格式见 [external-kernel-artifact-v2.schema.json](../schemas/external-kernel-artifact-v2.schema.json)。
+FugaTensor 的 [`normalize_artifact`](../../../fugatensor/src/fugatensor/_ask/adapters.py) 根据请求构造 `port_map` 和 invocation v2，校验产物后转成原生计划。其它调用方可采用同一规则。格式见 [external-kernel-artifact-v2.schema.json](../../schemas/external-kernel-artifact-v2.schema.json)。
 
 <a id="cache-identity"></a>
 
@@ -80,4 +80,4 @@ FugaTensor 查找外部编译缓存前执行带请求的 `--probe`，编译后�
 
 新增 worker 应覆盖多端口及不同形状、混合标量位宽和参数顺序、cubin/PTX 编码、动态共享内存、缓存命中和依赖变化。错误测试包括 worker 失败、损坏产物、目标或端口不匹配。数值结果须在真实 GPU 上验证，并与 CPU 协议测试分开记录。
 
-实现可参考 FugaTensor 的 [Triton worker](../../fugatensor/src/fugatensor/_triton_worker.py)。编译器版本和资源限制由各适配器维护。
+实现可参考 FugaTensor 的 [Triton worker](../../../fugatensor/src/fugatensor/_triton_worker.py)。编译器版本和资源限制由各适配器维护。

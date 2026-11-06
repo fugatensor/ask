@@ -1,6 +1,6 @@
 # ASK 编译器核心思想
 
-目录导航：[文档目录](README.md) · 上层协同：[FugaTensor 架构总览](../../fugatensor/docs/architecture/README.md)
+目录导航：[文档目录](README.md) · 上层协同：[FugaTensor 架构总览](../../../fugatensor/docs/zh/architecture/README.md)
 
 ASK 将静态张量图编译成 CPU 或 CUDA 代码，并调度外部 cubin/PTX。图中记录类型、形状和数据依赖，运行时管理缓冲区和执行顺序。
 
@@ -90,7 +90,7 @@ flowchart TD
 
 ## 8. 测试验证
 
-`ask-core`、`ask-compiler`、`ask-primitives` 和 `ask-pass` 验证图准备、优化、代码生成与计划证明，`ask-host-blas` 验证 OpenBLAS 链接及数值；启用 `ASK_TEST_CUDA=ON` 后，`ask-runtime` 验证 GPU 执行、槽位复用和 Graph replay；启用 cuBLASLt 的构建另有 `ask-matmul` 矩阵。[FugaTensor](../../fugatensor/README.md) 提供接入示例和端到端测试。
+`ask-core`、`ask-compiler`、`ask-primitives` 和 `ask-pass` 验证图准备、优化、代码生成与计划证明，`ask-host-blas` 验证 OpenBLAS 链接及数值；启用 `ASK_TEST_CUDA=ON` 后，`ask-runtime` 验证 GPU 执行、槽位复用和 Graph replay；启用 cuBLASLt 的构建另有 `ask-matmul` 矩阵。[FugaTensor](../../../fugatensor/README.zh.md) 提供接入示例和端到端测试。
 
 工程细节：[测试体系](testing.md#ctest-targets) · [编译与执行能力](fugatensor.md#implemented-scope) · [项目依赖](fugatensor.md#roadmap)
 
