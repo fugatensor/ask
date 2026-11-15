@@ -1,4 +1,4 @@
-Back to Core Concepts: [Owned Code Generation](concepts.md#ask-owned-codegen) · [Graph Partitioning and Execution Plans](concepts.md#execution-plan) · Related details: [Primitive Semantics](ir.md#tensor-primitives) · [Matrix Multiplication API](api.md#matmul-api) · [FugaTensor Basic Operations](../../../fugatensor/docs/en/API/ops.md)
+Back to Core Concepts: [Owned Code Generation](concepts.md#ask-owned-codegen) · [Graph Partitioning and Execution Plans](concepts.md#execution-plan) · Related details: [Primitive Semantics](ir.md#tensor-primitives) · [Matrix Multiplication API](api.md#matmul-api)
 
 # Primitives, Fusion, and Matrix Multiplication Verification Report
 

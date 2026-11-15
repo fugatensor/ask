@@ -68,9 +68,9 @@ external 步骤交给调用方 worker 编译为 cubin/PTX，owned 步骤经 ASK 
 
 ## 4. 编译包与常驻调度
 
-FugaTensor 将计划和各步骤产物保存为 `CUDAProgram`。包中使用相对路径：`execution_plan.json` 保存逻辑计划，`program.json` 记录步骤对应的子目录产物和摘要。保存和加载时检查路径范围、摘要、计划和 kernel ABI，自有与外部步骤分别使用对应的磁盘缓存；library 的矩阵描述保存在计划中。校验后，将内存中的计划描述交给 ASK Runtime。
+调用方可持久化保存导出的 `executionPlanJSON` 及各步骤编译产物与摘要。保存和加载时应检查路径范围、摘要、计划和 kernel ABI，自有与外部步骤分别使用各自的磁盘缓存，library 的矩阵描述保存在计划中，校验后再交给 ASK Runtime。
 
-调用方加载 owned/external kernel，并为 library 填写 `MatmulDescription`，按逻辑缓冲区构造字节数表、公开端口索引与 `PlanStep`，交给 `Session::prepareProgram(..., graph)`。`PreparedProgram::submit(inputs, outputs)` 一次完成所有步骤；C++ 先校验公开端口的设备归属、字节数、可写性和别名，再更新公开端口地址并提交，只记录一个完成事件。`run(inputs)` 还负责分配本次输出，供 FugaTensor 的薄原生桥直接调用。
+调用方加载 owned/external kernel，并为 library 填写 `MatmulDescription`，按逻辑缓冲区构造字节数表、公开端口索引与 `PlanStep`，交给 `Session::prepareProgram(..., graph)`。`PreparedProgram::submit(inputs, outputs)` 一次完成所有步骤；C++ 先校验公开端口的设备归属、字节数、可写性和别名，再更新公开端口地址并提交，只记录一个完成事件。`run(inputs)` 还负责分配本次输出。
 
 每个在途调用占用独立工作区，事件完成后才能复用。工作区内按已验证的步骤生存期共享物理槽位，公开端口单独绑定。事件保留程序和缓冲区，会话保留待完成事件，因此调用方释放对象后，在途资源仍然有效。启动失败时，运行时等待已排队的步骤结束再传播异常；设备写入不回滚。零步骤别名计划记录完成事件，覆盖此前的 stream 依赖，保持异步提交。
 
@@ -78,7 +78,7 @@ FugaTensor 将计划和各步骤产物保存为 `CUDAProgram`。包中使用相�
 
 传入 `graph=true` 时使用 [CUDA Graph replay](runtime.md#cuda-graph)。准备阶段从步骤读写端口推导依赖，冻结节点前驱，并按依赖可达性校验内部槽位复用；独立分支可并行执行。每个工作区缓存 graph 实例，复用时更新公开端口地址，自有与外部步骤使用同一机制。
 
-FugaTensor 将前向或求导后的静态图提交给 ASK，由 ASK 在外部节点处分区并优化自有区域。外部算子的反向规则由上层框架提供。
+上层框架将前向或求导后的静态图提交给 ASK，由 ASK 在外部节点处分区并优化自有区域。外部算子的反向规则由上层框架提供。
 
 <a id="complex-external"></a>
 
@@ -86,6 +86,6 @@ FugaTensor 将前向或求导后的静态图提交给 ASK，由 ASK 在外部节
 
 外部 kernel 可使用多输入、多输出、不同形状和存储类型、内部 FP32 累加及动态共享内存。worker 负责生成产物并报告所需资源，启动限制见[外部执行接口](artifacts.md#binary-artifact)。
 
-例如 FugaTensor 的 [attention API](../../../fugatensor/docs/zh/API/attention.md) 使用 FlashAttention 的 Triton kernel，并通过 `ft.fun.vjp` 定义纯余切规则。ASK 将前向、统计量、dQ、dK、dV 分为独立步骤，在同一 stream 上调度；算法和梯度的数值验证由 FugaTensor 维护。
+当外部算子包含多个关联 kernel（例如前向与拆分后的多个反向 kernel）时，ASK 将每个 `ask.external` 划分为独立步骤并按缓冲区依赖调度；算法和梯度的数值验证由调用方维护。
 
 接入新 DSL 见[适配规范](compilers.md#adapter-contract)，请求和产物格式见 [schemas/](../../schemas/)。

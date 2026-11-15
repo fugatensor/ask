@@ -1,6 +1,6 @@
 # ASK 编译器核心思想
 
-目录导航：[文档目录](README.md) · 上层协同：[FugaTensor 架构总览](../../../fugatensor/docs/zh/architecture/README.md)
+目录导航：[文档目录](README.md)
 
 ASK 将静态张量图编译成 CPU 或 CUDA 代码，并调度外部 cubin/PTX。图中记录类型、形状和数据依赖，运行时管理缓冲区和执行顺序。
 
@@ -8,11 +8,11 @@ ASK 将静态张量图编译成 CPU 或 CUDA 代码，并调度外部 cubin/PTX�
 
 ## 1. 与上层框架的分工
 
-FugaTensor 负责 Tensor API、组图、函数式 `grad` 和 Python 控制流。`grad` 先构造导数表达式，数值执行保持延迟。读取普通结果或梯度结果、判断标量条件或调用 `evaluate` 时，它收集依赖，向 ASK 提交形状确定的单基本块图。
+上层张量框架负责用户 API、前端构图、自动微分与宿主控制流，在求值边界收集依赖并向 ASK 提交形状确定的单基本块图。
 
-ASK 负责图校验、优化、代码生成和设备调度。FugaTensor 的扩展直接链接 ASK C++ 库，同时管理第三方 worker 和磁盘缓存。
+ASK 负责图校验、优化、代码生成和设备调度。上层原生绑定直接链接 ASK C++ 库，同时管理第三方编译器 worker 和磁盘缓存。
 
-工程细节：[职责划分](fugatensor.md#division-of-labor) · [C++ 接口边界](build.md#python-sdk)
+工程细节：[C++ 接口边界](build.md#python-sdk) · [用户 API](api.md#api-entrypoints)
 
 <a id="ask-ir-model"></a>
 
@@ -60,9 +60,9 @@ Host 后端将同形状的多输出计算放入共享循环，生成 `.o`；f32 
 
 `Session` 持有 CUDA context、stream 和已加载模块。`DeviceBuffer` 管理或借用显存；`PreparedProgram` 提交整段计划，返回覆盖所有步骤的 `Event`。ASK PASS 在准备阶段验证中间缓冲区共享物理槽位的生存期，并缓存成功校验。工作区保留参数模板，提交时更新公开端口地址；工作区和事件在完成后复用，输出保留至调用方释放。
 
-CUDA Graph 按读写依赖连接节点，独立分支保留并行机会。准备阶段校验共享槽位的全部访问顺序，提交时更新输入输出地址并重放执行图。在途调用各有自己的工作区。FugaTensor 的 CUDA JIT 使用这条路径，绑定层处理 CAI 描述符和 Python 对象保活。
+CUDA Graph 按读写依赖连接节点，独立分支保留并行机会。准备阶段校验共享槽位的全部访问顺序，提交时更新输入输出地址并重放执行图。在途调用各有自己的工作区，调用方绑定层负责外部缓冲区描述符与宿主对象保活。
 
-FugaTensor 按工具、依赖和内容摘要缓存编译产物；ASK 缓存已加载模块和执行资源。PTX 在驱动加载时 JIT。
+调用方按工具、依赖和内容摘要缓存编译产物；ASK 缓存已加载模块和执行资源。PTX 在驱动加载时 JIT。
 
 工程细节：[会话](runtime.md#execution-session) · [设备张量](runtime.md#device-tensor-and-cai) · [缓存](runtime.md#two-tier-cache) · [依赖调度与临时区复用验证](workspace_report.md)
 
@@ -90,9 +90,9 @@ flowchart TD
 
 ## 8. 测试验证
 
-`ask-core`、`ask-compiler`、`ask-primitives` 和 `ask-pass` 验证图准备、优化、代码生成与计划证明，`ask-host-blas` 验证 OpenBLAS 链接及数值；启用 `ASK_TEST_CUDA=ON` 后，`ask-runtime` 验证 GPU 执行、槽位复用和 Graph replay；启用 cuBLASLt 的构建另有 `ask-matmul` 矩阵。[FugaTensor](../../../fugatensor/README.zh.md) 提供接入示例和端到端测试。
+`ask-core`、`ask-compiler`、`ask-primitives` 和 `ask-pass` 验证图准备、优化、代码生成与计划证明，`ask-host-blas` 验证 OpenBLAS 链接及数值；启用 `ASK_TEST_CUDA=ON` 后，`ask-runtime` 验证 GPU 执行、槽位复用和 Graph replay；启用 cuBLASLt 的构建另有 `ask-matmul` 矩阵。`tests/cpp/` 中的独立消费测试验证安装后 `Compiler`、`Runtime` 和 `Core` 组件的消费。
 
-工程细节：[测试体系](testing.md#ctest-targets) · [编译与执行能力](fugatensor.md#implemented-scope) · [项目依赖](fugatensor.md#roadmap)
+工程细节：[测试体系](testing.md#ctest-targets) · [独立安装](install.md#source-install) · [用户 API](api.md#api-entrypoints)
 
 <a id="execution-plan"></a>
 

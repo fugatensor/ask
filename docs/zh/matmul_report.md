@@ -1,4 +1,4 @@
-返回核心思想：[自有代码生成](concepts.md#ask-owned-codegen) · [图切分与执行计划](concepts.md#execution-plan) · 相关细节：[原语语义](ir.md#tensor-primitives) · [矩阵乘法 API](api.md#matmul-api) · [FugaTensor 基础运算](../../../fugatensor/docs/zh/API/ops.md)
+返回核心思想：[自有代码生成](concepts.md#ask-owned-codegen) · [图切分与执行计划](concepts.md#execution-plan) · 相关细节：[原语语义](ir.md#tensor-primitives) · [矩阵乘法 API](api.md#matmul-api)
 
 # 原语、融合与矩阵乘法验证报告
 

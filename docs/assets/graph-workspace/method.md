@@ -1,4 +1,4 @@
-返回核心思想：[常驻运行时](../../concepts.md#ask-runtime-cache) · 相关细节：[验证报告](../../workspace_report.md#method)
+返回核心思想：[常驻运行时](../../zh/concepts.md#ask-runtime-cache) · 相关细节：[验证报告](../../zh/workspace_report.md#method)
 
 # CUDA Graph 与 Host 临时区量测方法
 

@@ -15,8 +15,3 @@ Welcome to the ASK documentation. Please select your preferred language:
 - **[ASK IR & Numerics](en/ir.md)**: Explicit typing, IEEE-754 semantics, casting, and op specifications.
 - **[Graph Partitioning & Execution Plans](en/partitioning.md)**: Multi-kernel scheduling, plan JSON schema v1, and runtime graph replay.
 - **[Testing Infrastructure](en/testing.md)**: CTest suite, native GPU testing, and integration verification.
-
-## 上层框架文档 / Higher-Level Framework Documentation
-
-- **[FugaTensor Documentation Hub](../../fugatensor/docs/README.md)**
-  - [English](en/README.md) · [简体中文](zh/README.md)

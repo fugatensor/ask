@@ -15,11 +15,11 @@
 - **双层 IR 分工**：
   - 高层 MLIR `ask` dialect（`include/ask/IR/`、`lib/IR/`）负责显式类型、静态形状推导、图级优化（折叠、DCE、逐元素融合分组）、`ask.mark` 溯源导出与 `ask.external` 外部算子契约检查。
   - 低层原生 LLVM IR（`lib/Lowering/`、`lib/LLIR/`）负责自有 CPU/CUDA 算子降级、LLVM 校验与优化及目标机器码（`.o` / `cubin`）生成。
-  - 前端自动微分与停止梯度由 FugaTensor 的 Fuga IR 处理；`fuga.stop_gradient` 降级时映射为输入值，ASK 接收处理后的数值计算图。
+  - 前端自动微分与控制流由上层框架处理，ASK 接收完成控制流展开和边界处理的静态数值计算图。
 - **核心与第三方适配器隔离**：
   - ASK 只交付 C++ SDK 与 CLI，不包含 Python 包或 nanobind 绑定；`core` 构建不依赖 Python、Triton、NumPy 或 PyTorch，自有 CPU/CUDA 降级属于基础核心。Python 仅用于可选的依赖获取和工程脚本。
   - `ASK::Compiler` 提供不暴露 LLVM 类型的编译门面，`ASK::Runtime` 提供原生计划与设备资源管理；消费两者不要求 LLVM 开发 SDK。直接操作 MLIR/LLVM 的调用方使用 `ASK::Core`。
-  - 第三方 worker、版本策略、编译编排、磁盘缓存和 Python 产物校验由调用方维护；FugaTensor 通过自己的原生绑定直接链接 ASK。ASK 维护协议 v2/schema、标准化请求、cubin/PTX 加载与原生调度，不硬编码 DSL 或扫描 Python entrypoints。
+  - 第三方 worker、版本策略、编译编排、磁盘缓存和产物校验由调用方维护；上层框架通过自己的原生绑定直接链接 ASK。ASK 维护协议 v2/schema、标准化请求、cubin/PTX 加载与原生调度，不硬编码 DSL 或扫描 Python entrypoints。
 - **图切分与执行计划**：
   - 高层 MLIR 分区函数与 JSON v1 记录缓冲区和步骤依赖；普通 stream 按序执行，CUDA Graph 从读写端口推导依赖，保留独立分支并行。自有区域内部保留融合，每个外部节点和 cuBLASLt matmul 始终独立执行；归约结果再次扩展时物化。CPU 物化临时区按实际发出的读取阶段在编译期分配和校验复用槽位。非法 IR、损坏产物和工具失败直接报错。
   - ASK 自有 `ASK::Pass` 静态库在 `lib/Pass/` 实现专用 C++ 计划校验。`Session::prepareProgram` 校验整份执行与内存槽位计划，包括索引、单一生产者、读端口、公开输出、容量和同槽生存期；Runtime 校验 kernel ABI、完成事件和在途资源。成功校验按完整计划键保存在有界进程缓存中；非法计划直接拒绝。
@@ -44,7 +44,7 @@
     - 核心构建与测试：`cmake --preset core && cmake --build --preset core && ctest --preset core --output-on-failure`
 - **测试组织**：
   - 原生测试源码位于 `tests/cpp/`，默认 CTest 为 `ask-core`、`ask-compiler`、`ask-pass`、`ask-primitives`、`ask-host-blas`；显式配置 `-DASK_TEST_CUDA=ON` 增加物理 GPU 测试 `ask-runtime`，启用 cuBLASLt 时另加 `ask-matmul`。
-  - 推荐以 FugaTensor 的生产接口和实现作为完整接入示例，文档不使用测试目录充当示例，也不叙述测试迁移历史。端到端数值、图组合和第三方编译器验证由 FugaTensor 维护；新增覆盖优先复用独立参考与 `plan_matrix`，避免重复实现。
+  - 文档聚焦 ASK 自身的 C++ 接口、CLI 与规范，不使用测试目录充当示例，也不叙述测试迁移历史；不引用其他仓库路径或以其他仓库作为文档示例。新增测试覆盖优先复用独立参考与 `plan_matrix`，避免重复实现。
   - SDK 使用 `cmake --install build/core --prefix /path/to/ask-sdk` 安装；验证独立消费 Compiler/Runtime 时不依赖 LLVM 开发 SDK，消费 Core 时匹配 ASK 实际构建的 LLVM/MLIR 版本。默认依赖记录用于复现稳定发行版；自有 LLVM/MLIR 与第三方编译器内部 LLVM 独立选择。
   - 因缺少 `ASK_OPT`、GPU 驱动或编译工具而 `skipped` 的测试不能视作功能验证通过。
 
@@ -55,8 +55,8 @@
 - **Agent 读取与双语维护约定**：
   - **开发读取**：Agent 在日常开发、代码理解、架构参考与上下文检索时，**只读取英文版本（`docs/en/` 与根目录 `README.md`）** 即可，无需重复读取中文文档以节省上下文。
   - **文档修改**：当修改接口、代码逻辑、构建配置或补充说明时，**必须同步修改中英文双语版本（`docs/en/` 与 `docs/zh/`，以及根目录 `README.md` 与 `README.zh.md`）**，确保双语内容、代码示例与 `<a id="..."></a>` 锚点保持严格对齐。
-- 文档采用中文 `docs/zh/` 与英文 `docs/en/` 双语目录结构，由 `docs/README.md` 语言导航索引，并与同级 `../fugatensor/docs/`（`zh/` 与 `en/`）双向互链：
+- 文档采用中文 `docs/zh/` 与英文 `docs/en/` 双语目录结构，由 `docs/README.md` 语言导航索引；文档内严禁跨仓库相对链接或跨仓库举例，所有链接必须指向当前仓库内有效文件与锚点：
   - 文件名按主题命名，不带数字序号前缀，中英文目录结构保持镜像对齐；
   - 总览各节使用 `<a id="..."></a>` 定义锚点，节末以 `工程细节：...` 链向专题章节；
   - 专题首行以 `返回核心思想：... · 相关细节：...` 链回总览与关联专题，内部小节同样提供 `<a id="..."></a>` 锚点；中英文锚点 ID 保持完全一致；
-- 修改章节标题、文件名或锚点时，同步检查仓内及同级 `../fugatensor/docs/` 的相对路径与 `#anchor` 引用。
+- 修改章节标题、文件名或锚点时，同步检查仓内的相对路径与 `#anchor` 引用，确保无死链。

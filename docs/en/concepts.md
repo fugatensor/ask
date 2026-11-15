@@ -1,6 +1,6 @@
 # ASK Compiler Core Concepts
 
-Navigation: [Documentation Index](README.md) · Upstream Collaboration: [FugaTensor Architecture Overview](../../../fugatensor/docs/en/architecture/README.md)
+Navigation: [Documentation Index](README.md)
 
 ASK compiles static tensor graphs into CPU or CUDA machine code and schedules external cubin/PTX kernels. The graph captures types, shapes, and data dependencies, while the runtime manages buffers and execution order.
 
@@ -8,11 +8,11 @@ ASK compiles static tensor graphs into CPU or CUDA machine code and schedules ex
 
 ## 1. Division of Labor with Upstream Frameworks
 
-FugaTensor is responsible for Tensor APIs, graph construction, functional `grad`, and Python control flow. `grad` first constructs derivative expressions while numerical execution remains deferred. When reading standard or gradient results, evaluating scalar conditions, or invoking `evaluate`, it collects dependencies and submits a single basic-block graph with concrete shapes to ASK.
+Upstream tensor frameworks manage user APIs, frontend graph construction, automatic differentiation, and host control flow, submitting single basic-block graphs with concrete shapes to ASK at evaluation boundaries.
 
-ASK is responsible for graph verification, optimization, code generation, and device scheduling. FugaTensor's native extension links directly against ASK C++ libraries while managing third-party workers and disk caching.
+ASK is responsible for graph verification, optimization, code generation, and device scheduling. Upstream native bindings link directly against ASK C++ libraries while managing third-party compiler workers and disk caching.
 
-Engineering details: [Division of Responsibilities](fugatensor.md#division-of-labor) · [C++ Interface Boundaries](build.md#python-sdk)
+Engineering details: [C++ Interface Boundaries](build.md#python-sdk) · [User API](api.md#api-entrypoints)
 
 <a id="ask-ir-model"></a>
 
@@ -60,9 +60,9 @@ Engineering details: [Artifacts and Ports](artifacts.md#binary-artifact) · [Wor
 
 `Session` holds CUDA context, streams, and loaded modules. `DeviceBuffer` manages or borrows device memory; `PreparedProgram` submits the entire plan, returning an `Event` covering all steps. ASK PASS verifies the lifetime of shared physical slots for intermediate buffers during preparation and caches successful verifications. Workspaces retain parameter templates and update public port addresses upon submission; workspaces and events are reused upon completion, while outputs persist until released by the caller.
 
-CUDA Graph connects nodes based on read-write dependencies, preserving parallel execution opportunities for independent branches. The preparation phase validates the complete access order of shared slots; upon submission, input and output addresses are updated, and the execution graph is replayed. In-flight invocations maintain their own workspaces. FugaTensor's CUDA JIT uses this path, with the binding layer handling CAI descriptors and Python object lifetime management.
+CUDA Graph connects nodes based on read-write dependencies, preserving parallel execution opportunities for independent branches. The preparation phase validates the complete access order of shared slots; upon submission, input and output addresses are updated, and the execution graph is replayed. In-flight invocations maintain their own workspaces, while caller bindings manage external buffer descriptors and host object lifetimes.
 
-FugaTensor caches compilation artifacts based on tooling, dependencies, and content digests; ASK caches loaded modules and execution resources. PTX is JIT-compiled upon driver loading.
+Callers cache compilation artifacts based on tooling, dependencies, and content digests; ASK caches loaded modules and execution resources. PTX is JIT-compiled upon driver loading.
 
 Engineering details: [Session](runtime.md#execution-session) · [Device Tensors](runtime.md#device-tensor-and-cai) · [Caching](runtime.md#two-tier-cache) · [Dependency Scheduling and Workspace Reuse Verification](workspace_report.md)
 
@@ -90,9 +90,9 @@ Engineering details: [Partition Representation](partitioning.md#partition-ir) ·
 
 ## 8. Test Verification
 
-`ask-core`, `ask-compiler`, `ask-primitives`, and `ask-pass` verify graph preparation, optimization, code generation, and plan proofs; `ask-host-blas` verifies OpenBLAS linking and numerical correctness; when `ASK_TEST_CUDA=ON` is enabled, `ask-runtime` verifies GPU execution, slot reuse, and Graph replay; builds with cuBLASLt enabled also run the `ask-matmul` matrix. [FugaTensor](../../../fugatensor/README.md) provides integration examples and end-to-end tests.
+`ask-core`, `ask-compiler`, `ask-primitives`, and `ask-pass` verify graph preparation, optimization, code generation, and plan proofs; `ask-host-blas` verifies OpenBLAS linking and numerical correctness; when `ASK_TEST_CUDA=ON` is enabled, `ask-runtime` verifies GPU execution, slot reuse, and Graph replay; builds with cuBLASLt enabled also run the `ask-matmul` matrix. Standalone consumer tests in `tests/cpp/` verify consuming installed `Compiler`, `Runtime`, and `Core` packages.
 
-Engineering details: [Testing Suite](testing.md#ctest-targets) · [Compilation and Execution Capabilities](fugatensor.md#implemented-scope) · [Project Dependencies](fugatensor.md#roadmap)
+Engineering details: [Testing Suite](testing.md#ctest-targets) · [Standalone Installation](install.md#source-install) · [User API](api.md#api-entrypoints)
 
 <a id="execution-plan"></a>
 

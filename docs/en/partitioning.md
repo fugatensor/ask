@@ -68,9 +68,9 @@ External steps support multiple inputs, multiple outputs, and ports of differing
 
 ## 4. Compilation Packages and Resident Scheduling
 
-FugaTensor saves plans and step artifacts as a `CUDAProgram`. Relative paths are used within the package: `execution_plan.json` stores the logical plan, while `program.json` records subdirectory artifacts and digests corresponding to steps. Path scopes, digests, plans, and kernel ABIs are validated upon saving and loading, with native and external steps utilizing their respective disk caches; library matrix descriptors are preserved in the plan. Following validation, the in-memory plan descriptor is delivered to ASK Runtime.
+Callers can persist the exported `executionPlanJSON` alongside compiled step artifacts and digests. Paths, digests, plans, and kernel ABIs should be validated upon saving and loading, with native and external steps utilizing their respective disk caches and library matrix descriptors preserved in the plan before constructing the in-memory plan descriptor for ASK Runtime.
 
-Callers load owned/external kernels, populate `MatmulDescription` for library steps, construct byte size tables, public port indices, and `PlanStep` instances from logical buffers, and pass them to `Session::prepareProgram(..., graph)`. `PreparedProgram::submit(inputs, outputs)` executes all steps in a single call; C++ first verifies device ownership, byte sizes, writability, and aliasing of public ports, then updates public port addresses and submits, recording only a single completion event. `run(inputs)` additionally handles allocation for current outputs, called directly by FugaTensor's thin native bridge.
+Callers load owned/external kernels, populate `MatmulDescription` for library steps, construct byte size tables, public port indices, and `PlanStep` instances from logical buffers, and pass them to `Session::prepareProgram(..., graph)`. `PreparedProgram::submit(inputs, outputs)` executes all steps in a single call; C++ first verifies device ownership, byte sizes, writability, and aliasing of public ports, then updates public port addresses and submits, recording only a single completion event. `run(inputs)` additionally handles allocation for current outputs.
 
 Each inflight invocation occupies an independent workspace, reusable only after its event completes. Physical slots are shared within a workspace according to verified step lifetimes, with public ports bound independently. Events retain programs and buffers, while sessions retain pending events, ensuring inflight resources remain valid even after callers release objects. On launch failure, the runtime waits for already-queued steps to finish before propagating exceptions; device writes are not rolled back. Zero-step aliased plans record completion events, covering prior stream dependencies to maintain asynchronous submission.
 
@@ -78,7 +78,7 @@ For the division of labor between plan proofs and VRAM reuse, see [Rule Proofs a
 
 When `graph=true` is passed, [CUDA Graph Replay](runtime.md#cuda-graph) is used. The preparation phase derives dependencies from step read/write ports, freezes node predecessors, and verifies internal slot reuse according to dependency reachability; independent branches can execute concurrently. Each workspace caches a graph instance, updating public port addresses upon reuse; native and external steps share this identical mechanism.
 
-FugaTensor submits forward or differentiated static graphs to ASK, where ASK partitions at external nodes and optimizes native regions. Backward rules for external operators are provided by the upper-level framework.
+Upstream frameworks submit forward or differentiated static graphs to ASK, where ASK partitions at external nodes and optimizes native regions. Backward rules for external operators are provided by the upper-level framework.
 
 <a id="complex-external"></a>
 
@@ -86,6 +86,6 @@ FugaTensor submits forward or differentiated static graphs to ASK, where ASK par
 
 External kernels can utilize multiple inputs, multiple outputs, differing shapes and storage types, internal FP32 accumulation, and dynamic shared memory. Workers are responsible for generating artifacts and reporting required resources; launch constraints are detailed in [External Execution Interface](artifacts.md#binary-artifact).
 
-For example, FugaTensor's [Attention API](../../../fugatensor/docs/en/API/attention.md) uses FlashAttention's Triton kernel and defines pure cotangent rules via `ft.fun.vjp`. ASK partitions forward, summary statistics, dQ, dK, and dV into separate steps scheduled on the same stream; numerical validation of algorithms and gradients is maintained by FugaTensor.
+When an operator spans multiple external kernels (such as a forward pass and its separate backward kernels), ASK partitions each `ask.external` node into an independent step scheduled according to buffer dependencies, while numerical validation of algorithms and gradients is maintained by the caller.
 
 For integrating new DSLs, see [Adapter Specification](compilers.md#adapter-contract); for request and artifact schemas, see [schemas/](../../schemas/).

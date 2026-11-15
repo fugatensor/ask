@@ -2,7 +2,7 @@
 
 # 前端接入与构建配置
 
-ASK 提供 C++ 组件 `ASK::Compiler`、`ASK::Runtime`、`ASK::Core` 和命令行工具 `ask-opt`。FugaTensor 的原生绑定直接链接 ASK 共享库，向用户提供 Python API。
+ASK 提供 C++ 组件 `ASK::Compiler`、`ASK::Runtime`、`ASK::Core` 和命令行工具 `ask-opt`。上层框架的原生绑定可直接链接 ASK 共享库。
 
 <a id="build-workflow"></a>
 
@@ -28,7 +28,7 @@ cmake --install build/core --prefix /path/to/ask-install
 
 默认 CTest 运行 Compiler、Core、Pass、Primitives 和 Host OpenBLAS 链接数值测试。配置 `-DASK_TEST_CUDA=ON` 后增加 GPU 运行时测试，并在启用 cuBLASLt 时增加 matmul 矩阵；执行需有可用的驱动和设备。
 
-调用方管理第三方编译器的 worker、运行环境和产物缓存。ASK 检查 `ask.external`，生成分区计划，再调度 cubin/PTX。FugaTensor 提供了 Triton worker；协议见[外部产物接口](artifacts.md)。
+调用方管理第三方编译器的 worker、运行环境和产物缓存。ASK 检查 `ask.external`，生成分区计划，再调度 cubin/PTX；协议见[外部产物接口](artifacts.md)。
 
 <a id="native-compiler"></a>
 <a id="python-sdk"></a>
@@ -77,7 +77,7 @@ target_link_libraries(my_frontend PRIVATE ASK::Core)
 | `--check-llir` / `--optimize-llir` | 验证或清理原生 LLVM IR |
 | `--report-json FILE` | 将准备、分区或 ABI 报告写入文件 |
 
-FugaTensor 默认调用共享库完成编译和执行；调用方使用 `llc` / `ptxas` 将 CUDA LLVM IR 转成 PTX/cubin。
+调用方通常在进程内调用共享库完成编译和执行，并使用 `llc` / `ptxas` 将 CUDA LLVM IR 转成 PTX/cubin。
 
 <a id="version-contract"></a>
 

@@ -1,4 +1,4 @@
-Back to Core Concepts: [Two-Level IR Model](concepts.md#ask-ir-model) · Related details: [Frontend Integration and Build Configuration](build.md) · [Graph Optimization and Native Code Generation](codegen.md) · [Fuga IR Lowering to ASK](../../../fugatensor/docs/en/ir/lowering.md)
+Back to Core Concepts: [Two-Level IR Model](concepts.md#ask-ir-model) · Related details: [Frontend Integration and Build Configuration](build.md) · [Graph Optimization and Native Code Generation](codegen.md)
 
 # ASK IR and Numerical Semantics
 
@@ -40,7 +40,7 @@ Each graph function uses a single basic block; upper-level frameworks unroll fun
 %matrix = "ask.reshape"(%flat) {shape = array<i64: 2, 2>} : (tensor<4xf32>) -> tensor<2x2xf32>
 ```
 
-`shape = array<i64>` represents a 0-D tensor; dimension inferences such as `-1` are resolved by callers, as seen in [FugaTensor reshape](../../../fugatensor/docs/en/API/tensor.md#reshape). Reshape preserves element types and linear order; external kernels receive the transformed shape. Native elementwise loops reuse corresponding input values, while public outputs use independent buffers.
+`shape = array<i64>` represents a 0-D tensor; dimension inferences such as `-1` must be resolved by callers beforehand. Reshape preserves element types and linear order; external kernels receive the transformed shape. Native elementwise loops reuse corresponding input values, while public outputs use independent buffers.
 
 <a id="tensor-primitives"></a>
 
@@ -93,7 +93,7 @@ Library matrix multiplication validates numerical values against permitted input
 | `"f16"` | `f16` | 2 Bytes | `half` | IEEE-754 binary16 (5-bit exponent + 10-bit mantissa). |
 | `"bf16"` | `bf16` | 2 Bytes | `bfloat` | bfloat16 (8-bit exponent + 7-bit mantissa); execution targets CUDA `sm_80+`. |
 
-`ask.constant` literals for `f16`, `bf16`, and `f32` adopt single-step round-to-nearest-even (RNE), rounding directly to the target bitwidth. This avoids double-rounding errors from first converting to `f32` and then truncating to `f16`/`bf16`, while preserving `-0.0`, `±inf`, and `NaN`. FugaTensor's [numerical encoding](../../../fugatensor/src/fugatensor/_ask/numerics.py) converts Python inputs into the target format following the same rule, which is then emitted as ASK IR by the internal graph bridge layer.
+`ask.constant` literals for `f16`, `bf16`, and `f32` adopt single-step round-to-nearest-even (RNE), rounding directly to the target bitwidth. This avoids double-rounding errors from first converting to `f32` and then truncating to `f16`/`bf16`, while preserving `-0.0`, `±inf`, and `NaN`. Callers converting host inputs into ASK IR constants should apply the same single-step RNE rule.
 
 <a id="cast-semantics"></a>
 

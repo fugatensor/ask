@@ -2,7 +2,7 @@ Back to Core Concepts: [Build and In-Process Integration](concepts.md#ask-fronte
 
 # ASK User API
 
-ASK's C++ interface is divided into Compiler and Runtime. For an integration example, see [FugaTensor](../../../fugatensor/README.md), whose native extension links against Compiler and Runtime; for Python usage, see [FugaTensor API](../../../fugatensor/docs/en/API/README.md).
+ASK's C++ interface is divided into `ASK::Compiler` and `ASK::Runtime`, with `ASK::Core` available for direct MLIR/LLVM manipulation.
 
 <a id="api-entrypoints"></a>
 
@@ -25,7 +25,7 @@ Compiler and Runtime use standard C++ types; compilation and GPU submission are 
 
 ## 2. Submitting ASK Graphs
 
-Compiler accepts ASK MLIR text; callers can generate text directly or construct graphs via Core's MLIR API. FugaTensor lowers Fuga IR to ASK IR before submitting it for compilation.
+Compiler accepts ASK MLIR text; callers can generate text directly or construct graphs via Core's MLIR API. Upper-level frameworks lower their frontend IR to static ASK IR before submitting it for compilation.
 
 The following is a static graph for `y = x + 1`:
 
@@ -176,7 +176,7 @@ Preparation creates cuBLASLt descriptors and algorithms, while execution binds t
 
 Adapters provide cubin/PTX, entry points, ports, and launch configurations, integrated via `load` and `prepareProgram`. The compiler checks `ask.external` declarations, and `ask::compiler::partition` splits each external node into an independent step, while native regions continue fusing internally.
 
-For worker requests, artifact formats, and scalar types, see [External Adapter Specification](compilers.md). Callers are responsible for workers, tooling environments, disk caches, and native program preparation; FugaTensor already provides corresponding implementations.
+For worker requests, artifact formats, and scalar types, see [External Adapter Specification](compilers.md). Callers are responsible for workers, tooling environments, disk caches, and native program preparation.
 
 When borrowing external device pointers, callers must retain ownership of the underlying storage until the completion event finishes; `importBuffer` merely holds an ASK wrapper object. Use `session->waitForExternalStream(producerStream)` to wait for producers; external frameworks must likewise wait for ASK completion or establish equivalent dependencies before accessing buffers again.
 
@@ -205,4 +205,4 @@ Callers persist compilation artifacts along with their targets, ports, parameter
 
 Compiler interfaces throw `std::runtime_error`, while the device layer throws `ask::runtime::CUDAError`. On launch failure, preceding steps may have already been submitted; the runtime waits for those operations to finish before releasing references and propagating errors; device writes are not rolled back.
 
-Plans use static contiguous buffers to execute kernels and cuBLASLt steps. Standard streams launch sequentially, while CUDA Graph schedules and replays based on port dependencies. FugaTensor handles the Python API and framework-level control flow.
+Plans use static contiguous buffers to execute kernels and cuBLASLt steps. Standard streams launch sequentially, while CUDA Graph schedules and replays based on port dependencies. The caller framework handles user-facing APIs and frontend control flow.

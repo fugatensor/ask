@@ -2,7 +2,7 @@
 
 # ASK 用户 API
 
-ASK 的 C++ 接口分为编译器和运行时。接入示例见 [FugaTensor](../../../fugatensor/README.zh.md)，其原生扩展链接 Compiler 与 Runtime；Python 用法见 [FugaTensor API](../../../fugatensor/docs/zh/API/README.md)。
+ASK 的 C++ 接口分为 `ASK::Compiler` 和 `ASK::Runtime`，直接操作 MLIR/LLVM 时可使用 `ASK::Core`。
 
 <a id="api-entrypoints"></a>
 
@@ -25,7 +25,7 @@ Compiler 与 Runtime 使用标准 C++ 类型，编译和 GPU 提交在进程内�
 
 ## 2. 提交 ASK 图
 
-Compiler 接收 ASK MLIR 文本，调用方可直接生成文本，或通过 Core 的 MLIR API 构图。FugaTensor 先将 Fuga IR 降级为 ASK IR，再提交编译。
+Compiler 接收 ASK MLIR 文本，调用方可直接生成文本，或通过 Core 的 MLIR API 构图。上层框架先将前端 IR 降级为静态 ASK IR，再提交编译。
 
 下面是 `y = x + 1` 的静态图：
 
@@ -176,7 +176,7 @@ auto program = session->prepareProgram(
 
 适配器提供 cubin/PTX、入口、端口和启动配置，通过 `load` 与 `prepareProgram` 接入。编译器检查 `ask.external` 的声明，`ask::compiler::partition` 将每个外部节点分为独立步骤，自有区域内部继续融合。
 
-worker 请求、产物格式和标量类型见[外部适配规范](compilers.md)。调用方负责 worker、工具环境、磁盘缓存和原生程序准备，FugaTensor 已提供相应实现。
+worker 请求、产物格式和标量类型见[外部适配规范](compilers.md)。调用方负责 worker、工具环境、磁盘缓存和原生程序准备。
 
 借用外部设备指针时，调用方须保留实际存储所有者直到完成事件结束；`importBuffer` 仅持有 ASK 包装对象。使用 `session->waitForExternalStream(producerStream)` 等待生产者，外部框架再次访问缓冲区前也须等待 ASK 完成或建立等价依赖。
 
@@ -205,4 +205,4 @@ worker 请求、产物格式和标量类型见[外部适配规范](compilers.md)
 
 编译接口抛出 `std::runtime_error`，设备层抛出 `ask::runtime::CUDAError`。启动失败时，前序步骤可能已提交；运行时等待这些工作结束，再释放引用并传播错误，设备写入不回滚。
 
-计划使用静态连续缓冲区执行 kernel 和 cuBLASLt 步骤。普通 stream 按序启动，CUDA Graph 按端口依赖调度并重放。FugaTensor 负责 Python API 和框架级控制流。
+计划使用静态连续缓冲区执行 kernel 和 cuBLASLt 步骤。普通 stream 按序启动，CUDA Graph 按端口依赖调度并重放。调用方框架负责用户 API 和前端控制流。

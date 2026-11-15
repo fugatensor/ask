@@ -2,7 +2,7 @@ Back to Core Concepts: [Build and In-Process Integration](concepts.md#ask-fronte
 
 # Frontend Integration and Build Configuration
 
-ASK provides the C++ components `ASK::Compiler`, `ASK::Runtime`, `ASK::Core`, and the command-line tool `ask-opt`. FugaTensor's native bindings link directly against ASK shared libraries to expose Python APIs to users.
+ASK provides the C++ components `ASK::Compiler`, `ASK::Runtime`, `ASK::Core`, and the command-line tool `ask-opt`. Upstream frameworks link directly against ASK shared libraries from their native bindings.
 
 <a id="build-workflow"></a>
 
@@ -28,7 +28,7 @@ The `core` preset builds CPU/CUDA lowering and the device runtime. `ASK_TARGET_B
 
 Default CTest runs Compiler, Core, Pass, Primitives, and Host OpenBLAS-linked numerical tests. Configuring `-DASK_TEST_CUDA=ON` adds GPU runtime tests, and adds matmul matrices when cuBLASLt is enabled; execution requires available drivers and devices.
 
-Callers manage third-party compiler workers, runtime environments, and artifact caches. ASK inspects `ask.external`, generates partitioned execution plans, and schedules cubin/PTX. FugaTensor provides a Triton worker; see [External Artifacts and Execution Interface](artifacts.md) for the protocol.
+Callers manage third-party compiler workers, runtime environments, and artifact caches. ASK inspects `ask.external`, generates partitioned execution plans, and schedules cubin/PTX; see [External Artifacts and Execution Interface](artifacts.md) for the protocol.
 
 <a id="native-compiler"></a>
 <a id="python-sdk"></a>
@@ -77,7 +77,7 @@ Reports are serialized using `ask::reportJSON(result.report, result.floatPaths)`
 | `--check-llir` / `--optimize-llir` | Validate or sanitize native LLVM IR |
 | `--report-json FILE` | Write preparation, partitioning, or ABI report to a file |
 
-FugaTensor invokes shared libraries by default to perform compilation and execution; callers convert CUDA LLVM IR into PTX/cubin using `llc` / `ptxas`.
+Callers typically invoke the shared libraries in-process to perform compilation and execution, converting CUDA LLVM IR into PTX/cubin using `llc` / `ptxas`.
 
 <a id="version-contract"></a>
 

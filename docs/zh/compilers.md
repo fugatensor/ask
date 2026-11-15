@@ -2,7 +2,7 @@
 
 # 外部编译器适配接入规范
 
-适配器是一个 worker：接收 ASK 导出的请求，调用第三方编译器，返回二进制和启动信息。调用方负责启动 worker、校验和缓存产物，再将其交给 ASK Runtime。FugaTensor 提供了这套调用流程及 Triton worker。
+适配器是一个 worker：接收 ASK 导出的请求，调用第三方编译器，返回二进制和启动信息。调用方负责启动 worker、校验和缓存产物，再将其交给 ASK Runtime。
 
 <a id="adapter-contract"></a>
 
@@ -15,7 +15,7 @@ worker --probe --request /path/to/request.json
 worker --request /path/to/request.json --output /path/to/artifact.json
 ```
 
-`--probe` 根据请求中的源码和编译选项计算依赖指纹，向 stdout 输出 JSON。结果至少包含 `producer: {name, version}` 和非空字符串 `adapter_version`，并记录编译器安装、引用模块、依赖锁等影响编译结果的内容。调用方将整个结果纳入缓存键，并核对实际产物的 `producer`；FugaTensor 已实现这项检查。
+`--probe` 根据请求中的源码和编译选项计算依赖指纹，向 stdout 输出 JSON。结果至少包含 `producer: {name, version}` 和非空字符串 `adapter_version`，并记录编译器安装、引用模块、依赖锁等影响编译结果的内容。调用方将整个结果纳入缓存键，并核对实际产物的 `producer`。
 
 编译成功后写入响应 JSON 并返回 0；失败返回非零状态，将诊断写入 stderr。输出通过临时文件原子替换。Python worker 使用指定的解释器运行。
 
@@ -64,13 +64,13 @@ worker --request /path/to/request.json --output /path/to/artifact.json
 
 `required_element_types` 声明运行时须检查的张量元素类型，调用方将它与端口类型合并后传给 `Session::load`。生产者按 `target` 编译，负责满足内部指令的架构要求。
 
-FugaTensor 的 [`normalize_artifact`](../../../fugatensor/src/fugatensor/_ask/adapters.py) 根据请求构造 `port_map` 和 invocation v2，校验产物后转成原生计划。其它调用方可采用同一规则。格式见 [external-kernel-artifact-v2.schema.json](../../schemas/external-kernel-artifact-v2.schema.json)。
+调用方根据请求构造 `port_map` 和 invocation v2，校验产物后转成原生计划。格式见 [external-kernel-artifact-v2.schema.json](../../schemas/external-kernel-artifact-v2.schema.json)。
 
 <a id="cache-identity"></a>
 
 ## 4. 缓存与支持范围
 
-FugaTensor 查找外部编译缓存前执行带请求的 `--probe`，编译后再次探测，确认期间依赖保持一致。缓存键包含请求、探测结果、worker/解释器文件摘要、环境变量及调用流程的实现摘要；命中后仍校验产物。Worker 的指纹应覆盖自身导入的辅助模块和第三方依赖。
+调用方查找外部编译缓存前执行带请求的 `--probe`，编译后再次探测，确认期间依赖保持一致。缓存键包含请求、探测结果、worker/解释器文件摘要、环境变量及调用流程的实现摘要；命中后仍校验产物。Worker 的指纹应覆盖自身导入的辅助模块和第三方依赖。
 
 产物使用普通 CUDA kernel、静态连续的多输入多输出、指针与标量混合参数、固定启动配置和动态共享内存。scratch 为空；`null` 用于实际允许为空的指针。启动要求见[可执行产物与端口](artifacts.md#binary-artifact)。
 
@@ -80,4 +80,4 @@ FugaTensor 查找外部编译缓存前执行带请求的 `--probe`，编译后�
 
 新增 worker 应覆盖多端口及不同形状、混合标量位宽和参数顺序、cubin/PTX 编码、动态共享内存、缓存命中和依赖变化。错误测试包括 worker 失败、损坏产物、目标或端口不匹配。数值结果须在真实 GPU 上验证，并与 CPU 协议测试分开记录。
 
-实现可参考 FugaTensor 的 [Triton worker](../../../fugatensor/src/fugatensor/_triton_worker.py)。编译器版本和资源限制由各适配器维护。
+编译器版本和资源限制由各适配器维护。

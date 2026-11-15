@@ -1,8 +1,8 @@
-返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[外部产物与执行接口](artifacts.md) · [图优化与自有代码生成](codegen.md) · [FugaTensor 多后端执行](../../../fugatensor/docs/zh/architecture/backend.md)
+返回核心思想：[常驻运行时与缓存](concepts.md#ask-runtime-cache) · 相关细节：[外部产物与执行接口](artifacts.md) · [图优化与自有代码生成](codegen.md)
 
 # 常驻运行时与多级缓存
 
-`ASK::Runtime` 管理执行计划、设备缓冲区、stream、完成事件和 Graph replay。FugaTensor 负责 Python API、张量描述符、外部 Python 对象的寿命及磁盘编译缓存。
+`ASK::Runtime` 管理执行计划、设备缓冲区、stream、完成事件和 Graph replay。调用方负责前端 API、张量描述符、外部宿主对象的寿命及磁盘编译缓存。
 
 <a id="execution-session"></a>
 
@@ -24,7 +24,7 @@ C++ 调用示例见[原生会话与计划执行](api.md#execution-api)。
 
 `DeviceBuffer::copyFromHost(pointer, nbytes)` 和 `copyToHost(pointer, nbytes)` 批量拷贝连续内存；另有返回字节字符串的 `copyToHost()`。拷贝按原始字节进行，长度须完全匹配，返回前等待会话 stream 完成。
 
-借用外部内存时，调用方须保留实际存储所有者，直到 GPU 使用结束。FugaTensor 的绑定层负责解析 CUDA Array Interface、检查 shape/dtype/连续性、保留 Python 所有者，并调用 `waitForExternalStream` 等待生产者 stream。交换接口见 [FugaTensor 张量与数据交换](../../../fugatensor/docs/zh/API/tensor.md)。
+借用外部内存时，调用方须保留实际存储所有者直到 GPU 使用结束，在绑定层核对 shape/dtype/连续性，并调用 `waitForExternalStream` 等待生产者 stream。
 
 外部生产者再次访问同一存储前，须等待 ASK 的完成事件或建立等价 stream 依赖。
 
@@ -43,7 +43,7 @@ C++ 调用示例见[原生会话与计划执行](api.md#execution-api)。
 - `Event::query` 立即返回状态；`wait`、`Session::synchronize` 和主机拷贝等待完成。关闭会话时先完成在途工作，再清理资源。
 - 单 kernel 和多 kernel 使用同一计划机制。启动失败时，运行时等待已排队的步骤结束再传播错误；设备写入不回滚。
 
-查询、等待及会话操作会回收已完成的资源。事件保留 C++ 对象，FugaTensor 的绑定另行保留外部 Python 所有者直到完成。
+查询、等待及会话操作会回收已完成的资源。事件保留 C++ 对象，调用方绑定层另行保留外部宿主所有者直到完成。
 
 <a id="cuda-graph"></a>
 
@@ -57,17 +57,17 @@ C++ 调用示例见[原生会话与计划执行](api.md#execution-api)。
 
 零步骤别名计划只记录 stream 完成事件。驱动缺少所需 Graph API，或实例化、更新、启动失败时抛出异常。
 
-`Session::stats()` 提供 `program_submissions`、`workspace_reuses`、`allocation_reuses`、`event_creations/event_reuses`、`graph_instantiations/graph_launches` 等计数。`launches` 表示提交的计划步骤数（库步骤内部可能包含多个 CUDA kernel），Graph 提交次数另行统计。FugaTensor 的 CUDA JIT 通过自己的原生桥使用 graph 模式。`matmul_preparations` 记录库算法准备次数；`resident_device_bytes` / `peak_resident_device_bytes` 记录 ASK 实际分配的当前/峰值显存，包含分配池，外部借用和驱动/库内部存储由其所有者统计。
+`Session::stats()` 提供 `program_submissions`、`workspace_reuses`、`allocation_reuses`、`event_creations/event_reuses`、`graph_instantiations/graph_launches` 等计数。`launches` 表示提交的计划步骤数（库步骤内部可能包含多个 CUDA kernel），Graph 提交次数另行统计。`matmul_preparations` 记录库算法准备次数；`resident_device_bytes` / `peak_resident_device_bytes` 记录 ASK 实际分配的当前/峰值显存，包含分配池，外部借用和驱动/库内部存储由其所有者统计。
 
 `graph_nodes` / `graph_edges` 累计已实例化 Graph 的顶层节点和依赖边，cuBLASLt 子图计为一个顶层节点。`prepared_internal_slots` / `prepared_internal_bytes` 累计成功准备计划中单份内部工作区的槽数和容量，包含库 scratch；实际驻留量随在途工作区及分配池变化。
 
-矩阵乘法的 Graph replay、TF32 与提交机制见 [FugaTensor 算术运算](../../../fugatensor/docs/zh/API/ops.md#matmul)。
+矩阵乘法的计划接口与语义见[矩阵乘法计划](api.md#matmul-api)和[矩阵乘法](ir.md#matmul-semantics)。
 
 <a id="two-tier-cache"></a>
 
 ## 5. 调用方编译缓存与原生运行时缓存
 
-FugaTensor 的 `_ask` 接入层维护以下磁盘缓存，校验产物后将字节和计划交给 ASK：
+实现磁盘编译缓存的调用方通常按以下层级组织缓存，校验产物后将字节和计划交给 ASK：
 
 | 缓存 | 命中时跳过 | 键的主要输入 |
 | --- | --- | --- |
@@ -75,6 +75,6 @@ FugaTensor 的 `_ask` 接入层维护以下磁盘缓存，校验产物后将字�
 | 自有 cubin | `llc` 与 `ptxas` | LLVM IR、产物描述、工具及环境摘要 |
 | 外部产物 | Worker 编译 | 标准化请求、probe 结果、worker/解释器、依赖与环境摘要 |
 
-外部缓存保存 cubin 或原始 PTX，查找前探测生产者，编译后再次核对依赖。缓存使用锁、临时目录和原子发布，读取时检查清单、长度和 SHA-256。失效规则见[FugaTensor 缓存分工](../../../fugatensor/docs/zh/architecture/backend.md#cache-hierarchy)及[worker 缓存身份](compilers.md#cache-identity)。
+外部缓存保存 cubin 或原始 PTX，查找前探测生产者，编译后再次核对依赖。缓存使用锁、临时目录和原子发布，读取时检查清单、长度和 SHA-256；键规则见[worker 缓存身份](compilers.md#cache-identity)。
 
 ASK 在计划准备时缓存成功校验，会话缓存驻留模块、工作区、显存和事件。校验缓存的键和容量见[成功校验缓存](verification.md#proof-cache)。

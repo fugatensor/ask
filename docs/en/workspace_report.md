@@ -1,4 +1,4 @@
-Back to Core Concepts: [Resident Runtime and Caching](concepts.md#ask-runtime-cache) · Related details: [Static Plan Verification](verification.md#plan-proof) · [Host Code Generation](codegen.md#host-codegen) · [Fuga Integration](../../../fugatensor/docs/en/architecture/backend.md#native-plan-replay)
+Back to Core Concepts: [Resident Runtime and Caching](concepts.md#ask-runtime-cache) · Related details: [Static Plan Verification](verification.md#plan-proof) · [Host Code Generation](codegen.md#host-codegen)
 
 # CUDA Graph Dependency Scheduling and CPU Scratch Space Reuse Verification Report
 

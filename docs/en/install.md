@@ -93,12 +93,10 @@ For native CUDA computation, ASK generates LLVM IR; the caller executes `llc` / 
 
 CUDA matmul uses cuBLASLt. `ASK_ENABLE_CUBLASLT=ON` (default) enables it when `cublasLt.h` is found; CMake searches `CUDA_PATH`, `CUDA_HOME`, and `/usr/local/cuda/include`, or `ASK_CUBLASLT_INCLUDE_DIR` can be explicitly specified. At runtime, `libcublasLt.so.13`, `.12`, or the unversioned name is dynamically loaded, and the library directory must reside in the dynamic loader's search path. `ASK_ENABLE_CUBLASLT=OFF` builds a base Runtime, which raises an error when preparing non-empty matmuls. Public headers for Compiler/Runtime use standard C++ types.
 
-Third-party kernels are compiled by the caller's worker; ASK receives cubin/PTX and launch metadata according to the [protocol](../../schemas/). FugaTensor provides a Triton worker; for environment configuration, see [FugaTensor Installation](../../../fugatensor/docs/en/install.md).
+Third-party kernels are compiled by the caller's worker; ASK receives cubin/PTX and launch metadata according to the [protocol](../../schemas/).
 
 <a id="framework-install"></a>
 
-## 5. Integrating with FugaTensor
+## 5. Packaging Shared Libraries in Downstream Projects
 
-Install the ASK SDK first, then pass it to the FugaTensor build via `CMAKE_PREFIX_PATH`. FugaTensor's nanobind extension links against `ASK::Compiler` and `ASK::Runtime`, and the wheel bundles these two shared libraries, the Host OpenBLAS library, and their licenses.
-
-FugaTensor's `pure` / `all` options determine whether pip installs Triton. For installation commands and CUDA tool configuration, see [FugaTensor Installation](../../../fugatensor/docs/en/install.md#installation-variants).
+Install the ASK SDK first, then pass its prefix to downstream framework builds via `CMAKE_PREFIX_PATH`. Downstream native bindings link against `ASK::Compiler` and `ASK::Runtime`; distributable packages bundling ASK should include these two shared libraries alongside `libask_openblas.so.0` and the OpenBLAS license.

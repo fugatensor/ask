@@ -26,8 +26,6 @@ ask/
 └── docs/                 # Documentation for interfaces, architecture, and engineering
 ```
 
-FugaTensor's `cpp/` bindings link against ASK; graph transformations, worker invocations, disk caching, and compilation package validations reside in `src/fugatensor/_ask/`.
-
 `.deps/`, `build/`, `dist/`, virtual environments, and caches are excluded from version control; `cmake/*.lock.json` and dependency fetching scripts are retained.
 
 <a id="ctest-targets"></a>
@@ -61,13 +59,9 @@ GPU tests require an available driver and device; missing devices when enabled a
 
 <a id="matrix-and-reference"></a>
 
-## 3. FugaTensor Integration and End-to-End Verification
+## 3. Matrix Generation and Reference Coverage
 
-[FugaTensor](../../../fugatensor/README.md) serves as the recommended integration example: constructing graphs from the [Tensor API](../../../fugatensor/docs/en/API/README.md), differentiating in Fuga IR, and passing down to ASK for compilation and dispatch via [Native Bindings](../../../fugatensor/docs/en/architecture/backend.md).
-
-FugaTensor's end-to-end tests cover graph semantics, caching, CPU/CUDA numerical correctness, external kernels, and multi-step plans. Base API tests generate operator combinations from the registry crossed with precision, shape, and differentiation order; CAI contracts independently cross dtypes, shapes, and layouts; for execution and filtering, see [Testing Matrix](../../../fugatensor/docs/en/testing.md).
-
-Numerical references use Python arbitrary-precision integers, covering single-step RNE, subnormals, integer wraparound, saturating casts, large integers, negative zero, infinity, NaN, and non-full tail tiles. New combinations reuse this reference and `plan_matrix`. External algorithmic formulas are tested by producers, while the ASK side verifies ABIs, resource lifetimes, and step connectivity.
+Native C++ test suites use generative matrices in `tests/cpp/support/` (`primitive_graphs.h`, `plan_matrix.h`, `graph_matrix.h`) alongside independent reference checks covering single-step RNE, subnormals, integer wraparound, saturating casts, negative zero, infinity, NaN, and non-full tail tiles. New combinations reuse these generators and `plan_matrix`. External algorithmic formulas are tested by callers/producers, while the ASK side verifies ABIs, resource lifetimes, and step connectivity.
 
 <a id="continuous-integration"></a>
 
@@ -84,4 +78,4 @@ cmake -S tests/cpp -B /path/to/runtime-consumer -G Ninja \
 cmake --build /path/to/runtime-consumer
 ```
 
-`ASK_TEST_COMPONENT` accepts `Compiler` (default), `Runtime`, or `Core`. Runtime can be built in CPU environments, requiring a GPU only during test execution; `ASK_TEST_CUBLASLT=ON` adds matrix multiplication verification for installed packages. FugaTensor independently verifies wheel bindings, shared library packaging, and isolated installations.
+`ASK_TEST_COMPONENT` accepts `Compiler` (default), `Runtime`, or `Core`. Runtime can be built in CPU environments, requiring a GPU only during test execution; `ASK_TEST_CUBLASLT=ON` adds matrix multiplication verification for installed packages.

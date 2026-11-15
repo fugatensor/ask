@@ -19,9 +19,9 @@ ASK is a C++ compiler and runtime for tensor frameworks. It ingests static MLIR 
 - **Execution Plans**: The ASK Pass statically verifies buffer slot mappings and caches valid plans at prepare time; execution reuses argument templates, scratch workspaces, and completion events with full CUDA Graph replay support.
 - **External Kernels**: Connected via device buffers as decoupled steps, supporting multiple inputs, multiple outputs, pointer arguments, and by-value scalars.
 
-The project provides a C++ SDK and the `ask-opt` utility. The Compiler SDK features named compilation options and stage-segregated results, returning execution plans, ABIs, artifacts, and diagnostics independently. [FugaTensor](../fugatensor/README.md) builds on ASK to deliver Python APIs, automatic graph construction, differentiation, and external compiler adapters.
+The project provides a C++ SDK and the `ask-opt` utility. The Compiler SDK features named compilation options and stage-segregated results, returning execution plans, ABIs, artifacts, and diagnostics independently.
 
-For interfaces, see [User API](docs/en/api.md); for architectural principles, see [Core Concepts](docs/en/concepts.md). For end-to-end integration examples, refer to FugaTensor's [Tensor API](../fugatensor/docs/en/API/README.md) and [Lowering, Native Bindings & Execution](../fugatensor/docs/en/architecture/backend.md).
+For interfaces, see [User API](docs/en/api.md); for architectural principles, see [Core Concepts](docs/en/concepts.md); for external compiler integration, see [External Worker Protocol](docs/en/compilers.md).
 
 ## Build, Install and Verification
 
@@ -56,8 +56,6 @@ ctest --preset core --output-on-failure
 ```
 
 Default CTest runs `ask-core`, `ask-compiler`, `ask-pass`, `ask-primitives`, and `ask-host-blas`; enabling GPU adds `ask-runtime`, and enabling cuBLASLt adds `ask-matmul`. C++ source and SDK consumer tests reside in `tests/`; see [Testing Infrastructure](docs/en/testing.md).
-
-FugaTensor's [End-to-End Tests](../fugatensor/docs/en/testing.md) validate graph lowering, numerics, autograd, and external kernel scheduling.
 
 ## License
 

@@ -30,7 +30,7 @@ matmul 前连续的末两轴转置在融合开启时被吸收到 `transpose_a` /
 
 - **共享循环生成**：按 `fusion_groups` 将同形状的逐元素链合并到同一个 `i64` 线性下标循环中，逐元素中间值保留在 LLVM SSA 寄存器；0-D 张量有一个元素，空输出直接结束对应计算。
 - **索引和归约**：reshape 复用线性下标，broadcast 与 transpose 映射到输入下标；归约生成内层循环。共享的 `ScalarEmitter` 为 Host/CUDA 生成这些表达式；跨 kernel 边界或公开输出写入缓冲区。
-- **C ABI**：生成函数与 MLIR `func.func` 同名。参数依次为全部输入、全部输出：标量输入按值传递，张量输入和所有输出使用指针。输出指针带 `noalias`，须与所有输入及其它输出缓冲区不重叠；输入之间可共享存储。`abiJSON` 的 `functions` 中各函数的 `inputs` / `outputs` 给出 `kind`、`shape`、`dtype`、`element_bytes` 与物理参数序号，上层（如 [FugaTensor 的 `HostBackend`](../../../fugatensor/docs/zh/architecture/backend.md#host-backend)）据此分配缓冲区，按 `abiJSON.link_libraries` 从 capabilities 的 `host_link_libraries` 取得库路径，交给系统链接器并设置加载路径，再调用导出的 C ABI 函数。
+- **C ABI**：生成函数与 MLIR `func.func` 同名。参数依次为全部输入、全部输出：标量输入按值传递，张量输入和所有输出使用指针。输出指针带 `noalias`，须与所有输入及其它输出缓冲区不重叠；输入之间可共享存储。`abiJSON` 的 `functions` 中各函数的 `inputs` / `outputs` 给出 `kind`、`shape`、`dtype`、`element_bytes` 与物理参数序号，上层调用方据此分配缓冲区，按 `abiJSON.link_libraries` 从 capabilities 的 `host_link_libraries` 取得库路径，交给系统链接器并设置加载路径，再调用导出的 C ABI 函数。
 - **Host 类型**：CPU 代码生成支持 `bool/i32/i64/f32/f16`，在图优化前静态校验类型。`--capabilities` 的 `host_supported_element_types` 给出可用类型。
 - **f32 矩阵乘法**：每个批次调用单线程 OpenBLAS SGEMM。M/N/K、转置、leading dimension、alpha=1 和 beta=0 在编译期固定，矩阵尺寸按 LP64 范围校验。连续输入直接传指针，末两轴转置转换为库参数，输入侧逐元素计算融合后物化；结果写入公开输出或现有临时槽位，后续逐元素链继续融合。K=0 生成零填充，空输出跳过计算。库算法采用 f32 运算并决定累加顺序。
 - **f16 矩阵乘法**：在每个批次内按 4 行 × 16 列生成 f32 向量累加，四行共享 B 的读取，每个输出沿 K 次序执行独立乘法与加法，最终舍入为 f16。尾行和尾列由静态形状决定。
@@ -44,7 +44,7 @@ matmul 前连续的末两轴转置在融合开启时被吸收到 `transpose_a` /
 
 ## 3. 自有 CUDA 降级（`lib/Lowering/CUDA.cpp`）
 
-自有 GPU 图通过 `ask::compiler::codegen` 降级，选项指定 `CodegenTarget::CUDALLVM` 和目标 `architecture`，例如 `86`。结果的 `ir` 返回 LLVM 文本，`cudaArtifactJSON` 返回 CUDA 产物契约。调用方用 `llc` / `ptxas` 生成 PTX 和 cubin，并在编译缓存中记录 Compiler 共享库或所选 CLI 的文件摘要。exp/log 产生 `__nv_expf` / `__nv_logf` 引用；调用方先用匹配的 `llvm-link` 链接 CUDA Toolkit 的 `nvvm/libdevice/libdevice.10.bc`。FugaTensor 将链接工具及 libdevice 摘要纳入产物缓存。
+自有 GPU 图通过 `ask::compiler::codegen` 降级，选项指定 `CodegenTarget::CUDALLVM` 和目标 `architecture`，例如 `86`。结果的 `ir` 返回 LLVM 文本，`cudaArtifactJSON` 返回 CUDA 产物契约。调用方用 `llc` / `ptxas` 生成 PTX 和 cubin，并在编译缓存中记录 Compiler 共享库或所选 CLI 的文件摘要。exp/log 产生 `__nv_expf` / `__nv_logf` 引用；调用方先用匹配的 `llvm-link` 链接 CUDA Toolkit 的 `nvvm/libdevice/libdevice.10.bc`。调用方应将链接工具及 libdevice 摘要纳入产物缓存键。
 
 - **NVPTX 原生 LLVM IR**：生成 `target triple = "nvptx64-nvidia-cuda"` 模块与 `define ptx_kernel void @<entry>(...)`，使用 `addrspace(1)` 全局显存指针。
 - **64 位 grid-stride 循环**：读取 `@llvm.nvvm.read.ptx.sreg.{ctaid,tid}.x` 后扩展为 `i64`，按固定 block size 计算起始下标。grid 的 x 维最多为 65535；线程调度的步长为 `grid.x * block_size`，warp 调度的步长再除以 32。混合输出组共用满足各组需求的 grid。

@@ -12,7 +12,7 @@ Each `ask.external` corresponds to an independent kernel. Callers generate cubin
 
 For example, `P: t = x + 1 → F: external kernel → Q: y = u + 3` forms three steps. Intermediate results `t` and `u` remain in device buffers, accessed via pointers in subsequent steps. CUDA Graph replay is used to reduce submission overhead for these steps.
 
-ASK is responsible for request and artifact protocols, graph partitioning, ABI checks, and device scheduling. Callers are responsible for launching workers, selecting compiler versions, parsing artifacts, and disk caching. FugaTensor's corresponding code resides in `src/fugatensor/_ask/`, and its Triton compilation code is in [`_triton_worker.py`](../../../fugatensor/src/fugatensor/_triton_worker.py).
+ASK is responsible for request and artifact protocols, graph partitioning, ABI checks, and device scheduling. Callers are responsible for launching workers, selecting compiler versions, parsing artifacts, and disk caching.
 
 <a id="binary-artifact"></a>
 
@@ -34,6 +34,6 @@ The launch interface uses standard pointers and standard CUDA kernels, with empt
 
 `ask.implementation.compiler` serves as the key for callers to select a worker. Workers can be standalone executables or scripts executed by a designated Python interpreter.
 
-FugaTensor provides a Triton worker; for its configuration, see [Upstream Execution Guide](../../../fugatensor/docs/en/architecture/backend.md#cuda-and-triton). Other frameworks can implement the same [Request/Response Protocol](compilers.md).
+Callers implement workers for their target DSLs according to the [Request/Response Protocol](compilers.md).
 
 External steps use the worker's compilation environment; owned steps in hybrid graphs are compiled by the caller running `llc` / `ptxas`. Missing workers, invalid requests, compilation failures, corrupted artifacts, and ABI mismatches must all trigger errors.

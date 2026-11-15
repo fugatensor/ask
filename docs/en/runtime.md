@@ -1,8 +1,8 @@
-Back to Core Concepts: [Resident Runtime and Caching](concepts.md#ask-runtime-cache) · Related details: [External Artifacts and Execution Interface](artifacts.md) · [Graph Optimization and Native Code Generation](codegen.md) · [FugaTensor Multi-Backend Execution](../../../fugatensor/docs/en/architecture/backend.md)
+Back to Core Concepts: [Resident Runtime and Caching](concepts.md#ask-runtime-cache) · Related details: [External Artifacts and Execution Interface](artifacts.md) · [Graph Optimization and Native Code Generation](codegen.md)
 
 # Resident Runtime and Multi-Level Caching
 
-`ASK::Runtime` manages execution plans, device buffers, streams, completion events, and Graph replay. FugaTensor is responsible for Python APIs, tensor descriptors, lifetimes of external Python objects, and on-disk compilation caching.
+`ASK::Runtime` manages execution plans, device buffers, streams, completion events, and Graph replay. Callers are responsible for frontend APIs, tensor descriptors, lifetimes of external host objects, and on-disk compilation caching.
 
 <a id="execution-session"></a>
 
@@ -24,7 +24,7 @@ For C++ invocation examples, see [Native Session and Plan Execution](api.md#exec
 
 `DeviceBuffer::copyFromHost(pointer, nbytes)` and `copyToHost(pointer, nbytes)` perform batch copies of contiguous memory; `copyToHost()` returning a byte string is also provided. Copies proceed on raw bytes with lengths matching strictly, waiting for session stream completion before returning.
 
-When borrowing external memory, callers must retain the actual storage owner until GPU usage finishes. FugaTensor's binding layer parses CUDA Array Interface, verifies shape/dtype/contiguity, preserves Python owners, and invokes `waitForExternalStream` to await producer streams. For exchange interfaces, see [FugaTensor Tensor and Data Exchange](../../../fugatensor/docs/en/API/tensor.md).
+When borrowing external memory, callers must retain the actual storage owner until GPU usage finishes, verifying shape, dtype, and contiguity in their binding layer and invoking `waitForExternalStream` to await producer streams.
 
 Before external producers re-access the same storage, they must await ASK's completion event or establish equivalent stream dependencies.
 
@@ -43,7 +43,7 @@ Each execution invokes `PreparedProgram::submit(inputs, outputs)`, or uses `run(
 - `Event::query` returns status immediately; `wait`, `Session::synchronize`, and host copies await completion. Closing a session completes inflight work before tearing down resources.
 - Single-kernel and multi-kernel executions use the identical plan mechanism. On launch failure, the runtime waits for queued steps to finish before propagating errors; device writes are not rolled back.
 
-Querying, waiting, and session operations reclaim completed resources. Events retain C++ objects, while FugaTensor bindings separately retain external Python owners until completion.
+Querying, waiting, and session operations reclaim completed resources. Events retain C++ objects, while caller bindings separately retain any external host owners until completion.
 
 <a id="cuda-graph"></a>
 
@@ -57,17 +57,17 @@ Each workspace creates and instantiates a graph upon initial execution; upon reu
 
 Zero-step aliased plans record only stream completion events. Exceptions are thrown if the driver lacks required Graph APIs or if instantiation, updates, or launches fail.
 
-`Session::stats()` provides counters including `program_submissions`, `workspace_reuses`, `allocation_reuses`, `event_creations/event_reuses`, and `graph_instantiations/graph_launches`. `launches` denotes submitted plan steps (a library step may encompass multiple CUDA kernels internally), while Graph submissions are tallied separately. FugaTensor's CUDA JIT uses graph mode via its native bridge. `matmul_preparations` tracks library algorithm preparations; `resident_device_bytes` / `peak_resident_device_bytes` track current and peak VRAM actually allocated by ASK including allocation pools, while external borrowings and driver/library internal storage are accounted for by their respective owners.
+`Session::stats()` provides counters including `program_submissions`, `workspace_reuses`, `allocation_reuses`, `event_creations/event_reuses`, and `graph_instantiations/graph_launches`. `launches` denotes submitted plan steps (a library step may encompass multiple CUDA kernels internally), while Graph submissions are tallied separately. `matmul_preparations` tracks library algorithm preparations; `resident_device_bytes` / `peak_resident_device_bytes` track current and peak VRAM actually allocated by ASK including allocation pools, while external borrowings and driver/library internal storage are accounted for by their respective owners.
 
 `graph_nodes` / `graph_edges` accumulate top-level nodes and dependency edges of instantiated Graphs, with cuBLASLt subgraphs counted as a single top-level node. `prepared_internal_slots` / `prepared_internal_bytes` accumulate slot counts and capacities of a single internal workspace across successfully prepared plans, including library scratch; actual resident volume varies with inflight workspaces and allocation pools.
 
-For Graph replay, TF32, and submission mechanisms of matrix multiplication, see [FugaTensor Arithmetic Operations](../../../fugatensor/docs/en/API/ops.md#matmul).
+For matrix multiplication plan APIs and semantics, see [Matrix Multiplication Plans](api.md#matmul-api) and [Matrix Multiplication](ir.md#matmul-semantics).
 
 <a id="two-tier-cache"></a>
 
 ## 5. Caller Compilation Cache and Native Runtime Cache
 
-FugaTensor's `_ask` integration layer maintains the following on-disk caches, delivering bytes and plans to ASK after verifying artifacts:
+Callers implementing on-disk compilation caches typically organize them into the following tiers, delivering validated bytes and plans to ASK:
 
 | Cache | Skipped on Hit | Primary Inputs to Key |
 | --- | --- | --- |
@@ -75,6 +75,6 @@ FugaTensor's `_ask` integration layer maintains the following on-disk caches, de
 | Owned cubin | `llc` and `ptxas` | LLVM IR, artifact descriptor, tooling and environment digest |
 | External Artifact | Worker compilation | Normalized request, probe result, worker/interpreter, dependencies and environment digest |
 
-External caches store cubin or raw PTX, probing producers before lookup and re-checking dependencies after compilation. Caching uses locks, temporary directories, and atomic publication, checking manifests, lengths, and SHA-256 upon reading. For invalidation rules, see [FugaTensor Cache Division](../../../fugatensor/docs/en/architecture/backend.md#cache-hierarchy) and [Worker Cache Identity](compilers.md#cache-identity).
+External caches store cubin or raw PTX, probing producers before lookup and re-checking dependencies after compilation. Caching uses locks, temporary directories, and atomic publication, checking manifests, lengths, and SHA-256 upon reading; see [Worker Cache Identity](compilers.md#cache-identity).
 
 ASK caches successful verifications during plan preparation, while sessions cache resident modules, workspaces, device memory, and events. For keys and capacities of verification caches, see [Successful Verification Cache](verification.md#proof-cache).
