@@ -25,8 +25,18 @@ Only two classes of symbol declarations and single-block `func.func` computation
 | `ask.cast` | Inside `func.func` | Converts element type while preserving shape; supports all 6×6 directions. |
 | `ask.reshape` | Inside `func.func` | Changes tensor shape while preserving element type, total count, and contiguous row-major order; supports 0-D and empty tensors. |
 | `ask.broadcast_in_dim` / `ask.transpose` | Inside `func.func` | Explicitly expands dimensions or permutes axes while preserving element type. |
-| `ask.reduce_sum` / `ask.reduce_max` | Inside `func.func` | Reduces along specified axes, removing them. |
+| `ask.iota` | Inside `func.func` | Generates coordinate indices `0, 1, ...` along `dimension` for the target numeric tensor type. |
+| `ask.slice` / `ask.pad` / `ask.concatenate` | Inside `func.func` | Slices with strided/reverse steps, pads borders and `interior` gaps with a 0-D value, or joins operands along `axis`. |
+| `ask.gather` / `ask.scatter_add` | Inside `func.func` | Indexed read along `axis`, or initializes output from `base` and accumulates `updates` at `indices` along `axis` (bounds-checked). |
+| `ask.reduce_sum` / `ask.reduce_max` / `ask.reduce_min` / `ask.reduce_prod` | Inside `func.func` | Numeric reductions along specified axes, removing them. |
+| `ask.reduce_any` / `ask.reduce_all` | Inside `func.func` | Boolean (`bool`) reductions along specified axes, removing them. |
+| `ask.argmax` / `ask.argmin` | Inside `func.func` | Returns `i64` index of the first extremum (or first NaN) along a non-empty `axis`, removing that axis. |
 | `ask.div` / `ask.exp` / `ask.log` / `ask.sqrt` | Inside `func.func` | Elementwise floating-point computation on identical types. |
+| `ask.sin` / `ask.cos` / `ask.tanh` / `ask.erf` / `ask.floor` / `ask.ceil` / `ask.round` | Inside `func.func` | Floating-point transcendental and rounding operations (round half-to-even). |
+| `ask.abs` / `ask.pow` / `ask.floordiv` / `ask.mod` | Inside `func.func` | Elementwise magnitude, power, floored division, and remainder on numeric types (`i32`/`i64`/`f32`/`f16`/`bf16`). |
+| `ask.maximum` / `ask.minimum` | Inside `func.func` | Elementwise maximum/minimum across all 6 element types; floats propagate NaN. |
+| `ask.bitwise_not` / `ask.bitwise_and` / `ask.bitwise_or` / `ask.bitwise_xor` | Inside `func.func` | Elementwise bitwise logic on `bool`, `i32`, and `i64`. |
+| `ask.shift_left` / `ask.shift_right` | Inside `func.func` | Bitwise shifts on `i32`/`i64`; out-of-range shift counts return deterministic saturation values without hardware UB. |
 | `ask.compare` / `ask.select` | Inside `func.func` | Comparison produces a bool tensor of identical shape; select picks values of identical shape and type based on a bool condition. |
 | `ask.matmul` | Inside `func.func` | Multiplies contiguous matrices or batched matrices; CUDA uses cuBLASLt. |
 | `ask.mark` | Inside `func.func` | Tracing passthrough marker recording logical value identity (`value_id`) or port binding (`port_id`), erased after extraction in `prepare`. |
@@ -56,13 +66,15 @@ Each graph function uses a single basic block; upper-level frameworks unroll fun
 
 `transpose`'s `permutation` lists the input axes corresponding to each output axis. Reduction `axes` are strictly ascending and unique, and the specified axes are removed in the result; when all axes are removed, the result is a scalar, which can be expanded using `splat` or `broadcast_in_dim`. An empty axis list for a positive-rank tensor preserves original values.
 
-`reduce_sum` supports warp shuffles and instruction-parallel tree-reduction accumulations without strictly enforcing sequential IEEE-754 accumulation order; integers wrap around, and empty domains evaluate to zero. When f32 accumulation is needed, perform `cast` first. `reduce_max` accepts integers and floats, propagates NaN, distinguishes positive and negative zero, and requires non-empty reduction domains.
+`reduce_sum` and `reduce_prod` support warp shuffles and tree-reduction accumulations without strictly enforcing sequential IEEE-754 accumulation order; integers wrap around, and empty domains evaluate to `0` (`reduce_sum`) or `1` (`reduce_prod`). When f32 accumulation is needed, perform `cast` first. `reduce_max` and `reduce_min` accept all six element types (ordered as signed integers / IEEE floats), propagate NaN, distinguish positive and negative zero, and require non-empty reduction domains. `reduce_any` / `reduce_all` reduce `bool` operands, yielding `false` / `true` on empty domains. `argmax` / `argmin` require rank >= 1 and non-empty reduction axes, returning `i64` first-occurrence indices (propagating the first `NaN` for floats).
+
+`slice` supports positive and negative steps with normalized bounds (`stop == -1` allowed for negative steps down to index `0`; `start == stop` denotes an empty extent). `pad` takes non-negative `pad_low`, `pad_high`, and `interior` dilations plus a 0-D `pad_value` matching the input dtype. `gather` and `scatter_add` validate axis and matching non-axis shapes, silently skipping out-of-bounds indices (or returning zeros for OOB reads in `gather`).
 
 <a id="elementwise-primitives"></a>
 
-## Floating-Point Arithmetic and Conditional Selection
+## Floating-Point, Integer, and Bitwise Computation
 
-`div`, `exp`, `log`, and `sqrt` accept f32/f16/bf16; low-precision transcendental functions are first widened to f32, then rounded back to their original type using RNE. CUDA exp/log uses NVIDIA libdevice. Comparison `predicate` values are `eq`, `ne`, `lt`, `le`, `gt`, or `ge`; floating-point NaN satisfies only `ne`. All three operands of `select(condition, yes, no)` share identical shapes, the condition is bool, and both branches share identical types.
+`div`, `exp`, `log`, `sqrt`, `sin`, `cos`, `tanh`, `erf`, `floor`, `ceil`, and `round` accept f32/f16/bf16 (`round` uses ties-to-even); low-precision math functions are first widened to f32, then rounded back to their original type using RNE. CUDA uses NVIDIA libdevice (`__nv_*`). `pow`, `floordiv`, `mod`, and `abs` additionally accept `i32`/`i64` with explicit edge-case definitions (integer divide/mod by 0 returns 0, `INT_MIN // -1` wraps, `INT_MIN % -1` is 0; float `floordiv`/`mod` use floored division semantics). `shift_left`/`shift_right` are defined for all shift counts on `i32`/`i64` (negative shifts give `0`; right shifts by `>= width` sign-extend `-1` or `0`, left shifts give `0`). Comparison `predicate` values are `eq`, `ne`, `lt`, `le`, `gt`, or `ge`; floating-point NaN satisfies only `ne`. All three operands of `select(condition, yes, no)` share identical shapes, the condition is bool, and both branches share identical types.
 
 Adjacent elementwise operations are executed by shared loops, with broadcast and transpose mappings reading indices. For concrete materialization boundaries, see [Graph Partitioning](partitioning.md#partition-boundaries).
 

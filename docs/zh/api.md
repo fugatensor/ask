@@ -138,7 +138,7 @@ outputs.front()->copyToHost(result, sizeof(result));
 
 `load(binary, entry, requiredTypes, arch, parameterWidths)` 按产物内容和入口复用模块。`requiredTypes` 声明使用的基础类型，`arch` 是编译目标。`parameterWidths` 按物理参数顺序填写：指针（含 null）为 `0`，按值标量为 ABI 字节数 `1/2/4/8`。加载时核对驱动报告的参数数量、宽度和偏移。
 
-`PlanStep` 保存 `kernel`、`arguments`、三维 `grid/block`、`sharedBytes` 和逻辑输入输出索引。`PlanArgument.buffer` 指向计划的缓冲区表，`-1` 表示 null；`scalar` 保存冻结的标量 ABI 字节。修改标量或启动配置时准备新程序。
+`PlanStep` 保存 `kernel`、`arguments`、三维 `grid/block`、`sharedBytes`、逻辑 `inputs`/`outputs` 索引，以及可选的 `preCopy`（`CopyDescription{sourceBuffer, destinationBuffer}`，在启动前将 `base` 输入拷贝到累加输出；`ask.scatter_add` 的 `cuda_lowering.pre_copy` 会输出该信息）。`PlanArgument.buffer` 指向计划的缓冲区表，`-1` 表示 null；`scalar` 保存冻结的标量 ABI 字节。修改标量或启动配置时准备新程序。
 
 公开输入允许共享存储。不同逻辑输出须与其它公开端口分离；重复输出或输入别名须绑定同一存储。每次提交核对实际缓冲区的设备、字节数、可写性和别名。内部槽位的容量和生存期在准备阶段由 [ASK PASS](verification.md) 验证。
 

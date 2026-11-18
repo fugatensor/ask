@@ -191,6 +191,152 @@ void cudaReductionMatrix() {
   std::cout << "CUDA reduction schedule matrix: " << cases << " cases\n";
 }
 }
+static void stage2Tests(bool host) {
+  using namespace ask::compiler;
+  const auto checkIR = [&](const std::string &mlir) {
+    (void)prepare(mlir, {true, {}});
+    compile(mlir, host);
+  };
+  CodegenOptions cudaOpts;
+  cudaOpts.target = CodegenTarget::CUDALLVM;
+  cudaOpts.architecture = 86;
+  cudaOpts.blockSize = 128;
+
+  // Unary/binary float & int math + bitwise + shifts + iota
+  checkIR(R"(
+    module {
+      func.func @main(%x: tensor<2x4xf32>, %y: tensor<2x4xf32>) -> tensor<2x4xf32> {
+        %0 = "ask.sin"(%x) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %1 = "ask.cos"(%y) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %2 = "ask.tanh"(%0) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %3 = "ask.erf"(%1) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %4 = "ask.abs"(%2) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %5 = "ask.floor"(%3) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %6 = "ask.ceil"(%4) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %7 = "ask.round"(%5) : (tensor<2x4xf32>) -> tensor<2x4xf32>
+        %8 = "ask.pow"(%6, %7) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+        %9 = "ask.maximum"(%8, %x) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+        %10 = "ask.minimum"(%9, %y) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+        %11 = "ask.floordiv"(%10, %y) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+        %12 = "ask.mod"(%11, %y) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+        %13 = "ask.iota"() {dimension = 1 : i64} : () -> tensor<2x4xf32>
+        %14 = "ask.add"(%12, %13) : (tensor<2x4xf32>, tensor<2x4xf32>) -> tensor<2x4xf32>
+        return %14 : tensor<2x4xf32>
+      }
+    }
+  )");
+  checkIR(R"(
+    module {
+      func.func @main(%a: tensor<4xi32>, %b: tensor<4xi32>) -> tensor<4xi32> {
+        %0 = "ask.abs"(%a) : (tensor<4xi32>) -> tensor<4xi32>
+        %1 = "ask.floordiv"(%0, %b) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        %2 = "ask.mod"(%1, %b) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        %3 = "ask.pow"(%2, %b) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        %4 = "ask.bitwise_and"(%3, %b) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        %5 = "ask.bitwise_or"(%4, %a) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        %6 = "ask.bitwise_xor"(%5, %b) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        %7 = "ask.bitwise_not"(%6) : (tensor<4xi32>) -> tensor<4xi32>
+        %8 = "ask.shift_left"(%7, %b) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        %9 = "ask.shift_right"(%8, %b) : (tensor<4xi32>, tensor<4xi32>) -> tensor<4xi32>
+        return %9 : tensor<4xi32>
+      }
+    }
+  )");
+  // Slice (negative step), Pad (interior), Concatenate, Gather, Argmax/Argmin, Boolean/Prod/Min reductions
+  checkIR(R"(
+    module {
+      func.func @main(%x: tensor<4x5xf32>, %p: f32, %idx: tensor<3xi64>, %flag: tensor<2x3xi1>)
+          -> (tensor<2x3xf32>, tensor<1x3xf32>, tensor<5xi64>, tensor<2xi1>) {
+        %0 = "ask.slice"(%x) {starts = array<i64: 3, 1>, stops = array<i64: -1, 4>, steps = array<i64: -2, 1>}
+            : (tensor<4x5xf32>) -> tensor<2x3xf32>
+        %1 = "ask.pad"(%x, %p) {pad_low = array<i64: 1, 0>, pad_high = array<i64: 0, 1>, interior = array<i64: 1, 0>}
+            : (tensor<4x5xf32>, f32) -> tensor<8x6xf32>
+        %2 = "ask.reduce_min"(%1) {axes = array<i64: 0>} : (tensor<8x6xf32>) -> tensor<6xf32>
+        %3 = "ask.reduce_prod"(%0) {axes = array<i64: 0>} : (tensor<2x3xf32>) -> tensor<3xf32>
+        %4 = "ask.reshape"(%3) {shape = array<i64: 1, 3>} : (tensor<3xf32>) -> tensor<1x3xf32>
+        %5 = "ask.gather"(%x, %idx) {axis = 1 : i64} : (tensor<4x5xf32>, tensor<3xi64>) -> tensor<4x3xf32>
+        %6 = "ask.concatenate"(%0, %5) {axis = 0 : i64} : (tensor<2x3xf32>, tensor<4x3xf32>) -> tensor<6x3xf32>
+        %7 = "ask.slice"(%6) {starts = array<i64: 0, 0>, stops = array<i64: 1, 3>, steps = array<i64: 1, 1>}
+            : (tensor<6x3xf32>) -> tensor<1x3xf32>
+        %8 = "ask.add"(%4, %7) : (tensor<1x3xf32>, tensor<1x3xf32>) -> tensor<1x3xf32>
+        %9 = "ask.argmax"(%x) {axis = 0 : i64} : (tensor<4x5xf32>) -> tensor<5xi64>
+        %10 = "ask.reduce_any"(%flag) {axes = array<i64: 1>} : (tensor<2x3xi1>) -> tensor<2xi1>
+        return %0, %8, %9, %10 : tensor<2x3xf32>, tensor<1x3xf32>, tensor<5xi64>, tensor<2xi1>
+      }
+    }
+  )");
+  // Argmax must not attempt warp shuffle on CUDA; ReduceMin warp reduction uses shuffle.
+  {
+    auto cudaArg = codegen(R"(
+      module {
+        func.func @main(%x: tensor<4x64xf32>) -> tensor<4xi64> {
+          %0 = "ask.argmax"(%x) {axis = 1 : i64} : (tensor<4x64xf32>) -> tensor<4xi64>
+          return %0 : tensor<4xi64>
+        }
+      }
+    )", cudaOpts);
+    require(cudaArg.ir.find("@llvm.nvvm.shfl.sync") == std::string::npos,
+            "argmax must use sequential loop without warp shuffle");
+
+    auto cudaMin = codegen(R"(
+      module {
+        func.func @main(%x: tensor<4x64xf32>) -> tensor<4xf32> {
+          %0 = "ask.reduce_min"(%x) {axes = array<i64: 1>} : (tensor<4x64xf32>) -> tensor<4xf32>
+          return %0 : tensor<4xf32>
+        }
+      }
+    )", cudaOpts);
+    require(cudaMin.ir.find("@llvm.nvvm.shfl.sync") != std::string::npos,
+            "reduce_min should use warp shuffle when domain >= 32");
+  }
+  // ScatterAdd partition isolation & gather reduction materialization
+  {
+    const std::string scatterSrc = R"(
+      module {
+        func.func @main(%b: tensor<4x3xf32>, %idx: tensor<2xi64>, %u: tensor<2x3xf32>) -> tensor<4x3xf32> {
+          %0 = "ask.scatter_add"(%b, %idx, %u) {axis = 0 : i64}
+              : (tensor<4x3xf32>, tensor<2xi64>, tensor<2x3xf32>) -> tensor<4x3xf32>
+          %1 = "ask.abs"(%0) : (tensor<4x3xf32>) -> tensor<4x3xf32>
+          return %1 : tensor<4x3xf32>
+        }
+      }
+    )";
+    auto p = partition(scatterSrc);
+    require(p.stepSources.size() == 2, "scatter_add must stay isolated in its own partition");
+    bool foundAtomic = false;
+    for (const auto &entry : p.stepSources)
+      if (entry.second.find("ask.scatter_add") != std::string::npos)
+        foundAtomic |= codegen(entry.second, cudaOpts).ir.find("atomicrmw fadd") != std::string::npos;
+    require(foundAtomic, "scatter_add CUDA LLVM must emit atomicrmw fadd");
+    if (host) {
+      auto h = codegen(scatterSrc, {});
+      require(h.ir.find("scatter.host.apply") != std::string::npos,
+              "scatter_add Host LLVM lowering failed");
+    }
+    // Gather reading a multi-element reduction must materialize the reduction first.
+    auto gp = partition(R"(
+      module {
+        func.func @main(%x: tensor<4x3xf32>, %idx: tensor<2xi64>) -> tensor<2xf32> {
+          %0 = "ask.reduce_sum"(%x) {axes = array<i64: 1>} : (tensor<4x3xf32>) -> tensor<4xf32>
+          %1 = "ask.gather"(%0, %idx) {axis = 0 : i64} : (tensor<4xf32>, tensor<2xi64>) -> tensor<2xf32>
+          return %1 : tensor<2xf32>
+        }
+      }
+    )");
+    require(gp.stepSources.size() == 2, "gather over reduction must materialize reduction");
+  }
+  // Negative validation cases
+  const auto rejectIR = [](const std::string &mlir) {
+    bool rejected = false;
+    try { (void)prepare(mlir, {}); } catch (const std::exception &) { rejected = true; }
+    require(rejected, "invalid Stage 2 IR unexpectedly passed prepare/verify");
+  };
+  rejectIR(R"(module { func.func @main(%x: tensor<4xi32>) -> tensor<4xi32> { %0 = "ask.sin"(%x) : (tensor<4xi32>) -> tensor<4xi32> return %0 : tensor<4xi32> } })");
+  rejectIR(R"(module { func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> { %0 = "ask.bitwise_not"(%x) : (tensor<4xf32>) -> tensor<4xf32> return %0 : tensor<4xf32> } })");
+  rejectIR(R"(module { func.func @main(%x: tensor<0x4xf32>) -> tensor<4xi64> { %0 = "ask.argmax"(%x) {axis = 0 : i64} : (tensor<0x4xf32>) -> tensor<4xi64> return %0 : tensor<4xi64> } })");
+  rejectIR(R"(module { func.func @main(%x: tensor<4xf32>) -> tensor<4xf32> { %0 = "ask.slice"(%x) {starts = array<i64: 0>, stops = array<i64: 5>, steps = array<i64: 1>} : (tensor<4xf32>) -> tensor<4xf32> return %0 : tensor<4xf32> } })");
+}
+
 int main() {
   try {
     const bool host = ask::compilerCapabilitiesJSON().find("\"host_codegen\":true") != std::string::npos;
@@ -279,6 +425,7 @@ int main() {
             for (const auto &step : plan.stepSources)
               if (step.second.find("\"ask.matmul\"") == std::string::npos) compile(step.second, host);
           }
+    stage2Tests(host);
     std::cout << "primitive shape, fusion, reduction and library partition matrices passed\n";
     return 0;
   } catch (const std::exception &error) {

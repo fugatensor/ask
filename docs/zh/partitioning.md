@@ -58,7 +58,7 @@ CLI 用法是 `ask-opt --partition --report-json plan-report.json graph.mlir`。
 
 切分器按外部节点划分自有区域。例如 `P → F → Q` 生成 `owned → external → owned`。各自有区域可包含多个逐元素算子。matmul 同样形成独立 library 步骤，例如 `mul → matmul → add` 生成 `owned → library → owned`。
 
-广播和转置通过索引参与自有融合。归约与同尺寸消费者可同核执行；归约结果被广播到更大形状时先物化，以免每个输出重复执行归约。跨步骤的归约标量使用 `shape=[]` 的设备缓冲区。
+广播、转置、切片、填充、拼接与下标读取通过索引参与自有融合。`ask.scatter_add` 切分为独立的 `owned` 步骤，使 `base` 先通过步骤前设备拷贝初始化再执行原子累加。归约与同尺寸消费者可同核执行；归约结果在被广播、转置、填充、聚集扩展或供 `matmul`/`gather`/`scatter_add` 消费时先物化，以免重复归约。跨步骤的归约标量使用 `shape=[]` 的设备缓冲区。
 
 external 步骤交给调用方 worker 编译为 cubin/PTX，owned 步骤经 ASK 的 LLVM 管线编译，library 步骤由 Runtime 在准备时选择 cuBLASLt 算法。非法 MLIR、缺失 worker、导出失败、损坏产物和代码生成错误都会使编译失败。
 

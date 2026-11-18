@@ -14,9 +14,9 @@
 
 ASK 是张量框架的 C++ 编译器和运行时。它接收 MLIR `ask` 静态图，生成 CPU/CUDA 代码，并调度自有及第三方 cubin/PTX。
 
-- 类型与数值：Host 使用 `bool`、`i32`、`i64`、`f32`、`f16`；CUDA 另支持 `bf16`（`sm_80+`）。常量按 RNE 舍入，加乘输入须同形状、同类型。
-- 编译与融合：常量折叠、DCE、多输出逐元素融合；Host 生成 `.o`，CUDA 生成 LLVM IR，再由 `llc` / `ptxas` 生成 cubin。
-- 执行计划：ASK PASS 在准备时证明缓冲区槽位映射并缓存成功结果；执行时复用参数模板、工作区和事件，支持 CUDA Graph replay。
+- 类型与数值：Host 使用 `bool`、`i32`、`i64`、`f32`、`f16`；CUDA 另支持 `bf16`（`sm_80+`）。常量按 RNE 舍入，二元逐元素输入须同形状、同类型；原生算子覆盖算术、初等函数、位运算/移位、归约（`sum`/`max`/`min`/`prod`/`any`/`all`/`argmax`/`argmin`）、下标生成、切片、填充、拼接、聚集及原子 `scatter_add`。
+- 编译与融合：常量折叠、DCE、多输出逐元素融合与 CUDA warp 协作归约；Host 生成 `.o`，CUDA 生成 LLVM IR，再由 `llc` / `ptxas` 生成 cubin。
+- 执行计划：ASK PASS 在准备时证明缓冲区槽位映射并缓存成功结果；执行时复用参数模板、工作区、步骤前预拷贝（`preCopy`）和事件，支持 CUDA Graph replay。
 - 外部 kernel：通过设备缓冲区连接独立步骤，支持多输入、多输出、指针和按值标量。
 
 项目提供 C++ SDK 与 `ask-opt`。Compiler SDK 使用具名编译选项和按阶段区分的结果，将执行计划、ABI、产物与诊断分开返回。

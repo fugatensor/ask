@@ -58,7 +58,7 @@ The runtime delegates read port, public output, and internal slot mappings to [A
 
 The partitioner divides native regions along external nodes. For example, `P → F → Q` generates `owned → external → owned`. Each native region may contain multiple elementwise operators. Matmul likewise forms independent library steps; for instance, `mul → matmul → add` generates `owned → library → owned`.
 
-Broadcasting and transposition participate in native fusion via indexing. Reductions and same-sized consumers can execute in the same kernel; when reduction results are broadcast to larger shapes, they are materialized first to avoid repeating reductions for each output. Cross-step reduction scalars use device buffers with `shape=[]`.
+Broadcasting, transposition, slicing, padding, concatenation, and index reads participate in native fusion via indexing. `ask.scatter_add` isolates into its own `owned` step so `base` initializes via pre-step device copy before atomic updates launch. Reductions and same-sized consumers can execute in the same kernel; when reduction results are expanded (broadcast/transpose/padding/gather) or consumed by `matmul`/`gather`/`scatter_add`, they are materialized first to avoid repeating reductions per consumer element. Cross-step reduction scalars use device buffers with `shape=[]`.
 
 `external` steps are handed to caller workers for compilation into cubin/PTX; `owned` steps are compiled through ASK's LLVM pipeline; `library` steps select cuBLASLt algorithms during Runtime preparation. Invalid MLIR, missing workers, export failures, corrupted artifacts, and codegen errors all fail the compilation.
 

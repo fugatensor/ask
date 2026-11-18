@@ -44,6 +44,11 @@ struct MatmulDescription {
   std::size_t workspaceLimit = 32 * 1024 * 1024;
 };
 
+struct CopyDescription {
+  std::size_t source = 0;
+  std::size_t destination = 0;
+};
+
 struct PlanStep {
   std::shared_ptr<Kernel> kernel;
   std::vector<PlanArgument> arguments;
@@ -52,6 +57,8 @@ struct PlanStep {
   std::vector<std::size_t> inputs, outputs;
   // A library step binds inputs={A,B}, outputs={C}; kernel is empty.
   std::optional<MatmulDescription> matmul;
+  // Optional device-to-device copy executed before launching `kernel`.
+  std::optional<CopyDescription> preCopy;
 };
 
 // The primary context is retained, never reset. Each session owns one

@@ -111,24 +111,32 @@ LogicalResult partition(ModuleOp original, llvm::json::Object &report, std::stri
     } else if (auto matmul = dyn_cast<MatmulOp>(operation)) {
       parts.push_back({{&operation}, "library", {}, matmul});
       runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
+    } else if (isa<ScatterAddOp>(operation)) {
+      parts.push_back({{&operation}, "owned", {}, {}});
+      runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
     } else if (runtimeComputed || llvm::any_of(operation.getResults(),
                    [&](Value value) { return publicOutputs.contains(value); })) {
-      if (parts.empty() || parts.back().kind != "owned") parts.emplace_back();
+      if (parts.empty() || parts.back().kind != "owned" ||
+          isa<ScatterAddOp>(parts.back().operations.back()))
+        parts.emplace_back();
       // A reduction can fuse into same-sized consumers. Expanding its result
-      // would repeat the reduction for each expanded element, so materialize
-      // that result once before the broadcast and its elementwise consumers.
+      // (or indexing it via gather) would repeat the reduction across multiple
+      // outputs, so materialize that result first.
       const auto region = parts.size() - 1;
       if (llvm::any_of(operation.getOperands(), [&](Value value) {
             auto found = reductionRegion.find(value);
             return found != reductionRegion.end() && found->second == region &&
-                   elementCount(operation.getResult(0).getType()) > elementCount(value.getType());
+                   (elementCount(operation.getResult(0).getType()) > elementCount(value.getType()) ||
+                    isa<GatherOp>(operation));
           }))
         parts.emplace_back();
       parts.back().operations.push_back(&operation);
       if (runtimeComputed)
         runtimeValues.insert(operation.getResults().begin(), operation.getResults().end());
       const auto current = parts.size() - 1;
-      const bool reducesMultipleElements = isa<ReduceSumOp, ReduceMaxOp>(operation) &&
+      const bool reducesMultipleElements =
+          isa<ReduceSumOp, ReduceMaxOp, ReduceMinOp, ReduceProdOp, ReduceAnyOp,
+              ReduceAllOp, ArgmaxOp, ArgminOp>(operation) &&
           elementCount(operation.getOperand(0).getType()) > elementCount(operation.getResult(0).getType());
       if (reducesMultipleElements ||
           llvm::any_of(operation.getOperands(), [&](Value value) {

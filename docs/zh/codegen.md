@@ -29,7 +29,7 @@ matmul 前连续的末两轴转置在融合开启时被吸收到 `transpose_a` /
 `ask::compiler::codegen(source, options)` 将自有图降级为本机 CPU 代码，默认先优化图。`options.target = CodegenTarget::HostLLVM` 返回 LLVM 文本；`HostObject` 将 `.o` 写入 `options.outputPath`。两种模式均通过结果的 `abiJSON` 返回端口契约，调用方负责链接和加载。[C++ 编译接口](api.md#compiler-api)与 `ask-opt --emit-llvm` / `--emit-object` 共用 `ask::codegenSource`：
 
 - **共享循环生成**：按 `fusion_groups` 将同形状的逐元素链合并到同一个 `i64` 线性下标循环中，逐元素中间值保留在 LLVM SSA 寄存器；0-D 张量有一个元素，空输出直接结束对应计算。
-- **索引和归约**：reshape 复用线性下标，broadcast 与 transpose 映射到输入下标；归约生成内层循环。共享的 `ScalarEmitter` 为 Host/CUDA 生成这些表达式；跨 kernel 边界或公开输出写入缓冲区。
+- **索引、归约与散布累加**：reshape 复用线性下标，broadcast、transpose、slice、pad、concatenate、iota 与 gather 通过 `ScalarEmitter` 映射索引或生成边界保护；归约生成内层循环。`ask.scatter_add` 终止逐元素融合，在 Host 侧按两阶段生成（先拷贝 `base`，再带越界检查累加 `updates`）；跨 kernel 边界或公开输出写入缓冲区。
 - **C ABI**：生成函数与 MLIR `func.func` 同名。参数依次为全部输入、全部输出：标量输入按值传递，张量输入和所有输出使用指针。输出指针带 `noalias`，须与所有输入及其它输出缓冲区不重叠；输入之间可共享存储。`abiJSON` 的 `functions` 中各函数的 `inputs` / `outputs` 给出 `kind`、`shape`、`dtype`、`element_bytes` 与物理参数序号，上层调用方据此分配缓冲区，按 `abiJSON.link_libraries` 从 capabilities 的 `host_link_libraries` 取得库路径，交给系统链接器并设置加载路径，再调用导出的 C ABI 函数。
 - **Host 类型**：CPU 代码生成支持 `bool/i32/i64/f32/f16`，在图优化前静态校验类型。`--capabilities` 的 `host_supported_element_types` 给出可用类型。
 - **f32 矩阵乘法**：每个批次调用单线程 OpenBLAS SGEMM。M/N/K、转置、leading dimension、alpha=1 和 beta=0 在编译期固定，矩阵尺寸按 LP64 范围校验。连续输入直接传指针，末两轴转置转换为库参数，输入侧逐元素计算融合后物化；结果写入公开输出或现有临时槽位，后续逐元素链继续融合。K=0 生成零填充，空输出跳过计算。库算法采用 f32 运算并决定累加顺序。
@@ -44,11 +44,12 @@ matmul 前连续的末两轴转置在融合开启时被吸收到 `transpose_a` /
 
 ## 3. 自有 CUDA 降级（`lib/Lowering/CUDA.cpp`）
 
-自有 GPU 图通过 `ask::compiler::codegen` 降级，选项指定 `CodegenTarget::CUDALLVM` 和目标 `architecture`，例如 `86`。结果的 `ir` 返回 LLVM 文本，`cudaArtifactJSON` 返回 CUDA 产物契约。调用方用 `llc` / `ptxas` 生成 PTX 和 cubin，并在编译缓存中记录 Compiler 共享库或所选 CLI 的文件摘要。exp/log 产生 `__nv_expf` / `__nv_logf` 引用；调用方先用匹配的 `llvm-link` 链接 CUDA Toolkit 的 `nvvm/libdevice/libdevice.10.bc`。调用方应将链接工具及 libdevice 摘要纳入产物缓存键。
+自有 GPU 图通过 `ask::compiler::codegen` 降级，选项指定 `CodegenTarget::CUDALLVM` 和目标 `architecture`，例如 `86`。结果的 `ir` 返回 LLVM 文本，`cudaArtifactJSON` 返回 CUDA 产物契约。调用方用 `llc` / `ptxas` 生成 PTX 和 cubin，并在编译缓存中记录 Compiler 共享库或所选 CLI 的文件摘要。超越与数学函数（`exp`/`log`/`sin`/`cos`/`tanh`/`erf`/`pow` 等）产生 NVIDIA libdevice（`__nv_*`）引用；调用方先用匹配的 `llvm-link` 链接 CUDA Toolkit 的 `nvvm/libdevice/libdevice.10.bc`。调用方应将链接工具及 libdevice 摘要纳入产物缓存键。
 
 - **NVPTX 原生 LLVM IR**：生成 `target triple = "nvptx64-nvidia-cuda"` 模块与 `define ptx_kernel void @<entry>(...)`，使用 `addrspace(1)` 全局显存指针。
 - **64 位 grid-stride 循环**：读取 `@llvm.nvvm.read.ptx.sreg.{ctaid,tid}.x` 后扩展为 `i64`，按固定 block size 计算起始下标。grid 的 x 维最多为 65535；线程调度的步长为 `grid.x * block_size`，warp 调度的步长再除以 32。混合输出组共用满足各组需求的 grid。
-- **Warp 协作归约**：在 `sm_70+`、block size 为 32 倍数时，独立且归约域至少为 32 的 `reduce_max` 与 `reduce_sum` 可由一个 warp 协作计算一个输出。选择还要求归约结果与该输出组元素数一致；各 lane 按 32 步进读取（大尺寸启用 4 路 ILP 展开与独立累加流），五次 shuffle-XOR 合并，lane 0 写出结果。尾部读取只为不足 32 的部分生成谓词，之后全部 lane 汇合。浮点求和使用 `reassoc` fast-math 标志以充分利用硬件并行流水线，浮点最大值使用传播 NaN、区分正负零的 `llvm.maximum`，i64 通过两个 32 位 shuffle 保留完整位模式。前后逐元素表达式继续在同一 kernel 中融合。
+- **Warp 协作归约**：在 `sm_70+`、block size 为 32 倍数时，独立且归约域至少为 32 的 `reduce_sum`、`reduce_max`、`reduce_min`、`reduce_prod`、`reduce_any` 与 `reduce_all` 可由一个 warp 协作计算一个输出。选择还要求归约结果与该输出组元素数一致；各 lane 按 32 步进读取（大尺寸启用 4 路 ILP 展开与独立累加流），五次 shuffle-XOR 合并，lane 0 写出结果。尾部读取只为不足 32 的部分生成谓词，之后全部 lane 汇合。浮点求和使用 `reassoc`，浮点极值传播 NaN 且区分正负零，i64 通过两个 32 位 shuffle 保留完整位模式。前后逐元素表达式继续在同一 kernel 中融合；`argmax`/`argmin` 按每输出单线程循环降级。
+- **原子 `scatter_add` 与 `pre_copy`**：每个 `ask.scatter_add` 单独切分为自有步骤。代码生成在诊断的 `cuda_lowering` 下记录 `"pre_copy": {"input": <base_idx>, "output": <out_idx>}`，供 `ASK::Runtime` 在启动带边界检查的 `atomicrmw add`/`fadd` 更新 kernel（grid 按 `updates` 规模启动，并省去输出 `WriteOnly` 约束）前完成 `base` 到输出的拷贝。
 - **多端口与边界处理**：支持多张量/标量输入、异构形状与 dtype 的多输出端口、非整块尾元素掩码保护（`idx < N`）以及空张量。
 - **浮点与架构检查**：
   - 浮点指令不附加 `contract` / `fast` 标志，配合 `llc -fp-contract=off` 保证 `a * b + c` 按独立乘法和加法两次 RNE 执行。

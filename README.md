@@ -14,9 +14,9 @@
 
 ASK is a C++ compiler and runtime for tensor frameworks. It ingests static MLIR `ask` graphs, generates CPU/CUDA machine code, and orchestrates native as well as third-party cubin/PTX kernels.
 
-- **Types and Numerics**: Host supports `bool`, `i32`, `i64`, `f32`, `f16`; CUDA additionally supports `bf16` (`sm_80+`). Floating-point constants are rounded using RNE; additions and multiplications require identical shapes and element types.
-- **Compilation & Fusion**: Constant folding, DCE, multi-output elementwise loop fusion; Host generates `.o`, CUDA generates LLVM IR followed by `llc` / `ptxas` cubin generation.
-- **Execution Plans**: The ASK Pass statically verifies buffer slot mappings and caches valid plans at prepare time; execution reuses argument templates, scratch workspaces, and completion events with full CUDA Graph replay support.
+- **Types and Numerics**: Host supports `bool`, `i32`, `i64`, `f32`, `f16`; CUDA additionally supports `bf16` (`sm_80+`). Floating-point constants are rounded using RNE; binary elementwise operations require identical shapes and element types. Native ops cover arithmetic, math functions, bitwise/shift ops, reductions (`sum`/`max`/`min`/`prod`/`any`/`all`/`argmax`/`argmin`), index generation, slicing, padding, concatenation, gather, and atomic `scatter_add`.
+- **Compilation & Fusion**: Constant folding, DCE, multi-output elementwise loop fusion, and warp-cooperative CUDA reductions; Host generates `.o`, CUDA generates LLVM IR followed by `llc` / `ptxas` cubin generation.
+- **Execution Plans**: The ASK Pass statically verifies buffer slot mappings and caches valid plans at prepare time; execution reuses argument templates, scratch workspaces, pre-step copies (`preCopy`), and completion events with full CUDA Graph replay support.
 - **External Kernels**: Connected via device buffers as decoupled steps, supporting multiple inputs, multiple outputs, pointer arguments, and by-value scalars.
 
 The project provides a C++ SDK and the `ask-opt` utility. The Compiler SDK features named compilation options and stage-segregated results, returning execution plans, ABIs, artifacts, and diagnostics independently.

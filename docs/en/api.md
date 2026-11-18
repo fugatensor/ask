@@ -138,7 +138,7 @@ Pass `graph=true` to enable CUDA Graph replay. The plan fixes kernels, shapes, a
 
 `load(binary, entry, requiredTypes, arch, parameterWidths)` reuses modules based on artifact content and entry point. `requiredTypes` declares the underlying primitive types used, and `arch` is the compilation target. `parameterWidths` is filled in physical parameter order: pointers (including null) are `0`, while pass-by-value scalars are ABI byte widths `1/2/4/8`. Upon loading, parameter counts, widths, and offsets reported by the driver are checked.
 
-`PlanStep` stores `kernel`, `arguments`, 3D `grid/block`, `sharedBytes`, and logical input/output indices. `PlanArgument.buffer` points to the plan's buffer table, with `-1` denoting null; `scalar` holds frozen scalar ABI bytes. Prepare a new program when modifying scalars or launch configurations.
+`PlanStep` stores `kernel`, `arguments`, 3D `grid/block`, `sharedBytes`, logical `inputs`/`outputs`, and an optional `preCopy` (`CopyDescription{sourceBuffer, destinationBuffer}`) for initializing an accumulated output buffer from an input before kernel launch (emitted in `cuda_lowering.pre_copy` for `ask.scatter_add`). `PlanArgument.buffer` points to the plan's buffer table, with `-1` denoting null; `scalar` holds frozen scalar ABI bytes. Prepare a new program when modifying scalars or launch configurations.
 
 Public inputs are permitted to share storage. Distinct logical outputs must be separated from other public ports; duplicate outputs or input aliases must bind to the same storage. Each submission verifies the actual buffers' device, byte count, writability, and aliasing. Capacities and lifetimes of internal slots are verified during the preparation stage by [ASK PASS](verification.md).
 

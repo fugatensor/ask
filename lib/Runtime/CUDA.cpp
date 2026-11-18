@@ -60,6 +60,7 @@ struct Driver {
   CUDA_FUNCTION(cuMemFreeHost, (void *));
   CUDA_FUNCTION(cuMemcpyHtoDAsync, (DevicePointer, const void *, std::size_t, Handle));
   CUDA_FUNCTION(cuMemcpyDtoHAsync, (void *, DevicePointer, std::size_t, Handle));
+  CUDA_FUNCTION(cuMemcpyDtoDAsync, (DevicePointer, DevicePointer, std::size_t, Handle));
   CUDA_FUNCTION(cuMemsetD8Async, (DevicePointer, unsigned char, std::size_t, Handle));
   CUDA_FUNCTION(cuPointerGetAttribute, (void *, int, DevicePointer));
   CUDA_FUNCTION(cuMemGetAddressRange, (DevicePointer *, std::size_t *, DevicePointer));
@@ -116,7 +117,7 @@ struct Driver {
       B(cuStreamCreate); V(cuStreamDestroy); B(cuStreamSynchronize); B(cuStreamWaitEvent);
       B(cuModuleLoadDataEx); B(cuModuleUnload); B(cuModuleGetFunction);
       B(cuFuncGetAttribute); B(cuFuncGetParamInfo); V(cuMemAlloc); V(cuMemFree);
-      V(cuMemAllocHost); B(cuMemFreeHost); V(cuMemcpyHtoDAsync); V(cuMemcpyDtoHAsync);
+      V(cuMemAllocHost); B(cuMemFreeHost); V(cuMemcpyHtoDAsync); V(cuMemcpyDtoHAsync); V(cuMemcpyDtoDAsync);
       B(cuMemsetD8Async);
       B(cuPointerGetAttribute); V(cuMemGetAddressRange);
       B(cuEventCreate); B(cuEventRecord); B(cuEventQuery); B(cuEventSynchronize); V(cuEventDestroy);
@@ -302,6 +303,7 @@ struct PreparedProgram::Impl {
     std::shared_ptr<detail::CUBLASLtMatmul> matmul;
     KernelNodeParams launch;
     std::size_t outputBytes = 0;
+    std::size_t parameterCount = 0;
     std::vector<DevicePointer> constants;
     std::vector<Binding> publicBindings, internalBindings;
     std::vector<std::size_t> dependencies;
@@ -343,6 +345,7 @@ struct PreparedProgram::Impl {
   std::size_t graphEdges = 0;
   bool graph = false;
   static void launchKernel(const Step &, Workspace &, std::size_t, SessionState &);
+  static void launchPreCopyKernel(const Step &, Workspace &, std::size_t, SessionState &);
   static void launchMatmul(const Step &, Workspace &, std::size_t, SessionState &);
   static void zeroMatmul(const Step &, Workspace &, std::size_t, SessionState &);
   static void emptyMatmul(const Step &, Workspace &, std::size_t, SessionState &) {}
@@ -358,6 +361,13 @@ void PreparedProgram::Impl::launchKernel(const Step &, Workspace &w, std::size_t
   const auto &n=w.launches[i];
   s.driver->check(s.driver->cuLaunchKernel(n.function,n.gridX,n.gridY,n.gridZ,n.blockX,n.blockY,n.blockZ,
                                          n.sharedBytes,s.stream,n.parameters,nullptr),"cuLaunchKernel");
+}
+void PreparedProgram::Impl::launchPreCopyKernel(const Step &step, Workspace &w, std::size_t i, SessionState &s) {
+  const auto &values = w.values[i];
+  DevicePointer source = values[step.parameterCount], destination = values[step.parameterCount + 1];
+  if (step.outputBytes && source != destination)
+    s.driver->check(s.driver->cuMemcpyDtoDAsync(destination, source, step.outputBytes, s.stream), "cuMemcpyDtoDAsync");
+  launchKernel(step, w, i, s);
 }
 void PreparedProgram::Impl::launchMatmul(const Step &step, Workspace &w, std::size_t i, SessionState &s) {
   step.matmul->launch(w.values[i].data(),s.stream);
@@ -696,6 +706,7 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
       }
       allocation.plan.steps.push_back({step.inputs,step.outputs});
       if(step.matmul) {
+        require(!step.preCopy,"pre-copy is not supported on matmul steps");
         require(step.inputs.size()==2 && step.outputs.size()==1 && step.arguments.empty(),
                 "matmul step requires two inputs, one output and no kernel arguments");
         require(!graph || s.driver->libraryGraphs(),"CUDA driver does not support library graph capture");
@@ -849,14 +860,28 @@ std::shared_ptr<PreparedProgram> Session::prepareProgram(
       }
     } else {
       step.kernel=std::move(source.kernel);
+      step.parameterCount=source.arguments.size();
       step.execute=&Program::launchKernel;step.addGraph=&Program::addKernel;step.updateGraph=&Program::updateKernel;
       step.launch={step.kernel->impl->function,source.grid[0],source.grid[1],source.grid[2],
                    source.block[0],source.block[1],source.block[2],source.sharedBytes,nullptr,nullptr};
-      step.constants.resize(source.arguments.size());
+      step.constants.resize(source.arguments.size() + (source.preCopy ? 2 : 0));
       for(std::size_t j=0;j<source.arguments.size();++j) {
         const auto &argument=source.arguments[j];
         if(!argument.scalar.empty()) std::memcpy(&step.constants[j],argument.scalar.data(),argument.scalar.size());
         else if(argument.buffer>=0) bind(j,argument.buffer);
+      }
+      if(source.preCopy) {
+        require(!graph || s.driver->libraryGraphs(),"CUDA driver does not support copy graph capture");
+        require(source.preCopy->source < p->sizes.size() && source.preCopy->destination < p->sizes.size(),
+                "pre-copy buffer index is out of range");
+        require(p->sizes[source.preCopy->source] == p->sizes[source.preCopy->destination],
+                "pre-copy buffer sizes must match");
+        step.outputBytes=p->sizes[source.preCopy->destination];
+        step.execute=&Program::launchPreCopyKernel;
+        step.addGraph=&Program::addLibrary;
+        step.updateGraph=&Program::updateLibrary;
+        bind(step.parameterCount, source.preCopy->source);
+        bind(step.parameterCount + 1, source.preCopy->destination);
       }
     }
     if(!step.publicBindings.empty()) p->publicSteps.push_back(p->steps.size());
@@ -920,8 +945,8 @@ std::shared_ptr<Event> PreparedProgram::enqueue(const std::shared_ptr<Session> &
       auto &values=workspace->values[i];values=step.constants;
       for(const auto &binding:step.internalBindings)
         values[binding.parameter]=workspace->buffers[binding.buffer]->pointer();
-      auto &parameters=workspace->parameters[i];parameters.reserve(values.size());
-      for(auto &value:values) parameters.push_back(&value);
+      auto &parameters=workspace->parameters[i];parameters.reserve(step.parameterCount);
+      for(std::size_t k=0;k<step.parameterCount;++k) parameters.push_back(&values[k]);
       auto launch=step.launch;launch.parameters=parameters.data();
       workspace->launches.push_back(launch);
     }

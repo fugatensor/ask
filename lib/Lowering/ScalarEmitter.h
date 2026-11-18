@@ -48,10 +48,116 @@ class ScalarEmitter {
     if (stride == 0) return b.getInt64(0);
     return b.CreateMul(coordinate, b.getInt64(stride));
   }
+  llvm::Value *floatCall(llvm::StringRef name, llvm::ArrayRef<llvm::Value *> args) {
+    llvm::SmallVector<llvm::Type *> argTypes(args.size(), b.getFloatTy());
+    auto *fnType = llvm::FunctionType::get(b.getFloatTy(), argTypes, false);
+    auto callee = function->getParent()->getOrInsertFunction(name, fnType);
+    return b.CreateCall(callee, args, "math");
+  }
+  llvm::Value *intPow(llvm::Value *base, llvm::Value *exp) {
+    llvm::Type *type = base->getType();
+    llvm::Value *zero = llvm::ConstantInt::get(type, 0);
+    llvm::Value *one = llvm::ConstantInt::get(type, 1);
+    llvm::Value *negOne = llvm::ConstantInt::getSigned(type, -1);
+    auto *isNeg = b.CreateICmpSLT(exp, zero);
+    auto *isBaseOne = b.CreateICmpEQ(base, one);
+    auto *isBaseNegOne = b.CreateICmpEQ(base, negOne);
+    auto *isOdd = b.CreateICmpNE(b.CreateAnd(exp, one), zero);
+    llvm::Value *negResult = b.CreateSelect(isBaseOne, one,
+        b.CreateSelect(isBaseNegOne, b.CreateSelect(isOdd, negOne, one), zero));
+    auto *loopCount = b.CreateSelect(isNeg, zero, exp);
+    auto *before = b.GetInsertBlock();
+    auto *header = llvm::BasicBlock::Create(b.getContext(), "ipow.cond", function);
+    auto *body = llvm::BasicBlock::Create(b.getContext(), "ipow.body", function);
+    auto *after = llvm::BasicBlock::Create(b.getContext(), "ipow.done", function);
+    b.CreateBr(header);
+    b.SetInsertPoint(header);
+    auto *resPhi = b.CreatePHI(type, 2, "ipow.res");
+    auto *curPhi = b.CreatePHI(type, 2, "ipow.cur");
+    auto *expPhi = b.CreatePHI(type, 2, "ipow.exp");
+    resPhi->addIncoming(one, before);
+    curPhi->addIncoming(base, before);
+    expPhi->addIncoming(loopCount, before);
+    b.CreateCondBr(b.CreateICmpNE(expPhi, zero), body, after);
+    b.SetInsertPoint(body);
+    auto *oddBit = b.CreateICmpNE(b.CreateAnd(expPhi, one), zero);
+    auto *nextRes = b.CreateSelect(oddBit, b.CreateMul(resPhi, curPhi), resPhi);
+    auto *nextCur = b.CreateMul(curPhi, curPhi);
+    auto *nextExp = b.CreateLShr(expPhi, one);
+    resPhi->addIncoming(nextRes, body);
+    curPhi->addIncoming(nextCur, body);
+    expPhi->addIncoming(nextExp, body);
+    b.CreateBr(header);
+    b.SetInsertPoint(after);
+    return b.CreateSelect(isNeg, negResult, resPhi, "ipow");
+  }
   llvm::Value *binary(mlir::Operation *op, llvm::Value *left, llvm::Value *right) {
-    if (left->getType()->isIntegerTy())
+    if (mlir::isa<MaximumOp>(op)) return maximum(left, right);
+    if (mlir::isa<MinimumOp>(op)) return minimum(left, right);
+    if (mlir::isa<BitwiseAndOp>(op)) return b.CreateAnd(left, right, "bitand");
+    if (mlir::isa<BitwiseOrOp>(op)) return b.CreateOr(left, right, "bitor");
+    if (mlir::isa<BitwiseXorOp>(op)) return b.CreateXor(left, right, "bitxor");
+    if (mlir::isa<ShiftLeftOp, ShiftRightOp>(op)) {
+      unsigned bits = left->getType()->getIntegerBitWidth();
+      llvm::Value *zero = b.getIntN(bits, 0);
+      llvm::Value *width = b.getIntN(bits, bits);
+      llvm::Value *nonneg = b.CreateICmpSGE(right, zero);
+      llvm::Value *inRange = b.CreateAnd(nonneg, b.CreateICmpSLT(right, width));
+      llvm::Value *safeShift = b.CreateSelect(inRange, right, zero);
+      if (mlir::isa<ShiftLeftOp>(op)) {
+        return b.CreateSelect(inRange, b.CreateShl(left, safeShift, "shl"), zero);
+      }
+      llvm::Value *allOnes = b.getIntN(bits, -1ULL);
+      llvm::Value *signFill = b.CreateSelect(b.CreateICmpSLT(left, zero), allOnes, zero);
+      llvm::Value *oob = b.CreateSelect(nonneg, signFill, zero);
+      return b.CreateSelect(inRange, b.CreateAShr(left, safeShift, "ashr"), oob);
+    }
+    if (left->getType()->isIntegerTy()) {
+      if (mlir::isa<PowOp>(op)) return intPow(left, right);
+      if (mlir::isa<FloordivOp, ModOp>(op)) {
+        unsigned bits = left->getType()->getIntegerBitWidth();
+        llvm::Value *zero = b.getIntN(bits, 0);
+        llvm::Value *one = b.getIntN(bits, 1);
+        llvm::Value *negOne = llvm::ConstantInt::getSigned(left->getType(), -1);
+        llvm::Value *minInt = llvm::ConstantInt::get(b.getContext(), llvm::APInt::getSignedMinValue(bits));
+        llvm::Value *isZero = b.CreateICmpEQ(right, zero);
+        llvm::Value *isOverflow = b.CreateAnd(b.CreateICmpEQ(left, minInt), b.CreateICmpEQ(right, negOne));
+        llvm::Value *unsafe = b.CreateOr(isZero, isOverflow);
+        llvm::Value *safeL = b.CreateSelect(unsafe, zero, left);
+        llvm::Value *safeR = b.CreateSelect(unsafe, one, right);
+        llvm::Value *q = b.CreateSDiv(safeL, safeR, "sdiv");
+        llvm::Value *rem = b.CreateSRem(safeL, safeR, "srem");
+        llvm::Value *needAdj = b.CreateAnd(
+            b.CreateICmpNE(rem, zero),
+            b.CreateICmpSLT(b.CreateXor(rem, safeR), zero));
+        if (mlir::isa<FloordivOp>(op)) {
+          llvm::Value *fq = b.CreateSelect(needAdj, b.CreateSub(q, one), q);
+          return b.CreateSelect(isZero, zero, b.CreateSelect(isOverflow, minInt, fq), "floordiv");
+        }
+        llvm::Value *frem = b.CreateSelect(needAdj, b.CreateAdd(rem, safeR), rem);
+        return b.CreateSelect(unsafe, zero, frem, "mod");
+      }
       return mlir::isa<AddOp, ReduceSumOp>(op) ? b.CreateAdd(left, right, "add.wrap")
                                             : b.CreateMul(left, right, "mul.wrap");
+    }
+    if (mlir::isa<PowOp, FloordivOp, ModOp>(op)) {
+      llvm::Type *type = left->getType();
+      llvm::Value *l = llir::createNumericCast(b, left, b.getFloatTy());
+      llvm::Value *r = llir::createNumericCast(b, right, b.getFloatTy());
+      llvm::Value *res;
+      if (mlir::isa<PowOp>(op)) {
+        res = floatCall(cuda ? "__nv_powf" : "powf", {l, r});
+      } else if (mlir::isa<FloordivOp>(op)) {
+        res = b.CreateIntrinsic(llvm::Intrinsic::floor, {b.getFloatTy()}, {b.CreateFDiv(l, r, "div")});
+      } else {
+        llvm::Value *rem = floatCall(cuda ? "__nv_fmodf" : "fmodf", {l, r});
+        llvm::Value *zeroF = llvm::ConstantFP::get(b.getFloatTy(), 0.0);
+        llvm::Value *remNonZero = b.CreateFCmpONE(rem, zeroF);
+        llvm::Value *diffSign = b.CreateXor(b.CreateFCmpOLT(rem, zeroF), b.CreateFCmpOLT(r, zeroF));
+        res = b.CreateSelect(b.CreateAnd(remNonZero, diffSign), b.CreateFAdd(rem, r), rem, "fmod.floor");
+      }
+      return llir::createNumericCast(b, res, type);
+    }
     const bool bf16 = left->getType()->isBFloatTy();
     if (bf16) {
       left = llir::extendBF16(b, left);
@@ -73,12 +179,23 @@ class ScalarEmitter {
     return bf16 ? llir::truncateBF16(b, computed) : computed;
   }
   llvm::Value *maximum(llvm::Value *left, llvm::Value *right) {
+    if (left->getType()->isIntegerTy(1)) return b.CreateOr(left, right, "max");
     if (left->getType()->isIntegerTy())
       return b.CreateSelect(b.CreateICmpSGT(left, right), left, right, "max");
     auto *type = left->getType();
     left = llir::createNumericCast(b, left, b.getFloatTy());
     right = llir::createNumericCast(b, right, b.getFloatTy());
     auto *computed = b.CreateIntrinsic(llvm::Intrinsic::maximum, {b.getFloatTy()}, {left, right});
+    return llir::createNumericCast(b, computed, type);
+  }
+  llvm::Value *minimum(llvm::Value *left, llvm::Value *right) {
+    if (left->getType()->isIntegerTy(1)) return b.CreateAnd(left, right, "min");
+    if (left->getType()->isIntegerTy())
+      return b.CreateSelect(b.CreateICmpSLT(left, right), left, right, "min");
+    auto *type = left->getType();
+    left = llir::createNumericCast(b, left, b.getFloatTy());
+    right = llir::createNumericCast(b, right, b.getFloatTy());
+    auto *computed = b.CreateIntrinsic(llvm::Intrinsic::minimum, {b.getFloatTy()}, {left, right});
     return llir::createNumericCast(b, computed, type);
   }
   llvm::Value *compare(mlir::Operation *op, llvm::Value *left, llvm::Value *right) {
@@ -103,16 +220,40 @@ class ScalarEmitter {
     return b.CreateICmp(kind, left, right, "compare");
   }
   llvm::Value *unary(mlir::Operation *op, llvm::Value *input) {
+    if (mlir::isa<BitwiseNotOp>(op)) return b.CreateNot(input, "bitnot");
     auto *type = input->getType();
+    if (mlir::isa<AbsOp>(op)) {
+      if (type->isIntegerTy()) {
+        auto *zero = llvm::ConstantInt::get(type, 0);
+        return b.CreateSelect(b.CreateICmpSLT(input, zero), b.CreateSub(zero, input), input, "abs");
+      }
+      llvm::Value *f = llir::createNumericCast(b, input, b.getFloatTy());
+      llvm::Value *res = b.CreateIntrinsic(llvm::Intrinsic::fabs, {b.getFloatTy()}, {f});
+      return llir::createNumericCast(b, res, type);
+    }
     input = llir::createNumericCast(b, input, b.getFloatTy());
     llvm::Value *computed;
     if (mlir::isa<SqrtOp>(op))
       computed = b.CreateIntrinsic(llvm::Intrinsic::sqrt, {b.getFloatTy()}, {input});
+    else if (mlir::isa<FloorOp>(op))
+      computed = b.CreateIntrinsic(llvm::Intrinsic::floor, {b.getFloatTy()}, {input});
+    else if (mlir::isa<CeilOp>(op))
+      computed = b.CreateIntrinsic(llvm::Intrinsic::ceil, {b.getFloatTy()}, {input});
+    else if (mlir::isa<RoundOp>(op))
+      computed = b.CreateIntrinsic(llvm::Intrinsic::rint, {b.getFloatTy()}, {input});
+    else if (mlir::isa<SinOp>(op))
+      computed = cuda ? floatCall("__nv_sinf", {input})
+                      : b.CreateIntrinsic(llvm::Intrinsic::sin, {b.getFloatTy()}, {input});
+    else if (mlir::isa<CosOp>(op))
+      computed = cuda ? floatCall("__nv_cosf", {input})
+                      : b.CreateIntrinsic(llvm::Intrinsic::cos, {b.getFloatTy()}, {input});
+    else if (mlir::isa<TanhOp>(op))
+      computed = cuda ? floatCall("__nv_tanhf", {input}) : floatCall("tanhf", {input});
+    else if (mlir::isa<ErfOp>(op))
+      computed = cuda ? floatCall("__nv_erff", {input}) : floatCall("erff", {input});
     else if (cuda) {
       const char *name = mlir::isa<ExpOp>(op) ? "__nv_expf" : "__nv_logf";
-      auto callee = function->getParent()->getOrInsertFunction(name,
-          llvm::FunctionType::get(b.getFloatTy(), {b.getFloatTy()}, false));
-      computed = b.CreateCall(callee, {input}, "math");
+      computed = floatCall(name, {input});
     } else {
       auto intrinsic = mlir::isa<ExpOp>(op) ? llvm::Intrinsic::exp : llvm::Intrinsic::log;
       computed = b.CreateIntrinsic(intrinsic, {b.getFloatTy()}, {input});
@@ -124,6 +265,7 @@ class ScalarEmitter {
     if (count == 0) return initial;
     if (count == 1) return update(b.getInt64(0), initial);
     ++reductionLoops;
+    auto savedValues = values;
     auto *before = b.GetInsertBlock();
     auto *body = llvm::BasicBlock::Create(b.getContext(), "reduce.loop", function);
     auto *after = llvm::BasicBlock::Create(b.getContext(), "reduce.done", function);
@@ -140,6 +282,7 @@ class ScalarEmitter {
     accumulator->addIncoming(result, latch);
     b.CreateCondBr(b.CreateICmpULT(next, b.getInt64(count)), body, after);
     b.SetInsertPoint(after);
+    values = std::move(savedValues);
     return result;
   }
   llvm::Value *shuffleXor(llvm::Value *value, unsigned offset) {
@@ -149,6 +292,8 @@ class ScalarEmitter {
       return b.CreateIntrinsic(intrinsic, {},
           {b.getInt32(-1), part, b.getInt32(offset), b.getInt32(31)});
     };
+    if (value->getType()->isIntegerTy(1))
+      return b.CreateTrunc(shuffle(b.CreateZExt(value, b.getInt32Ty())), b.getInt1Ty());
     if (!value->getType()->isIntegerTy(64)) return shuffle(value);
     auto *low = shuffle(b.CreateTrunc(value, b.getInt32Ty()));
     auto *high = shuffle(b.CreateTrunc(b.CreateLShr(value, b.getInt64(32)), b.getInt32Ty()));
@@ -157,7 +302,11 @@ class ScalarEmitter {
   }
   template<class Read>
   llvm::Value *warpReduction(mlir::Operation *op, uint64_t count, llvm::Value *initial, Read read) {
-    const bool isSum = mlir::isa<ReduceSumOp>(op);
+    const bool isSum = mlir::isa_and_nonnull<ReduceSumOp>(op);
+    const bool isProd = mlir::isa_and_nonnull<ReduceProdOp>(op);
+    const bool isMin = mlir::isa_and_nonnull<ReduceMinOp>(op);
+    const bool isAny = mlir::isa_and_nonnull<ReduceAnyOp>(op);
+    const bool isAll = mlir::isa_and_nonnull<ReduceAllOp>(op);
     auto *outputType = initial->getType();
     if (outputType->isFloatingPointTy()) initial = llir::createNumericCast(b, initial, b.getFloatTy());
     auto combine = [&](llvm::Value *left, llvm::Value *right) -> llvm::Value * {
@@ -172,6 +321,13 @@ class ScalarEmitter {
         }
         return add;
       }
+      if (isProd) {
+        return left->getType()->isIntegerTy() ? b.CreateMul(left, right, "mul.wrap")
+                                              : b.CreateFMul(left, right, "mul");
+      }
+      if (isMin) return minimum(left, right);
+      if (isAny) return b.CreateOr(left, right, "any");
+      if (isAll) return b.CreateAnd(left, right, "all");
       return maximum(left, right);
     };
     auto update = [&](llvm::Value *index, llvm::Value *previous) {
@@ -184,6 +340,7 @@ class ScalarEmitter {
     if (warps >= 8) {
       const uint64_t unrollBlocks = warps / 4;
       ++reductionLoops;
+      auto savedLoopValues = values;
       auto *before = b.GetInsertBlock();
       auto *body = llvm::BasicBlock::Create(b.getContext(), "reduce.unroll.loop", function);
       auto *after = llvm::BasicBlock::Create(b.getContext(), "reduce.unroll.done", function);
@@ -223,6 +380,7 @@ class ScalarEmitter {
 
       b.CreateCondBr(b.CreateICmpULT(nextIter, b.getInt64(unrollBlocks)), body, after);
       b.SetInsertPoint(after);
+      values = std::move(savedLoopValues);
 
       value = combine(combine(res0, res1), combine(res2, res3));
 
@@ -236,6 +394,7 @@ class ScalarEmitter {
       });
     }
     if (const uint64_t tail = count % 32) {
+      auto savedTailValues = values;
       auto *before = b.GetInsertBlock();
       auto *body = llvm::BasicBlock::Create(b.getContext(), "reduce.tail", function);
       auto *after = llvm::BasicBlock::Create(b.getContext(), "reduce.tail.done", function);
@@ -245,6 +404,7 @@ class ScalarEmitter {
       auto *tailEnd = b.GetInsertBlock();
       b.CreateBr(after);
       b.SetInsertPoint(after);
+      values = std::move(savedTailValues);
       auto *merged = b.CreatePHI(value->getType(), 2, "reduce.partial");
       merged->addIncoming(value, before);
       merged->addIncoming(partial, tailEnd);
@@ -265,7 +425,16 @@ class ScalarEmitter {
     auto *type = llir::scalarLLVMType(input.getType(), b.getContext());
     llvm::Value *initial;
     if (mlir::isa<ReduceSumOp>(op)) initial = llvm::Constant::getNullValue(type);
-    else if (type->isIntegerTy())
+    else if (mlir::isa<ReduceProdOp>(op)) {
+      initial = type->isIntegerTy() ? llvm::ConstantInt::get(type, 1)
+                                    : llvm::ConstantFP::get(type, 1.0);
+    } else if (mlir::isa<ReduceAnyOp>(op)) initial = b.getFalse();
+    else if (mlir::isa<ReduceAllOp>(op)) initial = b.getTrue();
+    else if (mlir::isa<ReduceMinOp>(op)) {
+      if (type->isIntegerTy())
+        initial = llvm::ConstantInt::get(b.getContext(), llvm::APInt::getSignedMaxValue(type->getIntegerBitWidth()));
+      else initial = llvm::ConstantFP::getInfinity(type, false);
+    } else if (type->isIntegerTy())
       initial = llvm::ConstantInt::get(b.getContext(), llvm::APInt::getSignedMinValue(type->getIntegerBitWidth()));
     else initial = llvm::ConstantFP::getInfinity(type, true);
     llvm::SmallBitVector reduced(inputShape.size());
@@ -289,11 +458,74 @@ class ScalarEmitter {
             atStride(coordinate(reductionIndex, reducedShape, reducedAxis), inputShape, axis));
       return emit(input, inputIndex);
     };
-    if (warpLane && mlir::isa<ReduceMaxOp, ReduceSumOp>(op)) return warpReduction(op, count, initial, read);
+    if (warpLane && mlir::isa<ReduceMaxOp, ReduceMinOp, ReduceSumOp, ReduceProdOp,
+                              ReduceAnyOp, ReduceAllOp>(op))
+      return warpReduction(op, count, initial, read);
     return accumulate(count, initial, [&](llvm::Value *reductionIndex, llvm::Value *accumulator) {
       auto *value = read(reductionIndex);
-      return mlir::isa<ReduceSumOp>(op) ? binary(op, accumulator, value) : maximum(accumulator, value);
+      if (mlir::isa<ReduceSumOp, ReduceProdOp>(op)) return binary(op, accumulator, value);
+      if (mlir::isa<ReduceMinOp>(op)) return minimum(accumulator, value);
+      if (mlir::isa<ReduceAnyOp>(op)) return b.CreateOr(accumulator, value, "any");
+      if (mlir::isa<ReduceAllOp>(op)) return b.CreateAnd(accumulator, value, "all");
+      return maximum(accumulator, value);
     });
+  }
+  llvm::Value *argmaxmin(mlir::Operation *op, llvm::Value *index) {
+    const bool isMax = mlir::isa<ArgmaxOp>(op);
+    auto input = op->getOperand(0);
+    auto inputShape = shape(input.getType());
+    auto outputShape = shape(op->getResult(0).getType());
+    const int64_t axis = op->getAttrOfType<mlir::IntegerAttr>("axis").getInt();
+    const uint64_t count = uint64_t(inputShape[axis]);
+    llvm::Value *base = b.getInt64(0);
+    unsigned outputAxis = 0;
+    for (unsigned d = 0; d < inputShape.size(); ++d)
+      if (int64_t(d) != axis)
+        base = b.CreateAdd(base, atStride(coordinate(index, outputShape, outputAxis++), inputShape, d));
+    auto read = [&](llvm::Value *reductionIndex) {
+      return emit(input, b.CreateAdd(base, atStride(reductionIndex, inputShape, axis)));
+    };
+    llvm::Value *initVal = read(b.getInt64(0));
+    llvm::Value *initIdx = b.getInt64(0);
+    if (count <= 1) return initIdx;
+    ++reductionLoops;
+    auto savedValues = values;
+    auto *before = b.GetInsertBlock();
+    auto *body = llvm::BasicBlock::Create(b.getContext(), "argred.loop", function);
+    auto *after = llvm::BasicBlock::Create(b.getContext(), "argred.done", function);
+    b.CreateBr(body);
+    b.SetInsertPoint(body);
+    auto *iter = b.CreatePHI(b.getInt64Ty(), 2, "argred.index");
+    auto *bestValPhi = b.CreatePHI(initVal->getType(), 2, "argred.val");
+    auto *bestIdxPhi = b.CreatePHI(b.getInt64Ty(), 2, "argred.best");
+    iter->addIncoming(b.getInt64(1), before);
+    bestValPhi->addIncoming(initVal, before);
+    bestIdxPhi->addIncoming(initIdx, before);
+    llvm::Value *candVal = read(iter);
+    llvm::Value *takeCand;
+    if (candVal->getType()->isFloatingPointTy()) {
+      llvm::Value *candF = llir::createNumericCast(b, candVal, b.getFloatTy());
+      llvm::Value *bestF = llir::createNumericCast(b, bestValPhi, b.getFloatTy());
+      llvm::Value *candNan = b.CreateFCmpUNO(candF, candF);
+      llvm::Value *bestNan = b.CreateFCmpUNO(bestF, bestF);
+      llvm::Value *ordBetter = isMax ? b.CreateFCmpOGT(candF, bestF) : b.CreateFCmpOLT(candF, bestF);
+      takeCand = b.CreateOr(b.CreateAnd(candNan, b.CreateNot(bestNan)), ordBetter);
+    } else if (candVal->getType()->isIntegerTy(1)) {
+      takeCand = isMax ? b.CreateICmpUGT(candVal, bestValPhi) : b.CreateICmpULT(candVal, bestValPhi);
+    } else {
+      takeCand = isMax ? b.CreateICmpSGT(candVal, bestValPhi) : b.CreateICmpSLT(candVal, bestValPhi);
+    }
+    llvm::Value *nextVal = b.CreateSelect(takeCand, candVal, bestValPhi);
+    llvm::Value *nextIdx = b.CreateSelect(takeCand, iter, bestIdxPhi);
+    llvm::Value *nextIter = b.CreateAdd(iter, b.getInt64(1), "argred.next");
+    auto *latch = b.GetInsertBlock();
+    iter->addIncoming(nextIter, latch);
+    bestValPhi->addIncoming(nextVal, latch);
+    bestIdxPhi->addIncoming(nextIdx, latch);
+    b.CreateCondBr(b.CreateICmpULT(nextIter, b.getInt64(count)), body, after);
+    b.SetInsertPoint(after);
+    values = std::move(savedValues);
+    return nextIdx;
   }
   llvm::Value *matmul(mlir::Operation *op, llvm::Value *index,
                        unsigned width = 1, unsigned height = 1) {
@@ -406,12 +638,188 @@ public:
             mapped = b.CreateAdd(mapped, atStride(coordinate(index, outputShape, axis), inputShape, inputAxis));
         }
         computed = emit(input, mapped);
-      } else if (mlir::isa<ReduceSumOp, ReduceMaxOp>(op)) computed = reduce(op, index);
-      else if (mlir::isa<MatmulOp>(op)) computed = matmul(op, index);
+      } else if (mlir::isa<ReduceSumOp, ReduceMaxOp, ReduceMinOp, ReduceProdOp,
+                           ReduceAnyOp, ReduceAllOp>(op)) {
+        computed = reduce(op, index);
+      } else if (mlir::isa<ArgmaxOp, ArgminOp>(op)) {
+        computed = argmaxmin(op, index);
+      } else if (mlir::isa<IotaOp>(op)) {
+        auto outputShape = shape(value.getType());
+        const int64_t dim = op->getAttrOfType<mlir::IntegerAttr>("dimension").getInt();
+        llvm::Value *coord = coordinate(index, outputShape, unsigned(dim));
+        computed = llir::createNumericCast(b, coord, llir::scalarLLVMType(value.getType(), b.getContext()));
+      } else if (mlir::isa<SliceOp>(op)) {
+        auto input = op->getOperand(0);
+        auto inputShape = shape(input.getType()), outputShape = shape(value.getType());
+        auto starts = op->getAttrOfType<mlir::DenseI64ArrayAttr>("starts").asArrayRef();
+        auto steps = op->getAttrOfType<mlir::DenseI64ArrayAttr>("steps").asArrayRef();
+        llvm::Value *mapped = b.getInt64(0);
+        for (unsigned d = 0; d < outputShape.size(); ++d) {
+          llvm::Value *coord = coordinate(index, outputShape, d);
+          llvm::Value *inCoord = b.CreateAdd(b.getInt64(starts[d]),
+              b.CreateMul(coord, b.getInt64(steps[d])));
+          mapped = b.CreateAdd(mapped, atStride(inCoord, inputShape, d));
+        }
+        computed = emit(input, mapped);
+      } else if (mlir::isa<PadOp>(op)) {
+        auto input = op->getOperand(0), padValue = op->getOperand(1);
+        auto inputShape = shape(input.getType()), outputShape = shape(value.getType());
+        if (outputShape.empty()) {
+          computed = emit(input, b.getInt64(0));
+        } else {
+          auto low = op->getAttrOfType<mlir::DenseI64ArrayAttr>("pad_low").asArrayRef();
+          auto interior = op->getAttrOfType<mlir::DenseI64ArrayAttr>("interior").asArrayRef();
+          llvm::Value *inBounds = b.getTrue();
+          llvm::Value *mapped = b.getInt64(0);
+          for (unsigned d = 0; d < outputShape.size(); ++d) {
+            if (inputShape[d] == 0) {
+              inBounds = b.getFalse();
+              break;
+            }
+            llvm::Value *c = coordinate(index, outputShape, d);
+            llvm::Value *shifted = b.CreateSub(c, b.getInt64(low[d]));
+            llvm::Value *geLow = b.CreateICmpSGE(shifted, b.getInt64(0));
+            llvm::Value *inCoord;
+            llvm::Value *dimOk;
+            if (interior[d] == 0) {
+              inCoord = shifted;
+              dimOk = b.CreateAnd(geLow, b.CreateICmpSLT(shifted, b.getInt64(inputShape[d])));
+            } else {
+              llvm::Value *strideD = b.getInt64(interior[d] + 1);
+              llvm::Value *safeS = b.CreateSelect(geLow, shifted, b.getInt64(0));
+              inCoord = b.CreateUDiv(safeS, strideD);
+              llvm::Value *rem = b.CreateURem(safeS, strideD);
+              dimOk = b.CreateAnd(b.CreateAnd(geLow, b.CreateICmpEQ(rem, b.getInt64(0))),
+                  b.CreateICmpSLT(inCoord, b.getInt64(inputShape[d])));
+            }
+            inBounds = b.CreateAnd(inBounds, dimOk);
+            mapped = b.CreateAdd(mapped, atStride(inCoord, inputShape, d));
+          }
+          auto savedValues = values;
+          auto *thenBB = llvm::BasicBlock::Create(b.getContext(), "pad.in", function);
+          auto *elseBB = llvm::BasicBlock::Create(b.getContext(), "pad.out", function);
+          auto *mergeBB = llvm::BasicBlock::Create(b.getContext(), "pad.done", function);
+          b.CreateCondBr(inBounds, thenBB, elseBB);
+          b.SetInsertPoint(thenBB);
+          values = savedValues;
+          llvm::Value *inVal = emit(input, mapped);
+          auto *thenEnd = b.GetInsertBlock();
+          b.CreateBr(mergeBB);
+          b.SetInsertPoint(elseBB);
+          values = savedValues;
+          llvm::Value *padVal = emit(padValue, b.getInt64(0));
+          auto *elseEnd = b.GetInsertBlock();
+          b.CreateBr(mergeBB);
+          b.SetInsertPoint(mergeBB);
+          values = std::move(savedValues);
+          auto *phi = b.CreatePHI(inVal->getType(), 2, "pad.val");
+          phi->addIncoming(inVal, thenEnd);
+          phi->addIncoming(padVal, elseEnd);
+          computed = phi;
+        }
+      } else if (mlir::isa<ConcatenateOp>(op)) {
+        auto outputShape = shape(value.getType());
+        const int64_t axis = op->getAttrOfType<mlir::IntegerAttr>("axis").getInt();
+        llvm::SmallVector<mlir::Value> active;
+        for (mlir::Value operand : op->getOperands())
+          if (shape(operand.getType())[axis] > 0) active.push_back(operand);
+        if (active.empty()) {
+          computed = llvm::Constant::getNullValue(llir::scalarLLVMType(value.getType(), b.getContext()));
+        } else {
+          llvm::SmallVector<llvm::Value *> outCoords;
+          outCoords.reserve(outputShape.size());
+          for (unsigned d = 0; d < outputShape.size(); ++d)
+            outCoords.push_back(coordinate(index, outputShape, d));
+          auto emitOperandAt = [&](mlir::Value operand, int64_t offset) {
+            auto opShape = shape(operand.getType());
+            llvm::Value *mapped = b.getInt64(0);
+            for (unsigned d = 0; d < outputShape.size(); ++d) {
+              llvm::Value *c = int64_t(d) == axis ? b.CreateSub(outCoords[d], b.getInt64(offset)) : outCoords[d];
+              mapped = b.CreateAdd(mapped, atStride(c, opShape, d));
+            }
+            return emit(operand, mapped);
+          };
+          if (active.size() == 1) {
+            computed = emitOperandAt(active.front(), 0);
+          } else {
+            auto savedValues = values;
+            auto *mergeBB = llvm::BasicBlock::Create(b.getContext(), "concat.done", function);
+            llvm::SmallVector<std::pair<llvm::Value *, llvm::BasicBlock *>> incoming;
+            int64_t offset = 0;
+            llvm::Type *elemTy = nullptr;
+            for (size_t k = 0; k + 1 < active.size(); ++k) {
+              int64_t extent = shape(active[k].getType())[axis];
+              auto *matchBB = llvm::BasicBlock::Create(b.getContext(), "concat.match", function);
+              auto *nextBB = llvm::BasicBlock::Create(b.getContext(), "concat.next", function);
+              b.CreateCondBr(b.CreateICmpSLT(outCoords[axis], b.getInt64(offset + extent)), matchBB, nextBB);
+              b.SetInsertPoint(matchBB);
+              values = savedValues;
+              llvm::Value *val = emitOperandAt(active[k], offset);
+              elemTy = val->getType();
+              incoming.emplace_back(val, b.GetInsertBlock());
+              b.CreateBr(mergeBB);
+              b.SetInsertPoint(nextBB);
+              offset += extent;
+            }
+            values = savedValues;
+            llvm::Value *lastVal = emitOperandAt(active.back(), offset);
+            incoming.emplace_back(lastVal, b.GetInsertBlock());
+            b.CreateBr(mergeBB);
+            b.SetInsertPoint(mergeBB);
+            values = std::move(savedValues);
+            auto *phi = b.CreatePHI(elemTy, unsigned(incoming.size()), "concat.val");
+            for (auto &[v, bb] : incoming) phi->addIncoming(v, bb);
+            computed = phi;
+          }
+        }
+      } else if (mlir::isa<GatherOp>(op)) {
+        auto params = op->getOperand(0), indices = op->getOperand(1);
+        auto paramsShape = shape(params.getType()), idxShape = shape(indices.getType());
+        auto outputShape = shape(value.getType());
+        const int64_t axis = op->getAttrOfType<mlir::IntegerAttr>("axis").getInt();
+        const unsigned idxRank = unsigned(idxShape.size());
+        llvm::Value *idxLinear = b.getInt64(0);
+        for (unsigned m = 0; m < idxRank; ++m)
+          idxLinear = b.CreateAdd(idxLinear,
+              atStride(coordinate(index, outputShape, unsigned(axis) + m), idxShape, m));
+        llvm::Value *rawIdx = emit(indices, idxLinear);
+        llvm::Value *idxVal = rawIdx->getType()->isIntegerTy(32) ? b.CreateSExt(rawIdx, b.getInt64Ty()) : rawIdx;
+        llvm::Value *inBounds = b.CreateAnd(
+            b.CreateICmpSGE(idxVal, b.getInt64(0)),
+            b.CreateICmpSLT(idxVal, b.getInt64(paramsShape[axis])));
+        llvm::Value *paramLinear = b.getInt64(0);
+        for (unsigned d = 0; d < paramsShape.size(); ++d) {
+          llvm::Value *coord = int64_t(d) < axis ? coordinate(index, outputShape, d)
+                             : int64_t(d) == axis ? idxVal
+                                                  : coordinate(index, outputShape, d - 1 + idxRank);
+          paramLinear = b.CreateAdd(paramLinear, atStride(coord, paramsShape, d));
+        }
+        auto savedValues = values;
+        auto *thenBB = llvm::BasicBlock::Create(b.getContext(), "gather.in", function);
+        auto *elseBB = llvm::BasicBlock::Create(b.getContext(), "gather.oob", function);
+        auto *mergeBB = llvm::BasicBlock::Create(b.getContext(), "gather.done", function);
+        b.CreateCondBr(inBounds, thenBB, elseBB);
+        b.SetInsertPoint(thenBB);
+        values = savedValues;
+        llvm::Value *inVal = emit(params, paramLinear);
+        auto *thenEnd = b.GetInsertBlock();
+        b.CreateBr(mergeBB);
+        b.SetInsertPoint(elseBB);
+        llvm::Value *zeroVal = llvm::Constant::getNullValue(llir::scalarLLVMType(value.getType(), b.getContext()));
+        b.CreateBr(mergeBB);
+        b.SetInsertPoint(mergeBB);
+        values = std::move(savedValues);
+        auto *phi = b.CreatePHI(inVal->getType(), 2, "gather.val");
+        phi->addIncoming(inVal, thenEnd);
+        phi->addIncoming(zeroVal, elseBB);
+        computed = phi;
+      } else if (mlir::isa<MatmulOp>(op)) computed = matmul(op, index);
       else if (mlir::isa<CompareOp>(op)) computed = compare(op, emit(op->getOperand(0), index), emit(op->getOperand(1), index));
       else if (mlir::isa<SelectOp>(op))
         computed = b.CreateSelect(emit(op->getOperand(0), index), emit(op->getOperand(1), index), emit(op->getOperand(2), index), "select");
-      else if (mlir::isa<ExpOp, LogOp, SqrtOp>(op)) computed = unary(op, emit(op->getOperand(0), index));
+      else if (mlir::isa<ExpOp, LogOp, SqrtOp, SinOp, CosOp, TanhOp, ErfOp,
+                         AbsOp, FloorOp, CeilOp, RoundOp, BitwiseNotOp>(op))
+        computed = unary(op, emit(op->getOperand(0), index));
       else computed = binary(op, emit(op->getOperand(0), index), emit(op->getOperand(1), index));
     }
     values[key] = computed;

@@ -156,7 +156,7 @@ llvm::Error validateFusionGroups(mlir::func::FuncOp function) {
                       ? mlir::dyn_cast<mlir::RankedTensorType>(op.getResult(0).getType())
                       : mlir::RankedTensorType();
     if (!name || name.getValue().empty() || !tensor || !tensor.hasStaticShape() ||
-        (!isPureComputeOperation(&op) || mlir::isa<MatmulOp>(op)))
+        (!isPureComputeOperation(&op) || mlir::isa<MatmulOp, ScatterAddOp>(op)))
       return error("ask.fusion_group requires a nonempty string on a static tensor computation");
     llvm::StringRef id = name.getValue();
     if (active != id) {
@@ -236,7 +236,9 @@ WorkspacePlan planWorkspace(mlir::func::FuncOp graph) {
     auto found = expensive.find(value);
     if (found != expensive.end()) return found->second;
     auto *owner = value.getDefiningOp();
-    bool result = owner && ((mlir::isa<ReduceSumOp, ReduceMaxOp>(owner) &&
+    bool result = owner && ((mlir::isa<ReduceSumOp, ReduceMaxOp, ReduceMinOp,
+                                        ReduceProdOp, ReduceAnyOp, ReduceAllOp,
+                                        ArgmaxOp, ArgminOp>(owner) &&
         concreteCount(owner->getOperand(0).getType()) > concreteCount(value.getType())) ||
         llvm::any_of(owner->getOperands(), hasReduction));
     expensive[value] = result;
@@ -245,12 +247,13 @@ WorkspacePlan planWorkspace(mlir::func::FuncOp graph) {
   for (auto &op : graph.front()) {
     if (!op.getNumResults() || !plan.live.contains(op.getResult(0)) ||
         concreteCount(op.getResult(0).getType()) == 0) continue;
-    if (mlir::isa<MatmulOp>(op) && llvm::any_of(op.getResult(0).getUsers(),
+    if (mlir::isa<MatmulOp, ScatterAddOp>(op) && llvm::any_of(op.getResult(0).getUsers(),
         [&](mlir::Operation *user) {
           return user->getNumResults() && plan.live.contains(user->getResult(0));
         })) {
       plan.materialized.insert(op.getResult(0));
-      if (blasMatmul(op.getResult(0))) plan.addressed.insert(op.getResult(0));
+      if (blasMatmul(op.getResult(0)) || mlir::isa<ScatterAddOp>(op))
+        plan.addressed.insert(op.getResult(0));
       expensive.clear();
     }
     if (blasMatmul(op.getResult(0)) && blasContractingSize(op.getResult(0))) {
@@ -264,7 +267,8 @@ WorkspacePlan planWorkspace(mlir::func::FuncOp graph) {
       expensive.clear();
     }
     for (auto operand : op.getOperands())
-      if ((mlir::isa<MatmulOp>(op) || concreteCount(op.getResult(0).getType()) > concreteCount(operand.getType())) &&
+      if ((mlir::isa<MatmulOp, ScatterAddOp, GatherOp>(op) ||
+           concreteCount(op.getResult(0).getType()) > concreteCount(operand.getType())) &&
           hasReduction(operand)) {
         plan.materialized.insert(operand);
         expensive.clear();
@@ -670,6 +674,102 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       });
       return reads;
     };
+    auto emitScatter = [&](mlir::Value value, llvm::Value *destination) {
+      auto scatter = value.getDefiningOp<ScatterAddOp>();
+      mlir::Value base = scatter.getOperand(0), indices = scatter.getOperand(1),
+                  updates = scatter.getOperand(2);
+      auto getShape = [](mlir::Type type) -> llvm::ArrayRef<int64_t> {
+        auto ranked = mlir::dyn_cast<mlir::RankedTensorType>(type);
+        return ranked ? ranked.getShape() : llvm::ArrayRef<int64_t>{};
+      };
+      auto baseShape = getShape(base.getType());
+      auto idxShape = getShape(indices.getType());
+      auto updShape = getShape(updates.getType());
+      const uint64_t baseCount = concreteCount(base.getType());
+      const uint64_t updCount = concreteCount(updates.getType());
+      const int64_t axis = scatter->getAttrOfType<mlir::IntegerAttr>("axis").getInt();
+      const unsigned idxRank = unsigned(idxShape.size());
+      llvm::Type *elemTy = llvmStorageType(value.getType(), context);
+      const uint64_t elemAlign = elementByteWidth(value.getType());
+      llvm::SmallVector<mlir::Value> reads;
+      auto appendReads = [&](const lowering::ScalarEmitter &e) {
+        reads.append(e.bufferReads.begin(), e.bufferReads.end());
+      };
+      auto productStride = [](llvm::ArrayRef<int64_t> dims, unsigned d) -> uint64_t {
+        uint64_t s = 1;
+        for (unsigned k = d + 1; k < dims.size(); ++k) s *= uint64_t(dims[k]);
+        return s;
+      };
+      auto coord = [&](llvm::Value *lin, llvm::ArrayRef<int64_t> dims, unsigned d) -> llvm::Value * {
+        if (dims[d] == 1) return builder.getInt64(0);
+        uint64_t st = productStride(dims, d);
+        llvm::Value *q = st == 1 ? lin : builder.CreateUDiv(lin, builder.getInt64(st));
+        return builder.CreateURem(q, builder.getInt64(dims[d]));
+      };
+      if (baseCount > 0) {
+        emitHostLoop(builder, function, baseCount, 1, [&](llvm::Value *idx) {
+          lowering::ScalarEmitter baseEmitter(builder, function, false, load);
+          bind(baseEmitter);
+          llvm::Value *val = baseEmitter.emit(base, idx);
+          reductionLoops += baseEmitter.reductionLoops;
+          appendReads(baseEmitter);
+          llvm::Value *addr = builder.CreateGEP(elemTy, destination, idx, "scatter.init.addr");
+          builder.CreateAlignedStore(val, addr, llvm::Align(elemAlign));
+        });
+      }
+      if (baseCount > 0 && updCount > 0 && baseShape[axis] > 0) {
+        emitHostLoop(builder, function, updCount, 1, [&](llvm::Value *uIdx) {
+          lowering::ScalarEmitter idxEmitter(builder, function, false, load);
+          bind(idxEmitter);
+          llvm::Value *idxLinear = builder.getInt64(0);
+          for (unsigned m = 0; m < idxRank; ++m) {
+            llvm::Value *c = coord(uIdx, updShape, unsigned(axis) + m);
+            uint64_t st = productStride(idxShape, m);
+            idxLinear = builder.CreateAdd(idxLinear, st == 1 ? c : builder.CreateMul(c, builder.getInt64(st)));
+          }
+          llvm::Value *rawIdx = idxEmitter.emit(indices, idxLinear);
+          reductionLoops += idxEmitter.reductionLoops;
+          appendReads(idxEmitter);
+          llvm::Value *idxVal = rawIdx->getType()->isIntegerTy(32)
+                                    ? builder.CreateSExt(rawIdx, builder.getInt64Ty())
+                                    : rawIdx;
+          llvm::Value *inBounds = builder.CreateAnd(
+              builder.CreateICmpSGE(idxVal, builder.getInt64(0)),
+              builder.CreateICmpSLT(idxVal, builder.getInt64(baseShape[axis])));
+          auto *applyBB = llvm::BasicBlock::Create(context, "scatter.host.apply", function);
+          auto *skipBB = llvm::BasicBlock::Create(context, "scatter.host.skip", function);
+          builder.CreateCondBr(inBounds, applyBB, skipBB);
+          builder.SetInsertPoint(applyBB);
+          lowering::ScalarEmitter updEmitter(builder, function, false, load);
+          bind(updEmitter);
+          llvm::Value *updVal = updEmitter.emit(updates, uIdx);
+          reductionLoops += updEmitter.reductionLoops;
+          appendReads(updEmitter);
+          llvm::Value *baseLinear = builder.getInt64(0);
+          for (unsigned d = 0; d < baseShape.size(); ++d) {
+            llvm::Value *c = int64_t(d) < axis ? coord(uIdx, updShape, d)
+                               : int64_t(d) == axis ? idxVal
+                                                    : coord(uIdx, updShape, d - 1 + idxRank);
+            uint64_t st = productStride(baseShape, d);
+            baseLinear = builder.CreateAdd(baseLinear, st == 1 ? c : builder.CreateMul(c, builder.getInt64(st)));
+          }
+          llvm::Value *addr = builder.CreateGEP(elemTy, destination, baseLinear, "scatter.host.addr");
+          llvm::Value *cur = builder.CreateAlignedLoad(elemTy, addr, llvm::Align(elemAlign), "scatter.cur");
+          llvm::Value *sum;
+          if (elemTy->isIntegerTy()) sum = builder.CreateAdd(cur, updVal, "scatter.add");
+          else if (elemTy->isBFloatTy()) {
+            sum = llir::truncateBF16(builder, builder.CreateFAdd(
+                llir::extendBF16(builder, cur), llir::extendBF16(builder, updVal)));
+          } else {
+            sum = builder.CreateFAdd(cur, updVal, "scatter.fadd");
+          }
+          builder.CreateAlignedStore(sum, addr, llvm::Align(elemAlign));
+          builder.CreateBr(skipBB);
+          builder.SetInsertPoint(skipBB);
+        });
+      }
+      return reads;
+    };
     for (auto &op : graph.front()) {
       if (!op.getNumResults()) continue;
       auto value = op.getResult(0);
@@ -686,8 +786,9 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       }
       auto *address = llvm::GetElementPtrInst::Create(builder.getInt8Ty(), workspace,
           {builder.getInt64(0)}, "cached.buffer", builder.GetInsertBlock());
-      if (mlir::isa<MatmulOp>(op)) {
-        auto reads = emitMatmul(value, address);
+      if (mlir::isa<MatmulOp, ScatterAddOp>(op)) {
+        auto reads = mlir::isa<MatmulOp>(op) ? emitMatmul(value, address)
+                                            : emitScatter(value, address);
         cachedBuffers[value] = address;
         const auto phase = workspacePhases.size();
         workspaceBuffers.push_back({value, address,
@@ -728,10 +829,12 @@ lowerToHostLLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       }
       ++loopCount;
       auto value = returned.getOperand(batch.outputs.front());
-      if (value.getDefiningOp<MatmulOp>() && !cachedBuffers.contains(value) &&
-          !uniformValues.contains(value)) {
-        workspacePhases.push_back(emitMatmul(value,
-            function->getArg(graph.getNumArguments() + batch.outputs.front())));
+      if ((value.getDefiningOp<MatmulOp>() || value.getDefiningOp<ScatterAddOp>()) &&
+          !cachedBuffers.contains(value) && !uniformValues.contains(value)) {
+        llvm::Value *dest = function->getArg(graph.getNumArguments() + batch.outputs.front());
+        workspacePhases.push_back(value.getDefiningOp<MatmulOp>()
+                                      ? emitMatmul(value, dest)
+                                      : emitScatter(value, dest));
         continue;
       }
       bool shared = batch.outputs.size() > 1;

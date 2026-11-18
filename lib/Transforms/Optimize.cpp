@@ -343,7 +343,7 @@ llvm::json::Array planFusion(ModuleOp module, bool enabled, bool &changed) {
         auto type = dyn_cast<RankedTensorType>(op.getResult(0).getType());
         if (!type)
           continue; // Scalar arithmetic may occur between tensor operations.
-        if (!type.hasStaticShape() || isa<MatmulOp>(op)) {
+        if (!type.hasStaticShape() || isa<MatmulOp, ScatterAddOp>(op)) {
           finish();
           continue;
         }

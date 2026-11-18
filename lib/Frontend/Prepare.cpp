@@ -104,8 +104,13 @@ LogicalResult inferOperation(Operation *op, bool &changed) {
                                << lhs << " and " << rhs;
     return refine(op, 0, lhs, changed);
   }
-  if (isa<BroadcastInDimOp, TransposeOp, ReduceSumOp, ReduceMaxOp, CompareOp,
-          SelectOp, DivOp, ExpOp, LogOp, SqrtOp, MatmulOp>(op)) {
+  if (isa<BroadcastInDimOp, TransposeOp, ReduceSumOp, ReduceMaxOp, ReduceMinOp,
+          ReduceProdOp, ReduceAnyOp, ReduceAllOp, ArgmaxOp, ArgminOp, CompareOp,
+          SelectOp, DivOp, FloordivOp, ModOp, PowOp, MaximumOp, MinimumOp, ExpOp,
+          LogOp, SqrtOp, SinOp, CosOp, TanhOp, ErfOp, AbsOp, FloorOp, CeilOp,
+          RoundOp, BitwiseNotOp, BitwiseAndOp, BitwiseOrOp, BitwiseXorOp,
+          ShiftLeftOp, ShiftRightOp, IotaOp, SliceOp, PadOp, ConcatenateOp,
+          GatherOp, ScatterAddOp, MatmulOp>(op)) {
     auto inferred = inferComputeResultType(op);
     if (failed(inferred)) return failure();
     return refine(op, 0, *inferred, changed);

@@ -192,7 +192,13 @@ LogicalResult MulOp::verify() { return verifyBinary(*this); }
 bool isPureComputeOperation(Operation *op) {
   return isa<ConstantOp, SplatOp, CastOp, ReshapeOp, AddOp, MulOp,
              BroadcastInDimOp, TransposeOp, ReduceSumOp, ReduceMaxOp,
-             CompareOp, SelectOp, DivOp, ExpOp, LogOp, SqrtOp, MatmulOp>(op);
+             ReduceMinOp, ReduceProdOp, ReduceAnyOp, ReduceAllOp, ArgmaxOp,
+             ArgminOp, CompareOp, SelectOp, DivOp, FloordivOp, ModOp, PowOp,
+             MaximumOp, MinimumOp, ExpOp, LogOp, SqrtOp, SinOp, CosOp, TanhOp,
+             ErfOp, AbsOp, FloorOp, CeilOp, RoundOp, BitwiseNotOp, BitwiseAndOp,
+             BitwiseOrOp, BitwiseXorOp, ShiftLeftOp, ShiftRightOp, IotaOp,
+             SliceOp, PadOp, ConcatenateOp, GatherOp, ScatterAddOp,
+             MatmulOp>(op);
 }
 
 namespace {
@@ -221,12 +227,36 @@ FailureOr<Type> inferComputeResultType(Operation *op) {
     return failure();
   };
   if (failed(verifyDataTypes(op, op->getOperandTypes()))) return failure();
+  if (op->hasAttr("fastmath") || op->hasAttr("fastmathFlags"))
+    return invalid("numerical operations use fixed ASK floating-point rules");
+  if (isa<IotaOp>(op)) {
+    if (op->getAttr("overflow")) return invalid("overflow = wrap applies to integer reduce_sum");
+    Type resultType = op->getResult(0).getType();
+    if (failed(verifyDataTypes(op, {resultType}))) return failure();
+    Type resultElem = elementOf(resultType);
+    if (resultElem.isInteger(1)) return invalid("iota requires a numeric dtype");
+    auto iotaShape = shapeOf(resultType);
+    if (iotaShape.empty()) return invalid("iota requires rank at least one");
+    for (int64_t extent : iotaShape)
+      if (ShapedType::isDynamic(extent) || extent < 0)
+        return invalid("iota requires nonnegative concrete dimensions");
+    auto dimAttr = op->getAttrOfType<IntegerAttr>("dimension");
+    if (!dimAttr || dimAttr.getInt() < 0 || dimAttr.getInt() >= int64_t(iotaShape.size()))
+      return invalid("iota dimension must be within the result rank");
+    return resultType;
+  }
+  if (op->getNumOperands() == 0)
+    return invalid("compute operation expects at least one operand");
   const Type input = op->getOperand(0).getType();
   const Type element = elementOf(input);
   auto shape = shapeOf(input);
-  if (isa<ReduceSumOp, ReduceMaxOp, CompareOp, DivOp, ExpOp, LogOp, SqrtOp, MatmulOp>(op)) {
-    if (op->hasAttr("fastmath") || op->hasAttr("fastmathFlags"))
-      return invalid("numerical operations use fixed ASK floating-point rules");
+  if (isa<ReduceSumOp, ReduceMaxOp, ReduceMinOp, ReduceProdOp, ReduceAnyOp,
+          ReduceAllOp, ArgmaxOp, ArgminOp, CompareOp, SelectOp, DivOp,
+          FloordivOp, ModOp, PowOp, MaximumOp, MinimumOp, ExpOp, LogOp, SqrtOp,
+          SinOp, CosOp, TanhOp, ErfOp, AbsOp, FloorOp, CeilOp, RoundOp,
+          BitwiseNotOp, BitwiseAndOp, BitwiseOrOp, BitwiseXorOp, ShiftLeftOp,
+          ShiftRightOp, SliceOp, PadOp, ConcatenateOp, GatherOp, ScatterAddOp,
+          MatmulOp>(op)) {
     if (Attribute overflow = op->getAttr("overflow")) {
       auto mode = dyn_cast<StringAttr>(overflow);
       if (!isa<ReduceSumOp>(op) || !isa<IntegerType>(element) || !mode || mode.getValue() != "wrap")
@@ -264,8 +294,13 @@ FailureOr<Type> inferComputeResultType(Operation *op) {
     }
     return isa<RankedTensorType>(input) ? Type(RankedTensorType::get(output, element)) : input;
   }
-  if (isa<ReduceSumOp, ReduceMaxOp>(op)) {
-    if (element.isInteger(1)) return invalid("reduction requires an explicit numeric dtype");
+  if (isa<ReduceSumOp, ReduceMaxOp, ReduceMinOp, ReduceProdOp, ReduceAnyOp,
+          ReduceAllOp>(op)) {
+    if (isa<ReduceAnyOp, ReduceAllOp>(op)) {
+      if (!element.isInteger(1)) return invalid("boolean reduction requires a bool dtype");
+    } else {
+      if (element.isInteger(1)) return invalid("reduction requires an explicit numeric dtype");
+    }
     auto axes = op->getAttrOfType<DenseI64ArrayAttr>("axes");
     if (!axes) return invalid("requires dense i64 sorted unique reduction axes");
     llvm::SmallBitVector reduced(shape.size());
@@ -273,8 +308,8 @@ FailureOr<Type> inferComputeResultType(Operation *op) {
     for (int64_t axis : axes.asArrayRef()) {
       if (axis <= previous || uint64_t(axis) >= shape.size())
         return invalid("reduction axes must be sorted, unique and within the input rank");
-      if (isa<ReduceMaxOp>(op) && shape[axis] == 0)
-        return invalid("reduce_max requires a nonempty reduction domain");
+      if (isa<ReduceMaxOp, ReduceMinOp>(op) && shape[axis] == 0)
+        return invalid("reduce_max/reduce_min requires a nonempty reduction domain");
       reduced.set(axis);
       previous = axis;
     }
@@ -282,6 +317,20 @@ FailureOr<Type> inferComputeResultType(Operation *op) {
     for (auto [index, extent] : llvm::enumerate(shape))
       if (!reduced.test(index)) output.push_back(extent);
     return output.empty() ? element : Type(RankedTensorType::get(output, element));
+  }
+  if (isa<ArgmaxOp, ArgminOp>(op)) {
+    if (shape.empty()) return invalid("argmax/argmin requires rank at least one");
+    auto axisAttr = op->getAttrOfType<IntegerAttr>("axis");
+    if (!axisAttr || axisAttr.getInt() < 0 || uint64_t(axisAttr.getInt()) >= shape.size())
+      return invalid("argmax/argmin axis must be within the input rank");
+    const int64_t axis = axisAttr.getInt();
+    if (shape[axis] == 0)
+      return invalid("argmax/argmin requires a nonempty reduction domain");
+    SmallVector<int64_t> output;
+    for (auto [index, extent] : llvm::enumerate(shape))
+      if (int64_t(index) != axis) output.push_back(extent);
+    Type i64 = IntegerType::get(op->getContext(), 64);
+    return output.empty() ? i64 : Type(RankedTensorType::get(output, i64));
   }
   if (isa<CompareOp>(op)) {
     if (!haveCompatibleShapes(input, op->getOperand(1).getType()))
@@ -298,10 +347,151 @@ FailureOr<Type> inferComputeResultType(Operation *op) {
       return invalid("select requires a bool condition and matching condition/branch shapes and branch dtypes");
     return yes;
   }
-  if (isa<DivOp, ExpOp, LogOp, SqrtOp>(op)) {
+  if (isa<DivOp, ExpOp, LogOp, SqrtOp, SinOp, CosOp, TanhOp, ErfOp, FloorOp,
+          CeilOp, RoundOp>(op)) {
     if (!isa<FloatType>(element)) return invalid("requires f32, f16 or bf16 operands");
     if (isa<DivOp>(op) && !haveCompatibleShapes(input, op->getOperand(1).getType()))
       return invalid("div operands require matching shape and dtype");
+    return input;
+  }
+  if (isa<AbsOp, PowOp, FloordivOp, ModOp>(op)) {
+    if (element.isInteger(1)) return invalid("requires a numeric (non-bool) dtype");
+    if (!isa<AbsOp>(op) && !haveCompatibleShapes(input, op->getOperand(1).getType()))
+      return invalid("binary operands require matching shape and dtype");
+    return input;
+  }
+  if (isa<MaximumOp, MinimumOp>(op)) {
+    if (!haveCompatibleShapes(input, op->getOperand(1).getType()))
+      return invalid("maximum/minimum operands require matching shape and dtype");
+    return input;
+  }
+  if (isa<BitwiseNotOp, BitwiseAndOp, BitwiseOrOp, BitwiseXorOp, ShiftLeftOp,
+          ShiftRightOp>(op)) {
+    if (!isa<IntegerType>(element)) return invalid("bitwise/shift operations require integer or bool dtypes");
+    if (isa<ShiftLeftOp, ShiftRightOp>(op) && element.isInteger(1))
+      return invalid("shift operations require i32 or i64 dtypes");
+    if (!isa<BitwiseNotOp>(op) && !haveCompatibleShapes(input, op->getOperand(1).getType()))
+      return invalid("bitwise/shift operands require matching shape and dtype");
+    return input;
+  }
+  if (isa<SliceOp>(op)) {
+    auto starts = op->getAttrOfType<DenseI64ArrayAttr>("starts");
+    auto stops = op->getAttrOfType<DenseI64ArrayAttr>("stops");
+    auto steps = op->getAttrOfType<DenseI64ArrayAttr>("steps");
+    const int64_t rank = int64_t(shape.size());
+    if (!starts || !stops || !steps || starts.size() != rank || stops.size() != rank || steps.size() != rank)
+      return invalid("slice requires starts, stops and steps matching input rank");
+    SmallVector<int64_t> output;
+    for (int64_t i = 0; i < rank; ++i) {
+      int64_t dim = shape[i], start = starts[i], stop = stops[i], step = steps[i];
+      if (ShapedType::isDynamic(dim) || dim < 0)
+        return invalid("slice requires static nonnegative input dimensions");
+      if (step == 0) return invalid("slice step cannot be zero");
+      int64_t extent = 0;
+      if (step > 0) {
+        if (start < 0 || start > stop || stop > dim)
+          return invalid("slice forward bounds out of range");
+        extent = stop == start ? 0 : (stop - start + step - 1) / step;
+      } else {
+        if (start == stop) {
+          if (start < 0 || start > dim) return invalid("slice empty bounds out of range");
+          extent = 0;
+        } else {
+          if (start < 0 || start >= dim || stop < -1 || stop >= start)
+            return invalid("slice reverse bounds out of range");
+          extent = (start - stop + (-step) - 1) / (-step);
+        }
+      }
+      output.push_back(extent);
+    }
+    return output.empty() ? element : Type(RankedTensorType::get(output, element));
+  }
+  if (isa<PadOp>(op)) {
+    auto padShape = shapeOf(op->getOperand(1).getType());
+    if (!padShape.empty() || elementOf(op->getOperand(1).getType()) != element)
+      return invalid("pad requires a 0-D pad_value with the same dtype as input");
+    auto low = op->getAttrOfType<DenseI64ArrayAttr>("pad_low");
+    auto high = op->getAttrOfType<DenseI64ArrayAttr>("pad_high");
+    auto interior = op->getAttrOfType<DenseI64ArrayAttr>("interior");
+    const int64_t rank = int64_t(shape.size());
+    if (!low || !high || !interior || low.size() != rank || high.size() != rank || interior.size() != rank)
+      return invalid("pad requires pad_low, pad_high and interior matching input rank");
+    SmallVector<int64_t> output;
+    for (int64_t i = 0; i < rank; ++i) {
+      int64_t dim = shape[i], l = low[i], h = high[i], in = interior[i];
+      if (ShapedType::isDynamic(dim) || dim < 0 || l < 0 || h < 0 || in < 0)
+        return invalid("pad requires static nonnegative dimensions and padding");
+      int64_t inner = dim > 0 ? dim + (dim - 1) * in : 0;
+      output.push_back(l + inner + h);
+    }
+    return output.empty() ? element : Type(RankedTensorType::get(output, element));
+  }
+  if (isa<ConcatenateOp>(op)) {
+    if (op->getNumOperands() < 1) return invalid("concatenate requires at least one operand");
+    if (shape.empty()) return invalid("concatenate requires rank at least one");
+    auto axisAttr = op->getAttrOfType<IntegerAttr>("axis");
+    if (!axisAttr || axisAttr.getInt() < 0 || uint64_t(axisAttr.getInt()) >= shape.size())
+      return invalid("concatenate axis must be within operand rank");
+    const int64_t axis = axisAttr.getInt();
+    SmallVector<int64_t> output(shape.begin(), shape.end());
+    int64_t total = 0;
+    for (Value operand : op->getOperands()) {
+      Type operandType = operand.getType();
+      if (elementOf(operandType) != element)
+        return invalid("concatenate operands require matching dtype");
+      auto opShape = shapeOf(operandType);
+      if (opShape.size() != shape.size())
+        return invalid("concatenate operands require matching rank");
+      for (int64_t d = 0; d < int64_t(shape.size()); ++d) {
+        if (d == axis) {
+          if (ShapedType::isDynamic(opShape[d]) || opShape[d] < 0)
+            return invalid("concatenate requires static nonnegative axis extent");
+          total += opShape[d];
+        } else if (!compatibleExtent(shape[d], opShape[d])) {
+          return invalid("concatenate non-axis dimensions must match");
+        } else if (ShapedType::isDynamic(output[d]) && !ShapedType::isDynamic(opShape[d])) {
+          output[d] = opShape[d];
+        }
+      }
+    }
+    output[axis] = total;
+    return RankedTensorType::get(output, element);
+  }
+  if (isa<GatherOp>(op)) {
+    if (shape.empty()) return invalid("gather requires params rank at least one");
+    auto axisAttr = op->getAttrOfType<IntegerAttr>("axis");
+    if (!axisAttr || axisAttr.getInt() < 0 || uint64_t(axisAttr.getInt()) >= shape.size())
+      return invalid("gather axis must be within params rank");
+    Type idxType = op->getOperand(1).getType();
+    Type idxElem = elementOf(idxType);
+    if (!idxElem.isInteger(32) && !idxElem.isInteger(64))
+      return invalid("gather indices must have i32 or i64 dtype");
+    const int64_t axis = axisAttr.getInt();
+    SmallVector<int64_t> output;
+    for (int64_t d = 0; d < axis; ++d) output.push_back(shape[d]);
+    for (int64_t d : shapeOf(idxType)) output.push_back(d);
+    for (int64_t d = axis + 1; d < int64_t(shape.size()); ++d) output.push_back(shape[d]);
+    return output.empty() ? element : Type(RankedTensorType::get(output, element));
+  }
+  if (isa<ScatterAddOp>(op)) {
+    if (shape.empty()) return invalid("scatter_add requires base rank at least one");
+    if (element.isInteger(1)) return invalid("scatter_add requires a numeric (non-bool) dtype");
+    auto axisAttr = op->getAttrOfType<IntegerAttr>("axis");
+    if (!axisAttr || axisAttr.getInt() < 0 || uint64_t(axisAttr.getInt()) >= shape.size())
+      return invalid("scatter_add axis must be within base rank");
+    Type idxType = op->getOperand(1).getType();
+    Type idxElem = elementOf(idxType);
+    if (!idxElem.isInteger(32) && !idxElem.isInteger(64))
+      return invalid("scatter_add indices must have i32 or i64 dtype");
+    const int64_t axis = axisAttr.getInt();
+    SmallVector<int64_t> expectedUpdates;
+    for (int64_t d = 0; d < axis; ++d) expectedUpdates.push_back(shape[d]);
+    for (int64_t d : shapeOf(idxType)) expectedUpdates.push_back(d);
+    for (int64_t d = axis + 1; d < int64_t(shape.size()); ++d) expectedUpdates.push_back(shape[d]);
+    Type updatesType = op->getOperand(2).getType();
+    Type expectedType = expectedUpdates.empty() ? element : Type(RankedTensorType::get(expectedUpdates, element));
+    if (!haveCompatibleShapes(expectedType, updatesType))
+      return invalid("scatter_add updates shape/dtype does not match base, indices and axis");
     return input;
   }
   if (isa<MatmulOp>(op)) {
@@ -360,12 +550,43 @@ ASK_VERIFY_COMPUTE(BroadcastInDimOp)
 ASK_VERIFY_COMPUTE(TransposeOp)
 ASK_VERIFY_COMPUTE(ReduceSumOp)
 ASK_VERIFY_COMPUTE(ReduceMaxOp)
+ASK_VERIFY_COMPUTE(ReduceMinOp)
+ASK_VERIFY_COMPUTE(ReduceProdOp)
+ASK_VERIFY_COMPUTE(ReduceAnyOp)
+ASK_VERIFY_COMPUTE(ReduceAllOp)
+ASK_VERIFY_COMPUTE(ArgmaxOp)
+ASK_VERIFY_COMPUTE(ArgminOp)
 ASK_VERIFY_COMPUTE(CompareOp)
 ASK_VERIFY_COMPUTE(SelectOp)
 ASK_VERIFY_COMPUTE(DivOp)
+ASK_VERIFY_COMPUTE(FloordivOp)
+ASK_VERIFY_COMPUTE(ModOp)
+ASK_VERIFY_COMPUTE(PowOp)
+ASK_VERIFY_COMPUTE(MaximumOp)
+ASK_VERIFY_COMPUTE(MinimumOp)
 ASK_VERIFY_COMPUTE(ExpOp)
 ASK_VERIFY_COMPUTE(LogOp)
 ASK_VERIFY_COMPUTE(SqrtOp)
+ASK_VERIFY_COMPUTE(SinOp)
+ASK_VERIFY_COMPUTE(CosOp)
+ASK_VERIFY_COMPUTE(TanhOp)
+ASK_VERIFY_COMPUTE(ErfOp)
+ASK_VERIFY_COMPUTE(AbsOp)
+ASK_VERIFY_COMPUTE(FloorOp)
+ASK_VERIFY_COMPUTE(CeilOp)
+ASK_VERIFY_COMPUTE(RoundOp)
+ASK_VERIFY_COMPUTE(BitwiseNotOp)
+ASK_VERIFY_COMPUTE(BitwiseAndOp)
+ASK_VERIFY_COMPUTE(BitwiseOrOp)
+ASK_VERIFY_COMPUTE(BitwiseXorOp)
+ASK_VERIFY_COMPUTE(ShiftLeftOp)
+ASK_VERIFY_COMPUTE(ShiftRightOp)
+ASK_VERIFY_COMPUTE(IotaOp)
+ASK_VERIFY_COMPUTE(SliceOp)
+ASK_VERIFY_COMPUTE(PadOp)
+ASK_VERIFY_COMPUTE(ConcatenateOp)
+ASK_VERIFY_COMPUTE(GatherOp)
+ASK_VERIFY_COMPUTE(ScatterAddOp)
 ASK_VERIFY_COMPUTE(MatmulOp)
 #undef ASK_VERIFY_COMPUTE
 

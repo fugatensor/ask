@@ -25,8 +25,18 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 | `ask.cast` | `func.func` 内 | 转换元素类型，保持形状；支持全部 6×6 方向。 |
 | `ask.reshape` | `func.func` 内 | 改变张量形状，保持元素类型、总数和连续行主序次序；支持 0-D 和空张量。 |
 | `ask.broadcast_in_dim` / `ask.transpose` | `func.func` 内 | 显式扩展维度或重排轴，保持元素类型。 |
-| `ask.reduce_sum` / `ask.reduce_max` | `func.func` 内 | 按指定轴归约，移除这些轴。 |
+| `ask.iota` | `func.func` 内 | 沿目标数值张量的 `dimension` 生成坐标索引 `0, 1, ...`。 |
+| `ask.slice` / `ask.pad` / `ask.concatenate` | `func.func` 内 | 支持正负步长切片、使用 0-D `pad_value` 填充边界及内部间距（`interior`），或沿 `axis` 拼接张量。 |
+| `ask.gather` / `ask.scatter_add` | `func.func` 内 | 沿 `axis` 按下标读取；或由 `base` 初始化输出并沿 `axis` 按 `indices` 越界保护地累加 `updates`。 |
+| `ask.reduce_sum` / `ask.reduce_max` / `ask.reduce_min` / `ask.reduce_prod` | `func.func` 内 | 按指定轴进行数值归约，移除这些轴。 |
+| `ask.reduce_any` / `ask.reduce_all` | `func.func` 内 | 按指定轴进行布尔（`bool`）归约，移除这些轴。 |
+| `ask.argmax` / `ask.argmin` | `func.func` 内 | 返回沿非空 `axis` 首次出现极值（或首个 NaN）的 `i64` 下标，并移除该轴。 |
 | `ask.div` / `ask.exp` / `ask.log` / `ask.sqrt` | `func.func` 内 | 同类型浮点逐元素计算。 |
+| `ask.sin` / `ask.cos` / `ask.tanh` / `ask.erf` / `ask.floor` / `ask.ceil` / `ask.round` | `func.func` 内 | 浮点超越函数与取整（其中 `round` 采用四舍六入五成双）。 |
+| `ask.abs` / `ask.pow` / `ask.floordiv` / `ask.mod` | `func.func` 内 | 数值类型（`i32`/`i64`/`f32`/`f16`/`bf16`）的绝对值、幂、向下取整除法和取余。 |
+| `ask.maximum` / `ask.minimum` | `func.func` 内 | 支持全部 6 种类型的逐元素最大/最小值；浮点传播 NaN。 |
+| `ask.bitwise_not` / `ask.bitwise_and` / `ask.bitwise_or` / `ask.bitwise_xor` | `func.func` 内 | `bool`、`i32` 和 `i64` 上的逐元素按位逻辑运算。 |
+| `ask.shift_left` / `ask.shift_right` | `func.func` 内 | `i32`/`i64` 上的位移运算；越界位移量返回无硬件 UB 的确定性饱和结果。 |
 | `ask.compare` / `ask.select` | `func.func` 内 | 比较产生同形状 bool；按 bool 条件选择同形状、同类型的值。 |
 | `ask.matmul` | `func.func` 内 | 连续矩阵或同批次矩阵相乘，CUDA 使用 cuBLASLt。 |
 | `ask.mark` | `func.func` 内 | 追踪透传标记，记录逻辑值身份（`value_id`）或端口绑定（`port_id`），在 `prepare` 提取报告后擦除。 |
@@ -56,13 +66,15 @@ ASK IR 使用 MLIR `ask` dialect 描述张量类型、形状、运算、溯源�
 
 `transpose` 的 `permutation` 列出各输出轴对应的输入轴。归约的 `axes` 严格递增且唯一，结果移除指定轴；全部轴被移除时结果为标量，可用 `splat` 或 `broadcast_in_dim` 扩展。正秩张量的空轴列表保持原值。
 
-`reduce_sum` 支持 Warp Shuffle 与指令并行折叠累加，不严格限制为串行 IEEE-754 累加顺序，整数回绕，空域结果为零。需要 f32 累加时先 `cast`。`reduce_max` 接受整数和浮点，传播 NaN，区分正负零，要求归约域非空。
+`reduce_sum` 和 `reduce_prod` 支持 Warp Shuffle 与树形归约累加，不严格限制为串行 IEEE-754 累加顺序，整数回绕，空域分别返回 `0`（`reduce_sum`）和 `1`（`reduce_prod`）。需要 f32 累加时先 `cast`。`reduce_max` 与 `reduce_min` 接受全部六种元素类型（按有符号整数或 IEEE 浮点序），传播 NaN，区分正负零，要求归约域非空。`reduce_any` / `reduce_all` 对 `bool` 归约，空域分别返回 `false` 与 `true`。`argmax` / `argmin` 要求秩至少为 1 且归约轴非空，返回 `i64` 类型的首次极值下标（浮点优先传播首个 `NaN`）。
+
+`slice` 支持正负步长和规范化边界（负步长可取 `stop == -1` 覆盖至索引 `0`，`start == stop` 表示长度为零）。`pad` 接收非负 `pad_low`、`pad_high`、`interior` 内插间隙及同类型 0-D `pad_value`。`gather` 与 `scatter_add` 校验轴及非轴维度匹配，越界下标在读取时返回 0、在累加时静默跳过。
 
 <a id="elementwise-primitives"></a>
 
-## 浮点计算与条件选择
+## 浮点、整数与位运算计算
 
-`div`、`exp`、`log`、`sqrt` 接受 f32/f16/bf16；低精度超越函数先扩展至 f32，再 RNE 回原类型。CUDA 的 exp/log 使用 NVIDIA libdevice。比较的 `predicate` 为 `eq`、`ne`、`lt`、`le`、`gt` 或 `ge`；浮点 NaN 仅使 `ne` 成立。`select(condition, yes, no)` 三个操作数形状相同，条件为 bool，两个分支类型相同。
+`div`、`exp`、`log`、`sqrt`、`sin`、`cos`、`tanh`、`erf`、`floor`、`ceil`、`round` 接受 f32/f16/bf16（`round` 为偶舍入）；低精度数学函数先扩展至 f32，再 RNE 回原类型。CUDA 使用 NVIDIA libdevice（`__nv_*`）。`pow`、`floordiv`、`mod`、`abs` 同时接受 `i32`/`i64` 并定义全部边界语义（整数除零/取余返回 0，`INT_MIN // -1` 回绕、`INT_MIN % -1` 为 0；浮点 `floordiv`/`mod` 采用向下取整语义）。`shift_left` / `shift_right` 对 `i32`/`i64` 上的所有位移量均有明确定义（负位移量得 `0`；右移 `>= 位宽` 按符号扩展得 `-1` 或 `0`，左移得 `0`）。比较的 `predicate` 为 `eq`、`ne`、`lt`、`le`、`gt` 或 `ge`；浮点 NaN 仅使 `ne` 成立。`select(condition, yes, no)` 三个操作数形状相同，条件为 bool，两个分支类型相同。
 
 相邻逐元素操作由共享循环执行，广播和转置映射读取下标。具体物化边界见[图切分](partitioning.md#partition-boundaries)。
 

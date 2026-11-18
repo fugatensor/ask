@@ -60,15 +60,18 @@ bool supportsWarpReduction(llvm::ArrayRef<mlir::Value> roots, uint64_t outputCou
         result.supported &= input.supported;
         result.reduction |= input.reduction;
       }
-      if (mlir::isa<ReduceSumOp, ReduceMaxOp>(op)) {
+      if (mlir::isa<ArgmaxOp, ArgminOp, ScatterAddOp>(op)) {
+        result.supported = false;
+        result.reduction = true;
+      } else if (mlir::isa<ReduceSumOp, ReduceMaxOp, ReduceMinOp, ReduceProdOp,
+                           ReduceAnyOp, ReduceAllOp>(op)) {
         uint64_t domain = 1;
         auto shape = shapeOf(op->getOperand(0).getType());
         for (int64_t axis : op->getAttrOfType<mlir::DenseI64ArrayAttr>("axes").asArrayRef())
           domain *= uint64_t(shape[axis]);
         auto tensor = mlir::dyn_cast<mlir::RankedTensorType>(value.getType());
         const uint64_t count = tensor ? uint64_t(tensor.getNumElements()) : 1;
-        result.supported &= (mlir::isa<ReduceMaxOp, ReduceSumOp>(op)) && !result.reduction &&
-                            domain >= 32 && count == outputCount;
+        result.supported &= !result.reduction && domain >= 32 && count == outputCount;
         result.reduction = true;
       }
     }
@@ -129,6 +132,10 @@ llvm::Error validateFunction(mlir::func::FuncOp graph,
       return error("unsupported CUDA graph operation " + op.getName().getStringRef());
     for (auto type : op.getResultTypes())
       if (auto failure = checkType(type)) return failure;
+    if (mlir::isa<ScatterAddOp>(op) &&
+        !llvm::all_of(op.getResult(0).getUsers(),
+                      [](mlir::Operation *user) { return mlir::isa<mlir::func::ReturnOp>(user); }))
+      return error("CUDA scatter_add requires a partitioned step");
     if (mlir::isa<AddOp, MulOp>(op) &&
         (op.getOperand(0).getType() != op.getOperand(1).getType() ||
          op.getOperand(0).getType() != op.getResult(0).getType()))
@@ -186,10 +193,13 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
   }
   for (auto [index, type] : llvm::enumerate(graph.getResultTypes())) {
     unsigned argumentIndex = graph.getNumArguments() + index;
+    auto returnedOp = mlir::cast<mlir::func::ReturnOp>(graph.front().getTerminator());
+    const bool isScatterOutput =
+        returnedOp.getOperand(index).getDefiningOp<ScatterAddOp>() != nullptr;
     auto *argument = function->getArg(argumentIndex);
     argument->setName("output" + std::to_string(index));
     argument->addAttr(llvm::Attribute::NoAlias);
-    argument->addAttr(llvm::Attribute::WriteOnly);
+    if (!isScatterOutput) argument->addAttr(llvm::Attribute::WriteOnly);
     argument->addAttr(llvm::Attribute::getWithCaptureInfo(context, llvm::CaptureInfo::none()));
     std::string binding = "output:" + std::to_string(index);
     ports.push_back(describePort(type, argumentIndex, binding));
@@ -202,17 +212,34 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
     uint64_t count;
     llvm::SmallVector<unsigned> outputs;
     bool cooperative = false;
+    ScatterAddOp scatter;
   };
   llvm::SmallVector<Batch> batches;
   uint64_t emptyOutputs = 0;
+  std::optional<std::pair<int64_t, int64_t>> scatterPreCopy;
   auto returned = mlir::cast<mlir::func::ReturnOp>(graph.front().getTerminator());
   for (auto [index, value] : llvm::enumerate(returned.getOperands())) {
+    if (auto scatter = value.getDefiningOp<ScatterAddOp>()) {
+      if (auto baseArg = mlir::dyn_cast<mlir::BlockArgument>(scatter.getOperand(0)))
+        scatterPreCopy = {int64_t(baseArg.getArgNumber()), int64_t(index)};
+      auto updatesCount = elementCount(scatter.getOperand(2).getType());
+      if (!updatesCount) return updatesCount.takeError();
+      auto baseCount = elementCount(value.getType());
+      if (!baseCount) return baseCount.takeError();
+      if (*baseCount == 0 || *updatesCount == 0) {
+        ++emptyOutputs;
+        continue;
+      }
+      batches.push_back({shapeOf(scatter.getOperand(2).getType()), *updatesCount,
+                         {unsigned(index)}, false, scatter});
+      continue;
+    }
     auto count = elementCount(value.getType());
     if (!count) return count.takeError();
     if (*count == 0) { ++emptyOutputs; continue; }
     auto shape = shapeOf(value.getType());
-    auto batch = llvm::find_if(batches, [&](const Batch &item) { return item.shape == shape; });
-    if (batch == batches.end()) batches.push_back({std::move(shape), *count, {unsigned(index)}});
+    auto batch = llvm::find_if(batches, [&](const Batch &item) { return !item.scatter && item.shape == shape; });
+    if (batch == batches.end()) batches.push_back({std::move(shape), *count, {unsigned(index)}, false, {}});
     else batch->outputs.push_back(index);
   }
   uint64_t maximumBlocks = 0, warpGroups = 0;
@@ -266,30 +293,88 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
         computed = builder.CreateICmpNE(computed, builder.getInt8(0), "input.bool");
       return computed;
     });
-    if (batch.cooperative) emitter.bindWarpLane(lane);
     llvm::json::Array outputIndices;
-    llvm::SmallVector<llvm::Value *> computedOutputs;
-    for (unsigned outputIndex : batch.outputs) {
-      auto *computed = emitter.emit(returned.getOperand(outputIndex), index);
-      if (computed->getType()->isIntegerTy(1)) computed = builder.CreateZExt(computed, builder.getInt8Ty(), "output.bool");
-      computedOutputs.push_back(computed);
-    }
-    llvm::BasicBlock *stored = nullptr;
-    if (batch.cooperative) {
-      auto *write = llvm::BasicBlock::Create(context, "warp.write", function);
-      stored = llvm::BasicBlock::Create(context, "warp.stored", function);
-      builder.CreateCondBr(builder.CreateICmpEQ(lane, builder.getInt64(0)), write, stored);
-      builder.SetInsertPoint(write);
-    }
-    for (auto [position, outputIndex] : llvm::enumerate(batch.outputs)) {
-      auto *computed = computedOutputs[position];
+    if (batch.scatter) {
+      ScatterAddOp scatter = batch.scatter;
+      mlir::Value indices = scatter.getOperand(1), updates = scatter.getOperand(2);
+      auto baseShape = shapeOf(scatter.getResult().getType());
+      auto idxShape = shapeOf(indices.getType());
+      auto updShape = shapeOf(updates.getType());
+      const int64_t axis = scatter->getAttrOfType<mlir::IntegerAttr>("axis").getInt();
+      const unsigned idxRank = unsigned(idxShape.size());
+      auto productStride = [&](llvm::ArrayRef<int64_t> dims, unsigned d) -> uint64_t {
+        uint64_t s = 1;
+        for (unsigned k = d + 1; k < dims.size(); ++k) s *= uint64_t(dims[k]);
+        return s;
+      };
+      auto coord = [&](llvm::Value *lin, llvm::ArrayRef<int64_t> dims, unsigned d) -> llvm::Value * {
+        if (dims[d] == 1) return builder.getInt64(0);
+        uint64_t stride = productStride(dims, d);
+        llvm::Value *q = stride == 1 ? lin : builder.CreateUDiv(lin, builder.getInt64(stride));
+        return builder.CreateURem(q, builder.getInt64(dims[d]));
+      };
+      llvm::Value *idxLinear = builder.getInt64(0);
+      for (unsigned m = 0; m < idxRank; ++m) {
+        llvm::Value *c = coord(index, updShape, unsigned(axis) + m);
+        uint64_t st = productStride(idxShape, m);
+        idxLinear = builder.CreateAdd(idxLinear, st == 1 ? c : builder.CreateMul(c, builder.getInt64(st)));
+      }
+      llvm::Value *rawIdx = emitter.emit(indices, idxLinear);
+      llvm::Value *idxVal = rawIdx->getType()->isIntegerTy(32)
+                                ? builder.CreateSExt(rawIdx, builder.getInt64Ty())
+                                : rawIdx;
+      llvm::Value *inBounds = builder.CreateAnd(
+          builder.CreateICmpSGE(idxVal, builder.getInt64(0)),
+          builder.CreateICmpSLT(idxVal, builder.getInt64(baseShape[axis])));
+      auto *doAtomicBB = llvm::BasicBlock::Create(context, "scatter.atomic", function);
+      auto *skipBB = llvm::BasicBlock::Create(context, "scatter.skip", function);
+      builder.CreateCondBr(inBounds, doAtomicBB, skipBB);
+      builder.SetInsertPoint(doAtomicBB);
+      llvm::Value *updVal = emitter.emit(updates, index);
+      llvm::Value *baseLinear = builder.getInt64(0);
+      for (unsigned d = 0; d < baseShape.size(); ++d) {
+        llvm::Value *c = int64_t(d) < axis ? coord(index, updShape, d)
+                           : int64_t(d) == axis ? idxVal
+                                                : coord(index, updShape, d - 1 + idxRank);
+        uint64_t st = productStride(baseShape, d);
+        baseLinear = builder.CreateAdd(baseLinear, st == 1 ? c : builder.CreateMul(c, builder.getInt64(st)));
+      }
+      unsigned outputIndex = batch.outputs.front();
       auto *pointer = function->getArg(graph.getNumArguments() + outputIndex);
-      auto *address = builder.CreateGEP(computed->getType(), pointer, index, "output.address");
-      builder.CreateAlignedStore(computed, address,
-          llvm::Align(elementByteWidth(returned.getOperand(outputIndex).getType())));
+      auto *elemTy = storageType(scatter.getResult().getType(), context);
+      auto *address = builder.CreateGEP(elemTy, pointer, baseLinear, "scatter.address");
+      auto atomicOp = elemTy->isFloatingPointTy() ? llvm::AtomicRMWInst::FAdd : llvm::AtomicRMWInst::Add;
+      builder.CreateAtomicRMW(atomicOp, address, updVal,
+          llvm::Align(elementByteWidth(scatter.getResult().getType())),
+          llvm::AtomicOrdering::Monotonic);
+      builder.CreateBr(skipBB);
+      builder.SetInsertPoint(skipBB);
       outputIndices.push_back(int64_t(outputIndex));
+    } else {
+      if (batch.cooperative) emitter.bindWarpLane(lane);
+      llvm::SmallVector<llvm::Value *> computedOutputs;
+      for (unsigned outputIndex : batch.outputs) {
+        auto *computed = emitter.emit(returned.getOperand(outputIndex), index);
+        if (computed->getType()->isIntegerTy(1)) computed = builder.CreateZExt(computed, builder.getInt8Ty(), "output.bool");
+        computedOutputs.push_back(computed);
+      }
+      llvm::BasicBlock *stored = nullptr;
+      if (batch.cooperative) {
+        auto *write = llvm::BasicBlock::Create(context, "warp.write", function);
+        stored = llvm::BasicBlock::Create(context, "warp.stored", function);
+        builder.CreateCondBr(builder.CreateICmpEQ(lane, builder.getInt64(0)), write, stored);
+        builder.SetInsertPoint(write);
+      }
+      for (auto [position, outputIndex] : llvm::enumerate(batch.outputs)) {
+        auto *computed = computedOutputs[position];
+        auto *pointer = function->getArg(graph.getNumArguments() + outputIndex);
+        auto *address = builder.CreateGEP(computed->getType(), pointer, index, "output.address");
+        builder.CreateAlignedStore(computed, address,
+            llvm::Align(elementByteWidth(returned.getOperand(outputIndex).getType())));
+        outputIndices.push_back(int64_t(outputIndex));
+      }
+      if (stored) { builder.CreateBr(stored);builder.SetInsertPoint(stored); }
     }
-    if (stored) { builder.CreateBr(stored);builder.SetInsertPoint(stored); }
     reductionLoops += emitter.reductionLoops;
     auto *next = builder.CreateAdd(index, builder.getInt64(stride / (batch.cooperative ? 32 : 1)), "next");
     index->addIncoming(next, builder.GetInsertBlock());
@@ -327,6 +412,9 @@ lowerToCUDALLVM(mlir::ModuleOp source, llvm::LLVMContext &context,
       {"zero_element_outputs", int64_t(emptyOutputs)},
       {"temporary_buffer_count", 0}, {"groups", std::move(groups)},
       {"bool_storage", "one-byte-zero-or-one"}, {"cast_semantics", "rne-saturating-fptosi-nan-zero-v1"}};
+  if (scatterPreCopy)
+    report["pre_copy"] = llvm::json::Object{
+        {"input", scatterPreCopy->first}, {"output", scatterPreCopy->second}};
   return std::move(result);
 }
 } // namespace ask

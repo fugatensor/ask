@@ -293,6 +293,48 @@ int main() {
       return true;
     };
     if (!verifySlots(false) || !verifySlots(true)) return 1;
+    // Validate and exercise PlanStep::preCopy (both direct and graph mode).
+    {
+      auto k = session->load(ptx, "double_i32", {"i32"}, 80, {0, 0});
+      auto rejectsPreCopy = [&](std::vector<std::size_t> sizes, PlanStep badStep, bool g) {
+        try {
+          session->prepareProgram(std::move(sizes), {0}, {1}, {std::move(badStep)}, g);
+        } catch (const CUDAError &) {
+          return;
+        }
+        throw std::runtime_error("invalid preCopy step was accepted");
+      };
+      PlanStep outOfRange;
+      outOfRange.kernel = k; outOfRange.arguments = {{0, {}}, {1, {}}};
+      outOfRange.inputs = {0}; outOfRange.outputs = {1};
+      outOfRange.grid = {1, 1, 1}; outOfRange.block = {32, 1, 1};
+      outOfRange.preCopy = CopyDescription{2, 1};
+      rejectsPreCopy({16, 16}, outOfRange, false);
+
+      PlanStep sizeMismatch = outOfRange;
+      sizeMismatch.preCopy = CopyDescription{0, 1};
+      rejectsPreCopy({32, 16}, sizeMismatch, false);
+
+      for (bool g : {false, true}) {
+        PlanStep step;
+        step.kernel = k; step.arguments = {{0, {}}, {1, {}}};
+        step.inputs = {0}; step.outputs = {1};
+        step.grid = {1, 1, 1}; step.block = {32, 1, 1};
+        step.preCopy = CopyDescription{0, 1};
+        auto prog = session->prepareProgram({16, 16}, {0}, {1}, {step}, g);
+        for (int iter = 0; iter < 2; ++iter) {
+          std::array<std::int32_t, 4> inVals = {iter + 3, -4, 5, 6}, outVals{};
+          auto src = session->allocate(sizeof(inVals));
+          src->copyFromHost(inVals.data(), sizeof(inVals));
+          auto [outs, ev] = prog->run({src});
+          ev->wait();
+          outs.front()->copyToHost(outVals.data(), sizeof(outVals));
+          for (std::size_t idx = 0; idx < inVals.size(); ++idx)
+            if (outVals[idx] != inVals[idx] * 2)
+              throw std::runtime_error("preCopy run result mismatch");
+        }
+      }
+    }
     std::cout << "graph matrix: " << graphMatrix(session, ptx) << '\n';
     std::cout << "deep fork matrix: " << deepForkMatrix(session, ptx) << '\n';
     return 0;
